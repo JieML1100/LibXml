@@ -1,4 +1,4 @@
-#include "System/Xml/Xml.h"
+#include "Xml.h"
 
 #include <cmath>
 #include <filesystem>
@@ -545,7 +545,8 @@ void TestDocumentTypeBoundaries() {
 
 void TestInvalidDtdInputs() {
     // DTD support boundary: PUBLIC/SYSTEM DOCTYPE headers plus ENTITY/NOTATION declarations are supported;
-    // ELEMENT, ATTLIST, parameter entities, and conditional sections remain explicitly unsupported.
+    // ELEMENT/ATTLIST declarations are accepted and preserved in InternalSubset, while parameter entities
+    // and conditional sections remain explicitly unsupported.
     auto expectXmlExceptionContaining = [](const std::string& xml, const std::string& expectedMessage, const std::string& label) {
         bool threw = false;
         try {
@@ -568,20 +569,30 @@ void TestInvalidDtdInputs() {
         Assert(threw, label);
     };
 
-    expectXmlExceptionContaining(
-        "<!DOCTYPE root [<!ELEMENT root ANY>]><root/>",
-        "Unsupported DTD declaration: ELEMENT",
-        "Unsupported ELEMENT declarations should report a stable XmlException");
-
-    expectXmlExceptionContaining(
-        "<!DOCTYPE root [<!ATTLIST root id CDATA #IMPLIED>]><root/>",
-        "Unsupported DTD declaration: ATTLIST",
-        "Unsupported ATTLIST declarations should report a stable XmlException");
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root ANY><!ATTLIST root id CDATA #IMPLIED><!ENTITY label 'ok'>]><root id='42'/>");
+        Assert(document->DocumentType() != nullptr,
+            "ELEMENT/ATTLIST declarations should be accepted inside the DOCTYPE subset");
+        Assert(document->DocumentType()->InternalSubset().find("<!ELEMENT root ANY>") != std::string::npos,
+            "Accepted ELEMENT declarations should remain preserved in the internal subset");
+        Assert(document->DocumentType()->InternalSubset().find("<!ATTLIST root id CDATA #IMPLIED>") != std::string::npos,
+            "Accepted ATTLIST declarations should remain preserved in the internal subset");
+        Assert(document->DocumentType()->Entities().GetNamedItem("label") != nullptr,
+            "Accepting ELEMENT/ATTLIST declarations should not break ENTITY declaration parsing");
+        Assert(document->DocumentElement() != nullptr && document->DocumentElement()->GetAttribute("id") == "42",
+            "Accepted ELEMENT/ATTLIST declarations should not interfere with document parsing");
+    }
 
     expectXmlExceptionContaining(
         "<!DOCTYPE root [<!ENTITY % pe 'value'>]><root/>",
         "Unsupported DTD declaration: parameter entity",
         "Unsupported parameter entity declarations should report a stable XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<![IGNORE[<!ENTITY author 'value'>]]>]><root/>",
+        "Unsupported DTD declaration: conditional section",
+        "Unsupported conditional sections should report a stable XmlException");
 
     expectXmlExceptionContaining(
         "<!DOCTYPE root [<!ENTITY author SYSTEM>]><root/>",
@@ -627,6 +638,13 @@ void TestInvalidDtdInputs() {
         "<!DOCTYPE root SYSTEM \"root.dtd\" trailing><root/>",
         "Expected '>' after DOCTYPE",
         "XmlReader should reject trailing tokens after the DOCTYPE header with a stable error");
+
+    {
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root ANY><!ATTLIST root id CDATA #IMPLIED>]><root id='42'/>");
+        while (reader.Read()) {
+        }
+    }
 }
 
 void TestDeclaredEntityResolution() {
@@ -1239,6 +1257,107 @@ void TestXmlSchemaNamedTypesAndOccurs() {
 }
 
 void TestXmlSchemaFacets() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidFacetChildren\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:maxLength value=\"8\">"
+            "        <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            "      </xs:maxLength>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleType facet can only declare annotation children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType facets that declare non-annotation schema children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidLengthFacetCombination\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:length value=\"5\"/>"
+            "      <xs:minLength value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot declare length together with minLength or maxLength facets") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType declarations that mix length with minLength/maxLength facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidLengthRange\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:minLength value=\"10\"/>"
+            "      <xs:maxLength value=\"5\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot declare minLength greater than maxLength") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType declarations whose minLength exceeds maxLength");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidDigitsFacetCombination\">"
+            "    <xs:restriction base=\"xs:decimal\">"
+            "      <xs:totalDigits value=\"3\"/>"
+            "      <xs:fractionDigits value=\"5\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot declare fractionDigits greater than totalDigits") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType declarations whose fractionDigits exceeds totalDigits");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidWhiteSpaceFacet\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:whiteSpace value=\"invalid\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("whiteSpace facet value must be 'preserve', 'replace', or 'collapse'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType declarations with invalid whiteSpace facet values");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"AnnotatedFacetType\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:maxLength value=\"8\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>facet annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "      </xs:maxLength>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    }
+
     const std::string schemaXml =
         "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:facets\" targetNamespace=\"urn:facets\">"
         "  <xs:simpleType name=\"CodeType\">"
@@ -1305,7 +1424,7 @@ void TestXmlSchemaFacets() {
         "</payload>");
     valid->Validate(schemas);
 
-    bool threw = false;
+    threw = false;
     try {
         const auto invalidPattern = XmlDocument::Parse(
             "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
@@ -1475,6 +1594,117 @@ void TestXmlSchemaFacets() {
 }
 
 void TestXmlSchemaListAndUnion() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidUnion\">"
+            "    <xs:union memberTypes=\"xs:string xs:int\">"
+            "      <xs:simpleType>"
+            "        <xs:restriction base=\"xs:decimal\"/>"
+            "      </xs:simpleType>"
+            "    </xs:union>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("union simpleType cannot combine a memberTypes attribute with inline simpleType children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject union simpleType declarations that mix memberTypes with inline simpleType children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidRestrictionChildren\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleType restriction can only declare annotation, simpleType, and facet children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType restriction declarations that declare non-facet schema children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidRestrictionBase\">"
+            "    <xs:restriction>"
+            "      <xs:minLength value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleType restriction requires a base attribute or inline simpleType") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType restriction declarations that omit both base and inline simpleType");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidList\">"
+            "    <xs:list itemType=\"xs:string\">"
+            "      <xs:maxLength value=\"10\"/>"
+            "    </xs:list>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list simpleType can only declare annotation and an optional inline simpleType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject list simpleType declarations that declare non-annotation schema children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidUnionChildren\">"
+            "    <xs:union>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:union>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("union simpleType can only declare annotation and optional inline simpleType children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject union simpleType declarations that declare non-annotation schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"AnnotatedList\">"
+            "    <xs:list itemType=\"xs:string\">"
+            "      <xs:annotation>"
+            "        <xs:documentation>list annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "    </xs:list>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"AnnotatedRestriction\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:annotation>"
+            "        <xs:documentation>restriction annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "      <xs:minLength value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"AnnotatedUnion\">"
+            "    <xs:union memberTypes=\"xs:string xs:int\">"
+            "      <xs:annotation>"
+            "        <xs:documentation>union annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "    </xs:union>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    }
+
     const std::string schemaXml =
         "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:collections\" targetNamespace=\"urn:collections\">"
         "  <xs:simpleType name=\"PositiveInt\">"
@@ -1571,7 +1801,7 @@ void TestXmlSchemaListAndUnion() {
         "</payload>");
     valid->Validate(schemas);
 
-    bool threw = false;
+    threw = false;
     try {
         const auto invalidListItem = XmlDocument::Parse(
             "<payload xmlns=\"urn:collections\">"
@@ -1762,6 +1992,22 @@ void TestXmlSchemaListAndUnion() {
 }
 
 void TestXmlSchemaAnnotations() {
+    bool threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:annotations-invalid\">"
+            "  <xs:element name=\"record\" type=\"xs:string\">"
+            "    <xs:annotation>"
+            "      <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            "    </xs:annotation>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("annotation can only declare appinfo or documentation children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject annotations that declare schema children other than appinfo or documentation");
+
     const std::string schemaXml =
         "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:annotations\" targetNamespace=\"urn:annotations\">"
         "  <xs:annotation>"
@@ -2106,6 +2352,33 @@ void TestXmlSchemaAllCompositor() {
     }
     Assert(threw, "Schema validation should reject undeclared xs:all members");
 
+    {
+        XmlSchemaSet wildcardSchemas;
+        wildcardSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:all-wildcard\" targetNamespace=\"urn:all-wildcard\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:any namespace=\"##other\" processContents=\"lax\" minOccurs=\"0\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"payload\" type=\"tns:PayloadType\"/>"
+            "</xs:schema>");
+
+        const auto validWildcardMember = XmlDocument::Parse(
+            "<payload xmlns=\"urn:all-wildcard\" xmlns:ext=\"urn:all-extra\">"
+            "  <ext:meta/>"
+            "  <id>7</id>"
+            "</payload>");
+        validWildcardMember->Validate(wildcardSchemas);
+
+        const auto validWildcardOmitted = XmlDocument::Parse(
+            "<payload xmlns=\"urn:all-wildcard\">"
+            "  <id>7</id>"
+            "</payload>");
+        validWildcardOmitted->Validate(wildcardSchemas);
+    }
+
     threw = false;
     try {
         XmlSchemaSet invalidAllMaxOccursSchemas;
@@ -2172,6 +2445,38 @@ void TestXmlSchemaAllCompositor() {
 
     threw = false;
     try {
+        XmlSchemaSet invalidAnyMaxOccursSchemas;
+        invalidAnyMaxOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:any maxOccurs=\"2\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("child wildcards currently support maxOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all child wildcards whose maxOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAnyMinOccursSchemas;
+        invalidAnyMinOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:any minOccurs=\"2\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("child wildcards currently support minOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all child wildcards whose minOccurs exceeds 1");
+
+    threw = false;
+    try {
         XmlSchemaSet invalidGroupOccursSchemas;
         invalidGroupOccursSchemas.AddXml(
             "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:all-invalid\" targetNamespace=\"urn:all-invalid\">"
@@ -2228,7 +2533,7 @@ void TestXmlSchemaAllCompositor() {
             "  </xs:complexType>"
             "</xs:schema>");
     } catch (const XmlException& exception) {
-        threw = std::string(exception.what()).find("supports only child element particles and group references") != std::string::npos;
+        threw = std::string(exception.what()).find("supports only child element particles, wildcards, and group references") != std::string::npos;
     }
     Assert(threw, "Schema loading should reject nested sequence particles directly under xs:all");
 
@@ -2692,6 +2997,23 @@ void TestXmlSchemaContentExtensions() {
         "    </xs:complexContent>"
         "  </xs:complexType>"
         "  <xs:element name=\"record\" type=\"tns:DetailedRecord\"/>"
+        "  <xs:complexType name=\"MixedDetailedRecord\">"
+        "    <xs:complexContent mixed=\"true\">"
+        "      <xs:extension base=\"tns:BaseRecord\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"name\" type=\"xs:string\"/>"
+        "        </xs:sequence>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"mixedDerivedRecord\" type=\"tns:MixedDetailedRecord\"/>"
+        "  <xs:complexType name=\"MixedRecord\" mixed=\"true\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"id\" type=\"xs:int\"/>"
+        "      <xs:element name=\"name\" type=\"xs:string\"/>"
+        "    </xs:sequence>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"mixedRecord\" type=\"tns:MixedRecord\"/>"
         "</xs:schema>";
 
     XmlSchemaSet schemas;
@@ -2755,6 +3077,40 @@ void TestXmlSchemaContentExtensions() {
             && std::string(exception.what()).find("enumeration") != std::string::npos;
     }
     Assert(threw, "Schema validation should enforce attributes introduced by complexContent extension");
+
+    threw = false;
+    try {
+        const auto invalidRecordText = XmlDocument::Parse(
+            "<record xmlns=\"urn:content-ext\" version=\"2\" status=\"active\">"
+            "  prefix"
+            "  <id>7</id>"
+            "  <name>Alpha</name>"
+            "</record>");
+        invalidRecordText->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not allow text content") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should still reject text content for non-mixed complexType sequences");
+
+    const auto validMixedDerivedRecord = XmlDocument::Parse(
+        "<mixedDerivedRecord xmlns=\"urn:content-ext\" version=\"2\">"
+        "  prefix"
+        "  <id>7</id>"
+        "  middle"
+        "  <name>Alpha</name>"
+        "  suffix"
+        "</mixedDerivedRecord>");
+    validMixedDerivedRecord->Validate(schemas);
+
+    const auto validMixedRecord = XmlDocument::Parse(
+        "<mixedRecord xmlns=\"urn:content-ext\">"
+        "  prefix"
+        "  <id>7</id>"
+        "  middle"
+        "  <name>Alpha</name>"
+        "  suffix"
+        "</mixedRecord>");
+    validMixedRecord->Validate(schemas);
 }
 
 void TestXmlSchemaContentRestrictions() {
@@ -3016,6 +3372,228 @@ void TestXmlSchemaRestrictionLegality() {
     try {
         XmlSchemaSet schemas;
         schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidSimpleContentRestriction\">"
+            "    <xs:simpleContent>"
+            "      <xs:restriction base=\"xs:string\">"
+            "        <xs:choice>"
+            "          <xs:element name=\"value\" type=\"xs:string\"/>"
+            "        </xs:choice>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleContent restriction can only declare annotation, simpleType, facet, or attribute children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent restrictions that declare non-simpleContent children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"AnnotatedSimpleContentRestriction\">"
+            "    <xs:simpleContent>"
+            "      <xs:restriction base=\"xs:string\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>allowed annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "        <xs:minLength value=\"2\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidSimpleContentExtension\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"value\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleContent extension can only declare annotation or attribute children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent extensions that declare non-simpleContent children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"DuplicateSimpleContentExtension\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\"/>"
+            "      <xs:extension base=\"xs:string\"/>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleContent must declare exactly one extension or restriction child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent declarations that contain multiple extension children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"MixedSimpleContentDerivation\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\"/>"
+            "      <xs:restriction base=\"xs:string\">"
+            "        <xs:minLength value=\"1\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleContent must declare exactly one extension or restriction child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent declarations that mix extension and restriction children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"CommonAttrs\">"
+            "    <xs:attribute name=\"lang\" type=\"xs:string\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:complexType name=\"AnnotatedSimpleContentExtension\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>allowed annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "        <xs:attributeGroup ref=\"CommonAttrs\"/>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidExtensionRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"BaseRecord\">"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\"/>"
+            "        </xs:simpleType>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexContent extension can only declare annotation, particle, or attribute children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent extensions that declare non-complexContent children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"DuplicateComplexContentRestriction\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "      <xs:restriction base=\"BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexContent must declare exactly one extension or restriction child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent declarations that contain multiple restriction children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"MixedComplexContentDerivation\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"extra\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "      <xs:restriction base=\"BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexContent must declare exactly one extension or restriction child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent declarations that mix extension and restriction children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"AnnotatedExtensionRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"BaseRecord\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>allowed annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "        <xs:sequence>"
+            "          <xs:element name=\"extra\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
             "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
             "  <xs:simpleType name=\"BaseCode\">"
             "    <xs:restriction base=\"xs:string\">"
@@ -3032,6 +3610,1151 @@ void TestXmlSchemaRestrictionLegality() {
         threw = std::string(exception.what()).find("cannot change the base pattern facet") != std::string::npos;
     }
     Assert(threw, "Schema loading should reject simpleType restrictions that change base pattern facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidType\">"
+            "    <xs:restriction base=\"xs:string\"/>"
+            "    <xs:list itemType=\"xs:string\"/>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("can only declare one restriction, list, or union child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType declarations that mix restriction and list children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidType\">"
+            "    <xs:annotation><xs:documentation>missing derivation</xs:documentation></xs:annotation>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("requires exactly one restriction, list, or union child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType declarations that omit restriction, list, and union children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidType\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:choice>"
+            "      <xs:element name=\"name\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("can only declare one top-level content model child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexType declarations that mix multiple top-level content model children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidType\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\"/>"
+            "    </xs:simpleContent>"
+            "    <xs:attribute name=\"lang\" type=\"xs:string\"/>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("simpleContent/complexContent must be the only top-level content child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexType declarations that place attributes alongside simpleContent");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:simpleType>"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:int\"/>"
+            "    </xs:simpleType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("can only declare one inline simpleType or complexType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element declarations that declare multiple inline simpleType children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:simpleType>"
+            "    <xs:complexType>"
+            "      <xs:simpleContent>"
+            "        <xs:extension base=\"xs:string\"/>"
+            "      </xs:simpleContent>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("can only declare one inline simpleType or complexType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element declarations that mix inline simpleType and complexType children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\" type=\"xs:string\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:simpleType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot combine a type attribute with an inline simpleType or complexType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element declarations that mix a type attribute with an inline type child");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:group ref=\"missing\"/>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element declarations can only declare annotation, inline type, or identity constraint children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element declarations that declare non-element schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:annotation>"
+            "      <xs:documentation>element annotation</xs:documentation>"
+            "    </xs:annotation>"
+            "    <xs:key name=\"valueKey\">"
+            "      <xs:selector xpath=\".\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\" minOccurs=\"0\" type=\"xs:string\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("global element declarations cannot specify minOccurs or maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject global element declarations that specify minOccurs or maxOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\" type=\"xs:string\" abstract=\"true\" substitutionGroup=\"base\"/>"
+            "  <xs:element name=\"base\" type=\"xs:string\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot specify both abstract and substitutionGroup attributes") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element declarations that combine abstract and substitutionGroup attributes");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:key name=\"badKey\" refer=\"tns:OtherKey\">"
+            "      <xs:selector xpath=\".\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("key and unique constraints cannot specify a refer attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:key declarations that specify a refer attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:unique name=\"badUnique\" refer=\"tns:OtherKey\">"
+            "      <xs:selector xpath=\".\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:unique>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("key and unique constraints cannot specify a refer attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:unique declarations that specify a refer attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidSequenceType\">"
+            "    <xs:sequence>"
+            "      <xs:attribute name=\"illegal\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("sequence, choice, and all compositors can only declare annotation or particle children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject compositors that declare non-particle schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"AnnotatedSequenceType\">"
+            "    <xs:sequence>"
+            "      <xs:annotation>"
+            "        <xs:documentation>sequence annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "      <xs:element name=\"value\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:key name=\"badKey\">"
+            "      <xs:sequence>"
+            "        <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "      <xs:selector xpath=\".\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("identity constraints can only declare annotation, selector, and field children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject identity constraints that declare non-identity schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"annotatedValue\">"
+            "    <xs:key name=\"annotatedKey\">"
+            "      <xs:annotation>"
+            "        <xs:documentation>identity annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "      <xs:selector xpath=\".\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"value\">"
+            "    <xs:key name=\"badSelectorChild\">"
+            "      <xs:selector xpath=\".\">"
+            "        <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            "      </xs:selector>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("xs:selector can only declare annotation children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:selector declarations that declare non-annotation schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"annotatedSelectorValue\">"
+            "    <xs:key name=\"annotatedSelectorKey\">"
+            "      <xs:selector xpath=\".\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>selector annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "      </xs:selector>"
+            "      <xs:field xpath=\"@id\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>field annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "      </xs:field>"
+            "    </xs:key>"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:group name=\"InvalidGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:choice>"
+            "      <xs:element name=\"name\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:group>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group declarations can only declare one sequence, choice, all, or group child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject group declarations that mix multiple top-level content model children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:group name=\"InvalidGroup\">"
+            "    <xs:attribute name=\"code\" type=\"xs:string\"/>"
+            "    <xs:sequence>"
+            "      <xs:element name=\"value\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group declarations can only declare annotation and a single content model child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject group declarations that declare non-content children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:group name=\"ValidGroup\">"
+            "    <xs:annotation>"
+            "      <xs:documentation>group annotation</xs:documentation>"
+            "    </xs:annotation>"
+            "    <xs:sequence>"
+            "      <xs:element name=\"value\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"code\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:simpleType>"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:int\"/>"
+            "    </xs:simpleType>"
+            "  </xs:attribute>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("can only declare one inline simpleType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute declarations that declare multiple inline simpleType children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"code\" type=\"xs:string\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:simpleType>"
+            "  </xs:attribute>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot combine a type attribute with an inline simpleType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute declarations that mix a type attribute with an inline simpleType child");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"code\">"
+            "    <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            "  </xs:attribute>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute declarations can only declare annotation or inline simpleType children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute declarations that declare non-annotation schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"code\" type=\"xs:string\">"
+            "    <xs:annotation>"
+            "      <xs:documentation>attribute annotation</xs:documentation>"
+            "    </xs:annotation>"
+            "  </xs:attribute>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"code\" maxOccurs=\"unbounded\" type=\"xs:string\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("global attribute declarations cannot specify minOccurs or maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject global attribute declarations that specify minOccurs or maxOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidAttributeOnlyType\">"
+            "    <xs:attribute name=\"code\" type=\"xs:string\"/>"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\"/>"
+            "    </xs:simpleType>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexType declarations can only declare annotation, attribute, attributeGroup, and anyAttribute children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexType attribute-only declarations that declare non-attribute schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"AnnotatedAttributeOnlyType\">"
+            "    <xs:annotation>"
+            "      <xs:documentation>complexType annotation</xs:documentation>"
+            "    </xs:annotation>"
+            "    <xs:attribute name=\"code\" type=\"xs:string\"/>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidType\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"value\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "    <xs:anyAttribute namespace=\"##any\" processContents=\"skip\"/>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexType declarations can declare at most one anyAttribute child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexType declarations that declare multiple anyAttribute children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"InvalidAttrs\">"
+            "    <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "    <xs:anyAttribute namespace=\"##any\" processContents=\"skip\"/>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attributeGroup declarations can declare at most one anyAttribute child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attributeGroup declarations that declare multiple anyAttribute children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidWildcardType\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##invalid\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("wildcard namespace must use only ##any, ##other, ##targetNamespace, ##local, or explicit namespace URIs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:any declarations with unsupported wildcard namespace tokens");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"InvalidAttrs\">"
+            "    <xs:anyAttribute namespace=\"##invalid\" processContents=\"strict\"/>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("wildcard namespace must use only ##any, ##other, ##targetNamespace, ##local, or explicit namespace URIs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:anyAttribute declarations with unsupported wildcard namespace tokens");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"InvalidAttrs\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"value\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attributeGroup declarations can only declare annotation, attribute, attributeGroup, and anyAttribute children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attributeGroup declarations that declare non-attribute children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"ValidAttrs\">"
+            "    <xs:annotation>"
+            "      <xs:documentation>attributeGroup annotation</xs:documentation>"
+            "    </xs:annotation>"
+            "    <xs:attribute name=\"code\" type=\"xs:string\"/>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "        <xs:anyAttribute namespace=\"##local\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("restriction declarations can declare at most one anyAttribute child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restriction declarations that declare multiple anyAttribute children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"InvalidType\">"
+            "    <xs:sequence>"
+            "      <xs:any>"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\"/>"
+            "        </xs:simpleType>"
+            "      </xs:any>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("xs:any can only declare annotation children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:any declarations that declare non-annotation schema children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"InvalidAttrs\">"
+            "    <xs:anyAttribute>"
+            "      <xs:simpleType>"
+            "        <xs:restriction base=\"xs:string\"/>"
+            "      </xs:simpleType>"
+            "    </xs:anyAttribute>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("xs:anyAttribute can only declare annotation children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:anyAttribute declarations that declare non-annotation schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"ValidType\">"
+            "    <xs:sequence>"
+            "      <xs:any>"
+            "        <xs:annotation>"
+            "          <xs:documentation>wildcard annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "      </xs:any>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute>"
+            "      <xs:annotation>"
+            "        <xs:documentation>anyAttribute annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "    </xs:anyAttribute>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"globalAttr\" type=\"xs:string\"/>"
+            "  <xs:attributeGroup name=\"Attrs\">"
+            "    <xs:attribute ref=\"globalAttr\" name=\"localAttr\"/>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute references cannot specify a name") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute references that also declare a name");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"globalAttr\" type=\"xs:string\"/>"
+            "  <xs:attributeGroup name=\"Attrs\">"
+            "    <xs:attribute ref=\"globalAttr\" type=\"xs:int\"/>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute references cannot specify a type attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute references that also declare a type attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"globalAttr\" type=\"xs:string\"/>"
+            "  <xs:attributeGroup name=\"Attrs\">"
+            "    <xs:attribute ref=\"globalAttr\">"
+            "      <xs:simpleType>"
+            "        <xs:restriction base=\"xs:int\"/>"
+            "      </xs:simpleType>"
+            "    </xs:attribute>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute references cannot declare an inline simpleType") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute references that declare an inline simpleType");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"globalAttr\" type=\"xs:string\"/>"
+            "  <xs:attributeGroup name=\"Attrs\">"
+            "    <xs:attribute ref=\"globalAttr\" form=\"qualified\"/>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute references cannot specify a form attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute references that also declare a form attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"globalAttr\" type=\"xs:string\"/>"
+            "  <xs:attributeGroup name=\"Attrs\">"
+            "    <xs:attribute ref=\"globalAttr\">"
+            "      <xs:key name=\"localKey\">"
+            "        <xs:selector xpath=\".\"/>"
+            "        <xs:field xpath=\"@id\"/>"
+            "      </xs:key>"
+            "    </xs:attribute>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute references can only declare annotation children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute references that declare non-annotation schema children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"globalAttr\" type=\"xs:string\"/>"
+            "  <xs:attributeGroup name=\"Attrs\">"
+            "    <xs:attribute ref=\"globalAttr\">"
+            "      <xs:annotation>"
+            "        <xs:documentation>attribute ref annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "    </xs:attribute>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref\" targetNamespace=\"urn:element-ref\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" name=\"localElement\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a name") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a name");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref\" targetNamespace=\"urn:element-ref\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a type attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a type attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref\" targetNamespace=\"urn:element-ref\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" default=\"value\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify default or fixed values") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare default or fixed values");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref\" targetNamespace=\"urn:element-ref\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:extension base=\"xs:string\"/>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot declare an inline simpleType or complexType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that declare an inline type child");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:group-ref\" targetNamespace=\"urn:group-ref\">"
+            "  <xs:group name=\"SharedGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:group ref=\"tns:SharedGroup\" name=\"LocalGroup\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group references cannot specify a name") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject group references that also declare a name");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:group-ref\" targetNamespace=\"urn:group-ref\">"
+            "  <xs:group name=\"SharedGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:group ref=\"tns:SharedGroup\">"
+            "        <xs:choice>"
+            "          <xs:element name=\"name\" type=\"xs:string\"/>"
+            "        </xs:choice>"
+            "      </xs:group>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group references cannot declare inline content model children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject group references that declare inline content model children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:group name=\"SharedGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:group ref=\"SharedGroup\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>group ref annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "      </xs:group>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:attr-group-ref\" targetNamespace=\"urn:attr-group-ref\">"
+            "  <xs:attributeGroup name=\"SharedAttrs\">"
+            "    <xs:attribute name=\"id\" type=\"xs:int\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:attributeGroup ref=\"tns:SharedAttrs\" name=\"LocalAttrs\"/>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attributeGroup references cannot specify a name") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attributeGroup references that also declare a name");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:attr-group-ref\" targetNamespace=\"urn:attr-group-ref\">"
+            "  <xs:attributeGroup name=\"SharedAttrs\">"
+            "    <xs:attribute name=\"id\" type=\"xs:int\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:attributeGroup name=\"InvalidAttrs\">"
+            "    <xs:attributeGroup ref=\"tns:SharedAttrs\">"
+            "      <xs:attribute name=\"extra\" type=\"xs:string\"/>"
+            "    </xs:attributeGroup>"
+            "  </xs:attributeGroup>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attributeGroup references cannot declare local attribute or wildcard children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attributeGroup references that declare local attribute or wildcard children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attributeGroup name=\"SharedAttrs\">"
+            "    <xs:attribute name=\"id\" type=\"xs:int\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:attributeGroup ref=\"SharedAttrs\">"
+            "      <xs:annotation>"
+            "        <xs:documentation>ref annotation</xs:documentation>"
+            "      </xs:annotation>"
+            "    </xs:attributeGroup>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidList\">"
+            "    <xs:list itemType=\"xs:string\">"
+            "      <xs:simpleType>"
+            "        <xs:restriction base=\"xs:int\"/>"
+            "      </xs:simpleType>"
+            "    </xs:list>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list simpleType cannot combine an itemType attribute with an inline simpleType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject list simpleType declarations that mix itemType with an inline simpleType child");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:simpleType name=\"InvalidList\">"
+            "    <xs:list>"
+            "      <xs:simpleType>"
+            "        <xs:restriction base=\"xs:string\"/>"
+            "      </xs:simpleType>"
+            "      <xs:simpleType>"
+            "        <xs:restriction base=\"xs:int\"/>"
+            "      </xs:simpleType>"
+            "    </xs:list>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list simpleType can only declare one inline simpleType child") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject list simpleType declarations that declare multiple inline simpleType children");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" nillable=\"true\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a nillable attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a nillable attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" block=\"restriction\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a block attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a block attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" final=\"extension\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a final attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a final attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" form=\"qualified\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a form attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a form attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" abstract=\"true\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify an abstract attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare an abstract attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"head\" type=\"xs:string\"/>"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\" substitutionGroup=\"tns:head\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot specify a substitutionGroup attribute") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that also declare a substitutionGroup attribute");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\">"
+            "        <xs:key name=\"localKey\">"
+            "          <xs:selector xpath=\".\"/>"
+            "          <xs:field xpath=\"@id\"/>"
+            "        </xs:key>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element references cannot declare identity constraints") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element references that declare identity constraints");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:element-ref-extra\" targetNamespace=\"urn:element-ref-extra\">"
+            "  <xs:element name=\"globalElement\" type=\"xs:string\"/>"
+            "  <xs:complexType name=\"Container\">"
+            "    <xs:sequence>"
+            "      <xs:element ref=\"tns:globalElement\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>element ref annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
 
     threw = false;
     try {
@@ -3243,6 +4966,55 @@ void TestXmlSchemaRestrictionLegality() {
             || std::string(exception.what()).find("cannot omit required base sequence particles") != std::string::npos;
     }
     Assert(threw, "Schema loading should reject complexContent restrictions that add new sequence particles");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"BaseRecord\">"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\"/>"
+            "        </xs:simpleType>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexContent restriction can only declare annotation, particle, or attribute children") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that declare non-complexContent children");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"AnnotatedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"BaseRecord\">"
+            "        <xs:annotation>"
+            "          <xs:documentation>allowed annotation</xs:documentation>"
+            "        </xs:annotation>"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
 
     threw = false;
     try {
@@ -5940,6 +7712,8 @@ void TestXmlSchemaFileIncludesAndImports() {
     const auto badRootIncludeSchemaPath = tempDir / "bad-root-include.xsd";
     const auto wrongImportedSchemaPath = tempDir / "wrong-meta.xsd";
     const auto badRootImportSchemaPath = tempDir / "bad-root-import.xsd";
+    const auto illegalIncludeRootSchemaPath = tempDir / "illegal-include-root.xsd";
+    const auto illegalImportRootSchemaPath = tempDir / "illegal-import-root.xsd";
 
     {
         std::ofstream stream(sharedSchemaPath);
@@ -6018,6 +7792,28 @@ void TestXmlSchemaFileIncludesAndImports() {
             << "</xs:schema>";
     }
 
+    {
+        std::ofstream stream(illegalIncludeRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:catalog-files\">"
+            << "  <xs:include schemaLocation=\"shared.xsd\">"
+            << "    <xs:element name=\"illegal\" type=\"xs:string\"/>"
+            << "  </xs:include>"
+            << "  <xs:element name=\"catalog\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(illegalImportRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:meta=\"urn:meta-files\" targetNamespace=\"urn:catalog-files\">"
+            << "  <xs:import namespace=\"urn:meta-files\" schemaLocation=\"meta.xsd\">"
+            << "    <xs:complexType name=\"illegal\"/>"
+            << "  </xs:import>"
+            << "  <xs:element name=\"catalog\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
     try {
         XmlSchemaSet schemas;
         schemas.AddFile(rootSchemaPath.string());
@@ -6072,6 +7868,24 @@ void TestXmlSchemaFileIncludesAndImports() {
             threw = std::string(exception.what()).find("match the declared namespace") != std::string::npos;
         }
         Assert(threw, "Schema AddFile should reject xs:import when the referenced schema targetNamespace mismatches");
+
+        threw = false;
+        try {
+            XmlSchemaSet illegalIncludeSchemas;
+            illegalIncludeSchemas.AddFile(illegalIncludeRootSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("xs:include can only declare annotation children") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject xs:include declarations that declare non-annotation schema children");
+
+        threw = false;
+        try {
+            XmlSchemaSet illegalImportSchemas;
+            illegalImportSchemas.AddFile(illegalImportRootSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("xs:import can only declare annotation children") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject xs:import declarations that declare non-annotation schema children");
     } catch (...) {
         std::filesystem::remove_all(tempDir);
         throw;
@@ -6272,6 +8086,7 @@ void TestXmlSchemaFileOverrideAndRedefineHandling() {
     const auto baseSchemaPath = tempDir / "base.xsd";
     const auto overrideSchemaPath = tempDir / "override.xsd";
     const auto badOverrideSchemaPath = tempDir / "bad-override.xsd";
+    const auto unsupportedOverrideSchemaPath = tempDir / "unsupported-override.xsd";
     const auto wrongNamespaceSchemaPath = tempDir / "wrong-namespace.xsd";
     const auto redefineBaseSchemaPath = tempDir / "redefine-base.xsd";
     const auto redefineSchemaPath = tempDir / "redefine.xsd";
@@ -6324,6 +8139,18 @@ void TestXmlSchemaFileOverrideAndRedefineHandling() {
             << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:override-files\">"
             << "  <xs:override schemaLocation=\"wrong-namespace.xsd\">"
             << "    <xs:element name=\"detail\" type=\"xs:string\"/>"
+            << "  </xs:override>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(unsupportedOverrideSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:override schemaLocation=\"base.xsd\">"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"detail\" type=\"xs:string\"/>"
+            << "    </xs:sequence>"
             << "  </xs:override>"
             << "</xs:schema>";
     }
@@ -6458,6 +8285,15 @@ void TestXmlSchemaFileOverrideAndRedefineHandling() {
             threw = std::string(exception.what()).find("same targetNamespace") != std::string::npos;
         }
         Assert(threw, "Schema AddFile should reject xs:override when the referenced schema targetNamespace mismatches");
+
+        threw = false;
+        try {
+            XmlSchemaSet unsupportedOverrideSchemas;
+            unsupportedOverrideSchemas.AddFile(unsupportedOverrideSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("xs:override can only contain annotation, element, attribute, simpleType, complexType, group, and attributeGroup declarations") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject xs:override when it declares unsupported schema children");
 
         XmlSchemaSet redefineSchemas;
         redefineSchemas.AddFile(redefineSchemaPath.string());
@@ -7472,13 +9308,6 @@ void TestXmlSchemaDefaultAndFixedValues() {
         "      <xs:attribute name=\"requiredFixed\" fixed=\"stable\" type=\"xs:string\" use=\"required\"/>"
         "    </xs:complexType>"
         "  </xs:element>"
-        "  <xs:element name=\"badThreshold\" default=\"0\">"
-        "    <xs:simpleType>"
-        "      <xs:restriction base=\"xs:int\">"
-        "        <xs:minInclusive value=\"1\"/>"
-        "      </xs:restriction>"
-        "    </xs:simpleType>"
-        "  </xs:element>"
         "</xs:schema>";
 
     XmlSchemaSet schemas;
@@ -7531,16 +9360,6 @@ void TestXmlSchemaDefaultAndFixedValues() {
 
     threw = false;
     try {
-        const auto invalidDefaultValue = XmlDocument::Parse(
-            "<badThreshold xmlns=\"urn:defaults\"/>");
-        invalidDefaultValue->Validate(schemas);
-    } catch (const XmlException& exception) {
-        threw = std::string(exception.what()).find("must be >= 1") != std::string::npos;
-    }
-    Assert(threw, "Schema validation should validate element default values against the declared type facets");
-
-    threw = false;
-    try {
         XmlSchemaSet invalidSchemas;
         invalidSchemas.AddXml(
             "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
@@ -7562,6 +9381,44 @@ void TestXmlSchemaDefaultAndFixedValues() {
         threw = std::string(exception.what()).find("required attributes cannot specify a default value") != std::string::npos;
     }
     Assert(threw, "Schema loading should reject required attributes that declare a default value");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:defaults\">"
+            "  <xs:element name=\"badThreshold\" default=\"0\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:int\">"
+            "        <xs:minInclusive value=\"1\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("default value of element 'badThreshold'") != std::string::npos
+            && std::string(exception.what()).find("must be >= 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element default values that violate declared simpleType facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"mode\" fixed=\"manual\">"
+            "    <xs:simpleType>"
+            "      <xs:restriction base=\"xs:string\">"
+            "        <xs:enumeration value=\"auto\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleType>"
+            "  </xs:attribute>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("fixed value of attribute 'mode'") != std::string::npos
+            && std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attribute fixed values that violate declared simpleType facets");
 
     threw = false;
     try {
@@ -7744,7 +9601,7 @@ void TestXmlSchemaIdentityConstraints() {
         "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
         "          <xs:complexType>"
         "            <xs:sequence>"
-        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "              <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
         "                <xs:complexType>"
         "                  <xs:sequence>"
         "                    <xs:element name=\"meta\">"
@@ -7812,7 +9669,7 @@ void TestXmlSchemaIdentityConstraints() {
         "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
         "          <xs:complexType>"
         "            <xs:sequence>"
-        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "              <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
         "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
         "              </xs:element>"
         "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
@@ -8115,7 +9972,7 @@ void TestXmlSchemaIdentityConstraints() {
         threw = std::string(exception.what()).find("predSelectorBookRef") != std::string::npos
             && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
     }
-    Assert(threw, "Schema validation should fall back to DOM XPath for predicate selector identity constraints");
+    Assert(threw, "Schema validation should support predicate selector identity constraints");
 
     const std::string predicateFieldSchemaXml =
         "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-field\" targetNamespace=\"urn:identity-fallback-field\">"
@@ -8188,7 +10045,7 @@ void TestXmlSchemaIdentityConstraints() {
         threw = std::string(exception.what()).find("predFieldBookRef") != std::string::npos
             && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
     }
-    Assert(threw, "Schema validation should fall back to DOM XPath for predicate field identity constraints");
+    Assert(threw, "Schema validation should support predicate field identity constraints");
 
     const std::string namespaceWildcardSchemaXml =
         "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-ns-wildcard\" targetNamespace=\"urn:identity-ns-wildcard\">"
@@ -8491,7 +10348,315 @@ void TestXmlSchemaIdentityConstraints() {
         threw = std::string(exception.what()).find("axisFieldRef") != std::string::npos
             && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
     }
-    Assert(threw, "Schema validation should fall back to DOM XPath for axis-based field identity constraints");
+    Assert(threw, "Schema validation should support axis-based field identity constraints");
+
+    const std::string ancestorFieldSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-ancestor-field\" targetNamespace=\"urn:identity-fallback-ancestor-field\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType>"
+        "                  <xs:sequence>"
+        "                    <xs:element name=\"meta\" maxOccurs=\"unbounded\">"
+        "                      <xs:complexType><xs:attribute name=\"marker\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "                    </xs:element>"
+        "                  </xs:sequence>"
+        "                  <xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"ancestorFieldKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book/tns:meta\"/>"
+        "      <xs:field xpath=\"ancestor::tns:book/@token\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"ancestorFieldRef\" refer=\"tns:ancestorFieldKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"@tokenRef\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet ancestorFieldSchemas;
+    ancestorFieldSchemas.AddXml(ancestorFieldSchemaXml);
+
+    const auto ancestorFieldValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-fallback-ancestor-field\">"
+        "  <section>"
+        "    <book token=\"b1\">"
+        "      <meta marker=\"first\"/>"
+        "    </book>"
+        "    <reference tokenRef=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    ancestorFieldValid->Validate(ancestorFieldSchemas);
+
+    threw = false;
+    try {
+        const auto ancestorFieldInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-fallback-ancestor-field\">"
+            "  <section>"
+            "    <book token=\"b1\">"
+            "      <meta marker=\"first\"/>"
+            "    </book>"
+            "    <reference tokenRef=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        ancestorFieldInvalid->Validate(ancestorFieldSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("ancestorFieldRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support ancestor-axis identity constraint fields");
+
+    const std::string explicitAxisAliasSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-explicit-axis-alias\" targetNamespace=\"urn:identity-explicit-axis-alias\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"explicitAxisKey\">"
+        "      <xs:selector xpath=\"child::tns:section/child::tns:book\"/>"
+        "      <xs:field xpath=\"attribute::token\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"explicitAxisRef\" refer=\"tns:explicitAxisKey\">"
+        "      <xs:selector xpath=\"child::tns:section/child::tns:reference\"/>"
+        "      <xs:field xpath=\"attribute::tokenRef\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet explicitAxisAliasSchemas;
+    explicitAxisAliasSchemas.AddXml(explicitAxisAliasSchemaXml);
+
+    const auto explicitAxisAliasValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-explicit-axis-alias\">"
+        "  <section>"
+        "    <book token=\"b1\"/>"
+        "    <reference tokenRef=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    explicitAxisAliasValid->Validate(explicitAxisAliasSchemas);
+
+    threw = false;
+    try {
+        const auto explicitAxisAliasInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-explicit-axis-alias\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        explicitAxisAliasInvalid->Validate(explicitAxisAliasSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("explicitAxisRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support explicit child/attribute axis aliases in identity constraints");
+
+    const std::string descendantOrSelfAxisSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-descendant-or-self-axis\" targetNamespace=\"urn:identity-descendant-or-self-axis\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"descSelfKey\">"
+        "      <xs:selector xpath=\"descendant-or-self::tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"descSelfRef\" refer=\"tns:descSelfKey\">"
+        "      <xs:selector xpath=\"descendant::tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet descendantOrSelfAxisSchemas;
+    descendantOrSelfAxisSchemas.AddXml(descendantOrSelfAxisSchemaXml);
+
+    const auto descendantOrSelfAxisValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-descendant-or-self-axis\">"
+        "  <section>"
+        "    <book id=\"b1\"/>"
+        "    <reference bookId=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    descendantOrSelfAxisValid->Validate(descendantOrSelfAxisSchemas);
+
+    threw = false;
+    try {
+        const auto descendantOrSelfAxisInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-descendant-or-self-axis\">"
+            "  <section>"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        descendantOrSelfAxisInvalid->Validate(descendantOrSelfAxisSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("descSelfRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support explicit descendant axes in identity constraints");
+
+    const std::string siblingAxisSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-sibling-axis\" targetNamespace=\"urn:identity-sibling-axis\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"lookup\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenLookup\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"siblingKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"preceding-sibling::tns:book/@token\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"siblingRef\" refer=\"tns:siblingKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"following-sibling::tns:reference/@tokenRef\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet siblingAxisSchemas;
+    siblingAxisSchemas.AddXml(siblingAxisSchemaXml);
+
+    const auto siblingAxisValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-sibling-axis\">"
+        "  <section>"
+        "    <book token=\"b1\"/>"
+        "    <reference tokenRef=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    siblingAxisValid->Validate(siblingAxisSchemas);
+
+    threw = false;
+    try {
+        const auto siblingAxisInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-sibling-axis\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        siblingAxisInvalid->Validate(siblingAxisSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("siblingRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support sibling-axis identity constraints");
+
+    const std::string documentOrderAxisSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-document-order-axis\" targetNamespace=\"urn:identity-document-order-axis\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"group\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"docOrderKey\">"
+        "      <xs:selector xpath=\"tns:group/tns:reference\"/>"
+        "      <xs:field xpath=\"preceding::tns:book/@token\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"docOrderRef\" refer=\"tns:docOrderKey\">"
+        "      <xs:selector xpath=\"tns:group/tns:book\"/>"
+        "      <xs:field xpath=\"following::tns:reference/@tokenRef\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet documentOrderAxisSchemas;
+    documentOrderAxisSchemas.AddXml(documentOrderAxisSchemaXml);
+
+    const auto documentOrderAxisValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-document-order-axis\">"
+        "  <group>"
+        "    <book token=\"b1\"/>"
+        "  </group>"
+        "  <group>"
+        "    <reference tokenRef=\"b1\"/>"
+        "  </group>"
+        "</catalog>");
+    documentOrderAxisValid->Validate(documentOrderAxisSchemas);
+
+    threw = false;
+    try {
+        const auto documentOrderAxisInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-document-order-axis\">"
+            "  <group>"
+            "    <book token=\"b1\"/>"
+            "  </group>"
+            "  <group>"
+            "    <reference tokenRef=\"missing\"/>"
+            "  </group>"
+            "</catalog>");
+        documentOrderAxisInvalid->Validate(documentOrderAxisSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("docOrderRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support following/preceding identity constraints");
 
     const std::string partialFieldFallbackSchemaXml =
         "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-partial-field\" targetNamespace=\"urn:identity-fallback-partial-field\">"
@@ -8570,7 +10735,7 @@ void TestXmlSchemaIdentityConstraints() {
         threw = std::string(exception.what()).find("partialFieldRef") != std::string::npos
             && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
     }
-    Assert(threw, "Schema validation should fall back to DOM XPath when only part of a multi-field identity constraint can be compiled");
+    Assert(threw, "Schema validation should support predicate-based multi-field identity constraints");
 }
 
 void TestXmlSchemaIdAndIdRefTypes() {
@@ -10365,6 +12530,16 @@ void TestXmlSchemaXsiType() {
         "      </xs:restriction>"
         "    </xs:complexContent>"
         "  </xs:complexType>"
+        "  <xs:complexType name=\"AbstractAnimalType\" abstract=\"true\">"
+        "    <xs:attribute name=\"name\" type=\"xs:token\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"WorkingDogType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:AbstractAnimalType\">"
+        "        <xs:attribute name=\"breed\" type=\"xs:token\" use=\"required\"/>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
         "  <xs:complexType name=\"RestrictedAnimalType\" block=\"extension\">"
         "    <xs:attribute name=\"name\" type=\"xs:token\" use=\"required\"/>"
         "  </xs:complexType>"
@@ -10378,6 +12553,9 @@ void TestXmlSchemaXsiType() {
         "  <xs:element name=\"code\" type=\"xs:integer\"/>"
         "  <xs:element name=\"blockedCode\" type=\"xs:integer\" block=\"restriction\"/>"
         "  <xs:element name=\"pet\" type=\"tns:AnimalType\"/>"
+        "  <xs:element name=\"abstractPet\" type=\"tns:AbstractAnimalType\"/>"
+        "  <xs:element name=\"kennelPet\" type=\"tns:AbstractAnimalType\"/>"
+        "  <xs:element name=\"dynamicPet\" type=\"xs:anyType\"/>"
         "  <xs:element name=\"strictPet\" type=\"tns:AnimalType\" block=\"extension\"/>"
         "  <xs:element name=\"baseBlockedPet\" type=\"tns:RestrictedAnimalType\"/>"
         "</xs:schema>";
@@ -10392,6 +12570,10 @@ void TestXmlSchemaXsiType() {
     const auto validComplex = XmlDocument::Parse(
         "<pet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DogType\" name=\"Fido\" breed=\"collie\"/>");
     validComplex->Validate(schemas);
+
+    const auto validAbstractBaseOverride = XmlDocument::Parse(
+        "<kennelPet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:WorkingDogType\" name=\"Rex\" breed=\"shepherd\"/>");
+    validAbstractBaseOverride->Validate(schemas);
 
     bool threw = false;
     try {
@@ -10433,6 +12615,26 @@ void TestXmlSchemaXsiType() {
         threw = std::string(exception.what()).find("required attribute 'breed'") != std::string::npos;
     }
     Assert(threw, "Schema validation should apply xsi:type complexType attribute requirements");
+
+    threw = false;
+    try {
+        const auto abstractDeclaredType = XmlDocument::Parse(
+            "<abstractPet xmlns=\"urn:xsi-type\" name=\"Fido\"/>");
+        abstractDeclaredType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexType used by element 'abstractPet' is abstract") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject elements whose declared complexType is abstract without a concrete xsi:type override");
+
+    threw = false;
+    try {
+        const auto abstractXsiType = XmlDocument::Parse(
+            "<dynamicPet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:AbstractAnimalType\" name=\"Fido\"/>");
+        abstractXsiType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("complexType used by element 'dynamicPet' is abstract") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject abstract complexType values in xsi:type");
 
     threw = false;
     try {
@@ -11058,6 +13260,14 @@ void TestXPathSelection() {
     Assert(static_cast<XmlElement*>(nestedChildMatch.get())->GetAttribute("id") == "9",
         "child/grand='value' predicate result mismatch");
 
+    const auto parentPathDocument = XmlDocument::Parse(
+        "<root><item id=\"x\"><meta><title>Alpha</title></meta></item><item id=\"y\"><meta><title>Beta</title></meta></item></root>");
+    const auto parentPathMatch = parentPathDocument->SelectSingleNode("/root/item[meta/../@id='y']");
+    Assert(parentPathMatch != nullptr && parentPathMatch->NodeType() == XmlNodeType::Element,
+        "Predicate relative paths should support parent shorthand '..'");
+    Assert(static_cast<XmlElement*>(parentPathMatch.get())->GetAttribute("id") == "y",
+        "Predicate parent shorthand result mismatch");
+
     const auto filtered = root->SelectSingleNode("//item[@id='3']");
     Assert(filtered != nullptr && filtered->NodeType() == XmlNodeType::Element,
         "Element XPath descendant filter should find matching item");
@@ -11083,6 +13293,12 @@ void TestXPathSelection() {
         "XPath child existence and string functions should compose inside one predicate");
     Assert(static_cast<XmlElement*>(childExistsAndFunction.get())->GetAttribute("id") == "7",
         "XPath child existence/function predicate result mismatch");
+
+    const auto endsWithMatched = childTextDocument->SelectSingleNode("/root/item[ends-with(title, 'ta')]");
+    Assert(endsWithMatched != nullptr && endsWithMatched->NodeType() == XmlNodeType::Element,
+        "ends-with() predicates should be supported");
+    Assert(static_cast<XmlElement*>(endsWithMatched.get())->GetAttribute("id") == "7",
+        "ends-with() predicate result mismatch");
 
     const auto normalizedDocument = XmlDocument::Parse(
         "<root><item id=\"a\">  spaced   text  </item><item id=\"b\">plain</item></root>");
@@ -11118,6 +13334,57 @@ void TestXPathSelection() {
         "substring(), substring-before(), and substring-after() should be supported in predicates");
     Assert(static_cast<XmlElement*>(substringMatched.get())->GetAttribute("id") == "31",
         "substring-family predicate result mismatch");
+
+    const auto functionTargetMatched = childTextDocument->SelectSingleNode(
+        "/root/item[concat(@id, '-', translate(title, 'B', 'b'))='7-beta' and string(title)='Beta']");
+    Assert(functionTargetMatched != nullptr && functionTargetMatched->NodeType() == XmlNodeType::Element,
+        "concat(), translate(), and string() should compose inside predicates");
+    Assert(static_cast<XmlElement*>(functionTargetMatched.get())->GetAttribute("id") == "7",
+        "concat()/translate()/string() predicate result mismatch");
+
+    const auto booleanTargetMatched = childTextDocument->SelectSingleNode(
+        "/root/item[boolean(@id) and not(boolean(@missing))]");
+    Assert(booleanTargetMatched != nullptr && booleanTargetMatched->NodeType() == XmlNodeType::Element,
+        "boolean() should coerce node-set targets inside predicates");
+    Assert(static_cast<XmlElement*>(booleanTargetMatched.get())->GetAttribute("id") == "7",
+        "boolean() predicate result mismatch");
+
+    const auto numberDocument = XmlDocument::Parse(
+        "<root>"
+        "  <item id='low' score='1.4'/>"
+        "  <item id='mid' score='2.5'/>"
+        "  <item id='high' score='3.6'/>"
+        "  <value>1</value>"
+        "  <value>2</value>"
+        "  <value>3</value>"
+        "</root>");
+    const auto numberMatched = numberDocument->SelectSingleNode(
+        "/root/item[number(@score) > 3 and floor(@score)=3 and ceiling(@score)=4 and round(@score)=4]");
+    Assert(numberMatched != nullptr && numberMatched->NodeType() == XmlNodeType::Element,
+        "number(), floor(), ceiling(), and round() should be supported in predicates");
+    Assert(static_cast<XmlElement*>(numberMatched.get())->GetAttribute("id") == "high",
+        "number()/floor()/ceiling()/round() predicate result mismatch");
+
+    const auto sumMatchedRoot = numberDocument->SelectSingleNode("/root[sum(value)=6]");
+    Assert(sumMatchedRoot != nullptr && sumMatchedRoot->NodeType() == XmlNodeType::Element,
+        "sum() should aggregate numeric child-path values inside predicates");
+
+    const auto languageDocument = XmlDocument::Parse(
+        "<root xml:lang='en-US'>"
+        "  <item id='en'><title>Hello</title></item>"
+        "  <item id='fr' xml:lang='fr'><title>Bonjour</title></item>"
+        "</root>");
+    const auto inheritedLanguageMatched = languageDocument->SelectSingleNode("/root/item[lang('en')]");
+    Assert(inheritedLanguageMatched != nullptr && inheritedLanguageMatched->NodeType() == XmlNodeType::Element,
+        "lang() should honor inherited xml:lang values");
+    Assert(static_cast<XmlElement*>(inheritedLanguageMatched.get())->GetAttribute("id") == "en",
+        "lang() inherited-language predicate result mismatch");
+
+    const auto directLanguageMatched = languageDocument->SelectSingleNode("/root/item[lang('fr')]");
+    Assert(directLanguageMatched != nullptr && directLanguageMatched->NodeType() == XmlNodeType::Element,
+        "lang() should honor directly declared xml:lang values");
+    Assert(static_cast<XmlElement*>(directLanguageMatched.get())->GetAttribute("id") == "fr",
+        "lang() direct-language predicate result mismatch");
 }
 
 void TestXPathNamespaces() {
@@ -11228,6 +13495,15 @@ void TestXPathNamespaces() {
         namespaces);
     Assert(compositeNamespaceOr.Count() == 2,
         "Namespace-aware or-predicates should evaluate each branch against prefixed attributes");
+
+    const auto endsWithNamespaceBook = document->SelectSingleNode(
+        "/bk:catalog/bk:book[ends-with(@m:id, '2') and ends-with(bk:title, 'o')]",
+        namespaces);
+    Assert(endsWithNamespaceBook != nullptr && endsWithNamespaceBook->NodeType() == XmlNodeType::Element,
+        "Namespace-aware ends-with() predicates should be supported");
+    Assert(static_cast<XmlElement*>(endsWithNamespaceBook.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(endsWithNamespaceBook.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware ends-with() predicate result mismatch");
 
     const auto localNameMatch = document->SelectSingleNode("//*[local-name()='title' and namespace-uri()='urn:lib']", namespaces);
     Assert(localNameMatch != nullptr && localNameMatch->NodeType() == XmlNodeType::Element,
@@ -11515,6 +13791,18 @@ void TestXPathHighFrequencyFunctions() {
     Assert(static_cast<XmlElement*>(booleanStringContext.get())->GetAttribute("id") == "2",
         "string(title) boolean context result mismatch");
 
+    const auto notComparisonMatch = document->SelectSingleNode("/root/item[not(@missing)=true() and @id='2']");
+    Assert(notComparisonMatch != nullptr && notComparisonMatch->NodeType() == XmlNodeType::Element,
+        "not() should participate in comparison expressions without being misparsed as the whole predicate");
+    Assert(static_cast<XmlElement*>(notComparisonMatch.get())->GetAttribute("id") == "2",
+        "not() comparison predicate result mismatch");
+
+    const auto booleanWrappedNotMatch = document->SelectSingleNode("/root/item[boolean(not(@missing)) and @id='7']");
+    Assert(booleanWrappedNotMatch != nullptr && booleanWrappedNotMatch->NodeType() == XmlNodeType::Element,
+        "boolean() should accept not() target expressions as arguments");
+    Assert(static_cast<XmlElement*>(booleanWrappedNotMatch.get())->GetAttribute("id") == "7",
+        "boolean(not()) predicate result mismatch");
+
     const auto pathArgumentDocument = XmlDocument::Parse(
         "<root>"
         "<item><meta id=\"m1\">Alpha</meta></item>"
@@ -11650,11 +13938,6 @@ void TestInvalidXPathInputs() {
         "/root/item[contains('a', 'b', 'c')]",
         "Unsupported XPath feature: predicate [contains('a', 'b', 'c')]",
         "XPath predicate functions should reject extra arguments with a stable XmlException");
-
-    expectXPathExceptionMessage(
-        "/root/item[meta/../id='x']",
-        "Unsupported XPath feature: predicate path [meta/../id]",
-        "Unsupported parent-axis style predicate paths should throw a stable XmlException");
 
     expectXPathExceptionMessage(
         "/root/item[meta/text()/id='x']",
@@ -13816,9 +16099,9 @@ void TestXmlExceptionClassification() {
 
     expectXmlExceptionContaining(
         [] {
-            (void)XmlDocument::Parse("<!DOCTYPE root [<!ELEMENT root ANY>]><root/>");
+            (void)XmlDocument::Parse("<!DOCTYPE root [<!ENTITY % pe 'value'>]><root/>");
         },
-        "Unsupported DTD declaration: ELEMENT",
+        "Unsupported DTD declaration: parameter entity",
         "Unsupported DTD declarations should stay in the unsupported XmlException category");
 
     expectXmlExceptionContaining(
@@ -14051,6 +16334,42 @@ void TestXmlReaderConfiguration() {
             "Original reader should still read the child end element after subtree creation");
         Assert(subtreeSource.Read() && subtreeSource.Name() == "other",
             "Original reader should continue to sibling elements after subtree use");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:subtree-reader\">"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:sequence><xs:element name=\"child\" type=\"xs:string\"/></xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+
+        std::istringstream stream("<root xmlns=\"urn:subtree-reader\"><child>42</child></root>");
+        auto subtreeSource = XmlReader::Create(stream, settings);
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "root",
+            "Schema-validating subtree source should read root");
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "child",
+            "Schema-validating subtree source should read child");
+
+        bool threw = false;
+        try {
+            auto subtree = subtreeSource.ReadSubtree();
+            Assert(subtree.Read() && subtree.Name() == "child",
+                "Schema-validating ReadSubtree should still start at the current child element");
+            Assert(subtree.Read() && subtree.NodeType() == XmlNodeType::Text && subtree.Value() == "42",
+                "Schema-validating ReadSubtree should still expose descendant text");
+        } catch (const XmlException&) {
+            threw = true;
+        }
+        Assert(!threw,
+            "Schema-validating stream-backed ReadSubtree should not fail during subtree creation");
     }
 
     {
@@ -14321,7 +16640,7 @@ void TestXmlReaderConfiguration() {
             "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
             "          <xs:complexType>"
             "            <xs:sequence>"
-            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "              <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
             "                <xs:complexType>"
             "                  <xs:sequence>"
             "                    <xs:element name=\"meta\">"
@@ -14389,7 +16708,7 @@ void TestXmlReaderConfiguration() {
             "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
             "          <xs:complexType>"
             "            <xs:sequence>"
-            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "              <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
             "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
             "              </xs:element>"
             "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
@@ -15095,7 +17414,7 @@ void TestXmlReaderConfiguration() {
             "</catalog>",
             axisFieldIdentitySettings);
         Assert(axisFieldIdentityReader.Read() && axisFieldIdentityReader.Name() == "catalog",
-            "Schema-valid axis-based field identity-constraint reader input should fall back and still create a working reader");
+            "Schema-valid axis-based field identity-constraint reader input should still create a working reader");
 
         threw = false;
         try {
@@ -15111,7 +17430,332 @@ void TestXmlReaderConfiguration() {
             threw = std::string(exception.what()).find("axisFieldRef") != std::string::npos
                 && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
         }
-        Assert(threw, "Schema-invalid axis-based field identity-constraint reader input should fail during DOM fallback validation");
+        Assert(threw, "Schema-invalid axis-based field identity-constraint reader input should still fail schema validation");
+
+        const auto ancestorFieldIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        ancestorFieldIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-ancestor-field\" targetNamespace=\"urn:reader-identity-fallback-ancestor-field\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType>"
+            "                  <xs:sequence>"
+            "                    <xs:element name=\"meta\" maxOccurs=\"unbounded\">"
+            "                      <xs:complexType><xs:attribute name=\"marker\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "                    </xs:element>"
+            "                  </xs:sequence>"
+            "                  <xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"ancestorFieldKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book/tns:meta\"/>"
+            "      <xs:field xpath=\"ancestor::tns:book/@token\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"ancestorFieldRef\" refer=\"tns:ancestorFieldKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"@tokenRef\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings ancestorFieldIdentitySettings;
+        ancestorFieldIdentitySettings.Validation = ValidationType::Schema;
+        ancestorFieldIdentitySettings.Schemas = ancestorFieldIdentitySchemas;
+
+        auto ancestorFieldIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-fallback-ancestor-field\">"
+            "  <section>"
+            "    <book token=\"b1\">"
+            "      <meta marker=\"first\"/>"
+            "    </book>"
+            "    <reference tokenRef=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            ancestorFieldIdentitySettings);
+        Assert(ancestorFieldIdentityReader.Read() && ancestorFieldIdentityReader.Name() == "catalog",
+            "Schema-valid ancestor-axis identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-fallback-ancestor-field\">"
+                "  <section>"
+                "    <book token=\"b1\">"
+                "      <meta marker=\"first\"/>"
+                "    </book>"
+                "    <reference tokenRef=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                ancestorFieldIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("ancestorFieldRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid ancestor-axis identity-constraint reader input should still fail schema validation");
+
+        const auto explicitAxisAliasIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        explicitAxisAliasIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-explicit-axis-alias\" targetNamespace=\"urn:reader-identity-explicit-axis-alias\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"explicitAxisKey\">"
+            "      <xs:selector xpath=\"child::tns:section/child::tns:book\"/>"
+            "      <xs:field xpath=\"attribute::token\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"explicitAxisRef\" refer=\"tns:explicitAxisKey\">"
+            "      <xs:selector xpath=\"child::tns:section/child::tns:reference\"/>"
+            "      <xs:field xpath=\"attribute::tokenRef\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings explicitAxisAliasIdentitySettings;
+        explicitAxisAliasIdentitySettings.Validation = ValidationType::Schema;
+        explicitAxisAliasIdentitySettings.Schemas = explicitAxisAliasIdentitySchemas;
+
+        auto explicitAxisAliasIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-explicit-axis-alias\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            explicitAxisAliasIdentitySettings);
+        Assert(explicitAxisAliasIdentityReader.Read() && explicitAxisAliasIdentityReader.Name() == "catalog",
+            "Schema-valid explicit child/attribute axis alias reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-explicit-axis-alias\">"
+                "  <section>"
+                "    <book token=\"b1\"/>"
+                "    <reference tokenRef=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                explicitAxisAliasIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("explicitAxisRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid explicit child/attribute axis alias reader input should still fail schema validation");
+
+        const auto descendantOrSelfAxisIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        descendantOrSelfAxisIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-descendant-or-self-axis\" targetNamespace=\"urn:reader-identity-descendant-or-self-axis\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"descSelfKey\">"
+            "      <xs:selector xpath=\"descendant-or-self::tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"descSelfRef\" refer=\"tns:descSelfKey\">"
+            "      <xs:selector xpath=\"descendant::tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings descendantOrSelfAxisIdentitySettings;
+        descendantOrSelfAxisIdentitySettings.Validation = ValidationType::Schema;
+        descendantOrSelfAxisIdentitySettings.Schemas = descendantOrSelfAxisIdentitySchemas;
+
+        auto descendantOrSelfAxisIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-descendant-or-self-axis\">"
+            "  <section>"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            descendantOrSelfAxisIdentitySettings);
+        Assert(descendantOrSelfAxisIdentityReader.Read() && descendantOrSelfAxisIdentityReader.Name() == "catalog",
+            "Schema-valid explicit descendant axis reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-descendant-or-self-axis\">"
+                "  <section>"
+                "    <book id=\"b1\"/>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                descendantOrSelfAxisIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("descSelfRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid explicit descendant axis reader input should still fail schema validation");
+
+        const auto siblingAxisIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        siblingAxisIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-sibling-axis\" targetNamespace=\"urn:reader-identity-sibling-axis\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"siblingKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"preceding-sibling::tns:book/@token\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"siblingRef\" refer=\"tns:siblingKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"following-sibling::tns:reference/@tokenRef\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings siblingAxisIdentitySettings;
+        siblingAxisIdentitySettings.Validation = ValidationType::Schema;
+        siblingAxisIdentitySettings.Schemas = siblingAxisIdentitySchemas;
+
+        auto siblingAxisIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-sibling-axis\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            siblingAxisIdentitySettings);
+        Assert(siblingAxisIdentityReader.Read() && siblingAxisIdentityReader.Name() == "catalog",
+            "Schema-valid sibling-axis identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-sibling-axis\">"
+                "  <section>"
+                "    <book token=\"b1\"/>"
+                "    <reference tokenRef=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                siblingAxisIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("siblingRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid sibling-axis identity-constraint reader input should still fail schema validation");
+
+        const auto documentOrderAxisIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        documentOrderAxisIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-document-order-axis\" targetNamespace=\"urn:reader-identity-document-order-axis\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"group\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"docOrderKey\">"
+            "      <xs:selector xpath=\"tns:group/tns:reference\"/>"
+            "      <xs:field xpath=\"preceding::tns:book/@token\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"docOrderRef\" refer=\"tns:docOrderKey\">"
+            "      <xs:selector xpath=\"tns:group/tns:book\"/>"
+            "      <xs:field xpath=\"following::tns:reference/@tokenRef\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings documentOrderAxisIdentitySettings;
+        documentOrderAxisIdentitySettings.Validation = ValidationType::Schema;
+        documentOrderAxisIdentitySettings.Schemas = documentOrderAxisIdentitySchemas;
+
+        auto documentOrderAxisIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-document-order-axis\">"
+            "  <group>"
+            "    <book token=\"b1\"/>"
+            "  </group>"
+            "  <group>"
+            "    <reference tokenRef=\"b1\"/>"
+            "  </group>"
+            "</catalog>",
+            documentOrderAxisIdentitySettings);
+        Assert(documentOrderAxisIdentityReader.Read() && documentOrderAxisIdentityReader.Name() == "catalog",
+            "Schema-valid following/preceding identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-document-order-axis\">"
+                "  <group>"
+                "    <book token=\"b1\"/>"
+                "  </group>"
+                "  <group>"
+                "    <reference tokenRef=\"missing\"/>"
+                "  </group>"
+                "</catalog>",
+                documentOrderAxisIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("docOrderRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid following/preceding identity-constraint reader input should still fail schema validation");
 
         const auto partialFieldFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
         partialFieldFallbackIdentitySchemas->AddXml(
@@ -15175,7 +17819,7 @@ void TestXmlReaderConfiguration() {
             "</catalog>",
             partialFieldFallbackIdentitySettings);
         Assert(partialFieldFallbackIdentityReader.Read() && partialFieldFallbackIdentityReader.Name() == "catalog",
-            "Schema-valid partially compiled multi-field identity-constraint reader input should fall back and still create a working reader");
+            "Schema-valid predicate-based multi-field identity-constraint reader input should still create a working reader");
 
         threw = false;
         try {
@@ -15194,7 +17838,7 @@ void TestXmlReaderConfiguration() {
             threw = std::string(exception.what()).find("partialFieldRef") != std::string::npos
                 && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
         }
-        Assert(threw, "Schema-invalid partially compiled multi-field identity-constraint reader input should fail during DOM fallback validation");
+        Assert(threw, "Schema-invalid predicate-based multi-field identity-constraint reader input should still fail schema validation");
 
         const auto positionedFallbackSchemas = std::make_shared<XmlSchemaSet>();
         positionedFallbackSchemas->AddXml(
@@ -16077,6 +18721,24 @@ void TestXPathAxes() {
     const auto selfNoMatch = static_cast<XmlElement*>(g1.get())->SelectNodes("self::item");
     Assert(selfNoMatch.Count() == 0,
         "self::item should not match when the context node is a group element");
+
+    const auto explicitChildAxis = root->SelectNodes("child::group/child::item");
+    Assert(explicitChildAxis.Count() == 5,
+        "child:: axis should match the same element sequence as the abbreviated child path");
+
+    const auto attributeAxis = static_cast<XmlElement*>(firstItem.get())->SelectNodes("attribute::id");
+    Assert(attributeAxis.Count() == 1 && attributeAxis.Item(0) != nullptr
+            && attributeAxis.Item(0)->NodeType() == XmlNodeType::Attribute
+            && attributeAxis.Item(0)->Value() == "a",
+        "attribute::id should return the requested attribute node");
+
+    const auto descendantAxis = root->SelectNodes("descendant::item");
+    Assert(descendantAxis.Count() == 5,
+        "descendant::item should match all descendant item elements");
+
+    const auto descendantOrSelfAxis = root->SelectNodes("descendant-or-self::root");
+    Assert(descendantOrSelfAxis.Count() == 1 && descendantOrSelfAxis.Item(0).get() == root.get(),
+        "descendant-or-self::root should include the context node when it matches");
 }
 
 void TestXPathUnionOperator() {

@@ -42,3 +42,11 @@
 /.vs/LibXml/CopilotIndices/17.14.1641.39856
 /.vs/LibXml/FileContentIndex
 /.vs
+/backup
+/build-int
+/src/System.Xml/build/System.Xml/Debug
+/src/System.Xml/build-int/System.Xml/Debug/System.Xml.tlog
+/src/System.Xml/build-int/System.Xml/Debug
+/tests/System.Xml.Tests/build-int/System.Xml.Tests/Debug
+/LIBXML_TODO.md
+/build/System.Xml/Debug
