@@ -1,0 +1,17412 @@
+#include "System/Xml/Xml.h"
+
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+
+using namespace System::Xml;
+
+namespace System::Xml {
+void ValidateXmlReaderInputAgainstSchemas(XmlReader& reader, const XmlReaderSettings& settings);
+}
+
+namespace {
+
+void Assert(bool condition, const std::string& message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+class TestResolver final : public XmlResolver {
+public:
+    std::string ResolveUri(const std::string& baseUri, const std::string& relativeUri) const override {
+        return XmlUrlResolver().ResolveUri(baseUri, relativeUri);
+    }
+
+    std::string GetEntity(const std::string& absoluteUri) const override {
+        return XmlUrlResolver().GetEntity(absoluteUri);
+    }
+};
+
+class NonSeekableStringStreamBuf final : public std::streambuf {
+public:
+    explicit NonSeekableStringStreamBuf(std::string text)
+        : text_(std::move(text)) {
+        char* begin = text_.data();
+        setg(begin, begin, begin + static_cast<std::ptrdiff_t>(text_.size()));
+    }
+
+protected:
+    std::streampos seekoff(std::streamoff, std::ios_base::seekdir, std::ios_base::openmode) override {
+        return std::streampos(std::streamoff(-1));
+    }
+
+    std::streampos seekpos(std::streampos, std::ios_base::openmode) override {
+        return std::streampos(std::streamoff(-1));
+    }
+
+private:
+    std::string text_;
+};
+
+class NonSeekableStringStream final : public std::istream {
+public:
+    explicit NonSeekableStringStream(std::string text)
+        : std::istream(&buffer_),
+          buffer_(std::move(text)) {
+    }
+
+private:
+    NonSeekableStringStreamBuf buffer_;
+};
+
+std::string FormatExpectedXmlException(const std::string& message, std::size_t line, std::size_t column) {
+    return message + " (line " + std::to_string(line) + ", column " + std::to_string(column) + ')';
+}
+
+template <typename TAction>
+void AssertXmlExceptionDetails(
+    TAction action,
+    const std::string& expectedMessage,
+    std::size_t expectedLine,
+    std::size_t expectedColumn,
+    const std::string& label) {
+    bool threw = false;
+    try {
+        action();
+    } catch (const XmlException& exception) {
+        threw = true;
+        Assert(exception.Line() == expectedLine,
+            label + " line mismatch: actual=" + std::to_string(exception.Line())
+                + ", expected=" + std::to_string(expectedLine)
+                + ", what='" + exception.what() + "'");
+        Assert(exception.Column() == expectedColumn,
+            label + " column mismatch: actual=" + std::to_string(exception.Column())
+                + ", expected=" + std::to_string(expectedColumn)
+                + ", what='" + exception.what() + "'");
+        Assert(std::string(exception.what()) == FormatExpectedXmlException(expectedMessage, expectedLine, expectedColumn),
+            label + " message mismatch: actual='" + exception.what()
+                + "', expected='" + FormatExpectedXmlException(expectedMessage, expectedLine, expectedColumn) + "'");
+    }
+
+    Assert(threw, label + " should throw XmlException");
+}
+
+template <typename TAction>
+void AssertXmlExceptionMessage(TAction action, const std::string& expectedMessage, const std::string& label) {
+    bool threw = false;
+    try {
+        action();
+    } catch (const XmlException& exception) {
+        threw = true;
+        Assert(std::string(exception.what()) == expectedMessage,
+            label + " message mismatch: actual='" + exception.what() + "', expected='" + expectedMessage + "'");
+    }
+
+    Assert(threw, label + " should throw XmlException");
+}
+
+struct NodeBoundaryExpectation {
+    std::shared_ptr<XmlNode> node;
+    std::string label;
+    std::string expectedName;
+    std::string expectedValue;
+    std::string expectedInnerText;
+    std::string expectedInnerXml;
+    std::string expectedOuterXml;
+};
+
+void AssertNodeBoundaryView(const NodeBoundaryExpectation& expectation) {
+    Assert(expectation.node != nullptr, expectation.label + " node should not be null");
+    Assert(expectation.node->Name() == expectation.expectedName,
+        expectation.label + " Name mismatch: actual='" + expectation.node->Name()
+            + "', expected='" + expectation.expectedName + "'");
+    Assert(expectation.node->Value() == expectation.expectedValue,
+        expectation.label + " Value mismatch: actual='" + expectation.node->Value()
+            + "', expected='" + expectation.expectedValue + "'");
+    Assert(expectation.node->InnerText() == expectation.expectedInnerText,
+        expectation.label + " InnerText mismatch: actual='" + expectation.node->InnerText()
+            + "', expected='" + expectation.expectedInnerText + "'");
+    Assert(expectation.node->InnerXml() == expectation.expectedInnerXml,
+        expectation.label + " InnerXml mismatch: actual='" + expectation.node->InnerXml()
+            + "', expected='" + expectation.expectedInnerXml + "'");
+    Assert(expectation.node->OuterXml() == expectation.expectedOuterXml,
+        expectation.label + " OuterXml mismatch: actual='" + expectation.node->OuterXml()
+            + "', expected='" + expectation.expectedOuterXml + "'");
+}
+
+struct ReaderEventSnapshot {
+    XmlNodeType nodeType = XmlNodeType::None;
+    std::string name;
+    std::string value;
+    int depth = 0;
+    bool hasValue = false;
+    bool isEmptyElement = false;
+    std::string innerXml;
+    std::string outerXml;
+    std::vector<std::pair<std::string, std::string>> attributes;
+};
+
+bool IsComparableReaderNodeType(XmlNodeType nodeType) {
+    switch (nodeType) {
+    case XmlNodeType::Element:
+    case XmlNodeType::Text:
+    case XmlNodeType::CDATA:
+    case XmlNodeType::Whitespace:
+    case XmlNodeType::SignificantWhitespace:
+    case XmlNodeType::EntityReference:
+    case XmlNodeType::ProcessingInstruction:
+    case XmlNodeType::Comment:
+    case XmlNodeType::EndElement:
+    case XmlNodeType::EndEntity:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ReaderNodeTypeUsesName(XmlNodeType nodeType) {
+    return nodeType == XmlNodeType::XmlDeclaration
+        || nodeType == XmlNodeType::DocumentType
+        || nodeType == XmlNodeType::Element
+        || nodeType == XmlNodeType::EntityReference
+        || nodeType == XmlNodeType::EndElement
+        || nodeType == XmlNodeType::EndEntity
+        || nodeType == XmlNodeType::ProcessingInstruction;
+}
+
+std::string ReaderNodeTypeLabel(XmlNodeType nodeType) {
+    switch (nodeType) {
+    case XmlNodeType::None: return "None";
+    case XmlNodeType::Element: return "Element";
+    case XmlNodeType::Attribute: return "Attribute";
+    case XmlNodeType::Text: return "Text";
+    case XmlNodeType::CDATA: return "CDATA";
+    case XmlNodeType::EntityReference: return "EntityReference";
+    case XmlNodeType::Entity: return "Entity";
+    case XmlNodeType::ProcessingInstruction: return "ProcessingInstruction";
+    case XmlNodeType::Comment: return "Comment";
+    case XmlNodeType::Document: return "Document";
+    case XmlNodeType::DocumentType: return "DocumentType";
+    case XmlNodeType::DocumentFragment: return "DocumentFragment";
+    case XmlNodeType::Notation: return "Notation";
+    case XmlNodeType::Whitespace: return "Whitespace";
+    case XmlNodeType::SignificantWhitespace: return "SignificantWhitespace";
+    case XmlNodeType::EndElement: return "EndElement";
+    case XmlNodeType::EndEntity: return "EndEntity";
+    case XmlNodeType::XmlDeclaration: return "XmlDeclaration";
+    default: return "Unknown";
+    }
+}
+
+struct ReaderBoundaryExpectation {
+    XmlNodeType expectedNodeType = XmlNodeType::None;
+    std::string expectedName;
+    std::string expectedValue;
+    int expectedDepth = 0;
+    bool expectedHasValue = false;
+    bool expectedIsEmptyElement = false;
+    std::string expectedInnerXml;
+    std::string expectedOuterXml;
+    int expectedAttributeCount = 0;
+};
+
+template <typename TReader>
+void AssertReaderBoundaryView(TReader& reader, const ReaderBoundaryExpectation& expectation, const std::string& label) {
+    Assert(reader.Read(), label + " should yield a reader event");
+    Assert(reader.NodeType() == expectation.expectedNodeType,
+        label + " node type mismatch: actual=" + ReaderNodeTypeLabel(reader.NodeType())
+            + ", expected=" + ReaderNodeTypeLabel(expectation.expectedNodeType));
+    Assert(reader.Name() == expectation.expectedName,
+        label + " Name mismatch: actual='" + reader.Name()
+            + "', expected='" + expectation.expectedName + "'");
+    Assert(reader.Value() == expectation.expectedValue,
+        label + " Value mismatch: actual='" + reader.Value()
+            + "', expected='" + expectation.expectedValue + "'");
+    Assert(reader.Depth() == expectation.expectedDepth,
+        label + " Depth mismatch: actual=" + std::to_string(reader.Depth())
+            + ", expected=" + std::to_string(expectation.expectedDepth));
+    Assert(reader.HasValue() == expectation.expectedHasValue,
+        label + " HasValue mismatch");
+    Assert(reader.IsEmptyElement() == expectation.expectedIsEmptyElement,
+        label + " IsEmptyElement mismatch");
+    Assert(reader.ReadInnerXml() == expectation.expectedInnerXml,
+        label + " ReadInnerXml mismatch: actual='" + reader.ReadInnerXml()
+            + "', expected='" + expectation.expectedInnerXml + "'");
+    Assert(reader.ReadOuterXml() == expectation.expectedOuterXml,
+        label + " ReadOuterXml mismatch: actual='" + reader.ReadOuterXml()
+            + "', expected='" + expectation.expectedOuterXml + "'");
+    Assert(reader.AttributeCount() == expectation.expectedAttributeCount,
+        label + " AttributeCount mismatch: actual=" + std::to_string(reader.AttributeCount())
+            + ", expected=" + std::to_string(expectation.expectedAttributeCount));
+}
+
+std::string DescribeReaderEventSnapshot(const ReaderEventSnapshot& event) {
+    std::string description = ReaderNodeTypeLabel(event.nodeType) + " depth=" + std::to_string(event.depth);
+    if (!event.name.empty()) {
+        description += " name=" + event.name;
+    }
+    if (!event.value.empty()) {
+        description += " value=" + event.value;
+    }
+    if (event.isEmptyElement) {
+        description += " empty=true";
+    }
+    if (!event.attributes.empty()) {
+        description += " attrs=" + std::to_string(event.attributes.size());
+    }
+    return description;
+}
+
+template <typename TReader>
+std::vector<std::pair<std::string, std::string>> CaptureReaderAttributes(TReader& reader) {
+    std::vector<std::pair<std::string, std::string>> attributes;
+    if (!reader.MoveToFirstAttribute()) {
+        return attributes;
+    }
+
+    do {
+        attributes.emplace_back(reader.Name(), reader.Value());
+    } while (reader.MoveToNextAttribute());
+
+    reader.MoveToElement();
+    return attributes;
+}
+
+template <typename TReader>
+void AppendComparableReaderEventSnapshot(TReader& reader, std::vector<ReaderEventSnapshot>& events) {
+    if (!IsComparableReaderNodeType(reader.NodeType())) {
+        return;
+    }
+
+    events.push_back(ReaderEventSnapshot{
+        reader.NodeType(),
+        ReaderNodeTypeUsesName(reader.NodeType()) ? reader.Name() : std::string{},
+        reader.Value(),
+        reader.Depth(),
+        reader.HasValue(),
+        reader.IsEmptyElement(),
+        reader.ReadInnerXml(),
+        reader.ReadOuterXml(),
+        reader.NodeType() == XmlNodeType::Element ? CaptureReaderAttributes(reader) : std::vector<std::pair<std::string, std::string>>{}});
+}
+
+template <typename TReader>
+std::vector<ReaderEventSnapshot> CaptureComparableReaderEvents(TReader& reader, bool includeCurrent = false) {
+    std::vector<ReaderEventSnapshot> events;
+    if (includeCurrent) {
+        AppendComparableReaderEventSnapshot(reader, events);
+    }
+    while (reader.Read()) {
+        AppendComparableReaderEventSnapshot(reader, events);
+    }
+
+    return events;
+}
+
+template <typename TReader, typename TPredicate>
+std::vector<ReaderEventSnapshot> CaptureReaderEventsMatching(TReader& reader, TPredicate predicate, bool includeCurrent = false) {
+    std::vector<ReaderEventSnapshot> events;
+
+    auto appendCurrent = [&]() {
+        if (!predicate(reader.NodeType())) {
+            return;
+        }
+
+        events.push_back(ReaderEventSnapshot{
+            reader.NodeType(),
+            ReaderNodeTypeUsesName(reader.NodeType()) ? reader.Name() : std::string{},
+            reader.Value(),
+            reader.Depth(),
+            reader.HasValue(),
+            reader.IsEmptyElement(),
+            reader.ReadInnerXml(),
+            reader.ReadOuterXml(),
+            reader.NodeType() == XmlNodeType::Element ? CaptureReaderAttributes(reader) : std::vector<std::pair<std::string, std::string>>{}});
+    };
+
+    if (includeCurrent) {
+        appendCurrent();
+    }
+
+    while (reader.Read()) {
+        appendCurrent();
+    }
+
+    return events;
+}
+
+std::vector<ReaderEventSnapshot> FilterReaderEventSnapshots(
+    const std::vector<ReaderEventSnapshot>& events,
+    bool ignoreWhitespace,
+    bool ignoreComments,
+    bool ignoreProcessingInstructions) {
+    std::vector<ReaderEventSnapshot> filtered;
+    filtered.reserve(events.size());
+
+    for (const auto& event : events) {
+        if (ignoreWhitespace
+            && (event.nodeType == XmlNodeType::Whitespace || event.nodeType == XmlNodeType::SignificantWhitespace)) {
+            continue;
+        }
+        if (ignoreComments && event.nodeType == XmlNodeType::Comment) {
+            continue;
+        }
+        if (ignoreProcessingInstructions && event.nodeType == XmlNodeType::ProcessingInstruction) {
+            continue;
+        }
+        filtered.push_back(event);
+    }
+
+    return filtered;
+}
+
+void AssertReaderParity(const std::vector<ReaderEventSnapshot>& actual, const std::vector<ReaderEventSnapshot>& expected, const std::string& label) {
+    Assert(actual.size() == expected.size(),
+        label + " event count mismatch: actual=" + std::to_string(actual.size()) + ", expected=" + std::to_string(expected.size()));
+
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto& actualEvent = actual[index];
+        const auto& expectedEvent = expected[index];
+        Assert(actualEvent.nodeType == expectedEvent.nodeType,
+            label + " node type mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        if (ReaderNodeTypeUsesName(expectedEvent.nodeType)) {
+            Assert(actualEvent.name == expectedEvent.name,
+                label + " name mismatch at event " + std::to_string(index)
+                    + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                    + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        }
+        Assert(actualEvent.value == expectedEvent.value,
+            label + " value mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        Assert(actualEvent.depth == expectedEvent.depth,
+            label + " depth mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        Assert(actualEvent.hasValue == expectedEvent.hasValue,
+            label + " HasValue mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        Assert(actualEvent.isEmptyElement == expectedEvent.isEmptyElement,
+            label + " IsEmptyElement mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        Assert(actualEvent.innerXml == expectedEvent.innerXml,
+            label + " ReadInnerXml mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        Assert(actualEvent.outerXml == expectedEvent.outerXml,
+            label + " ReadOuterXml mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+        Assert(actualEvent.attributes == expectedEvent.attributes,
+            label + " attribute snapshot mismatch at event " + std::to_string(index)
+                + ": actual=" + DescribeReaderEventSnapshot(actualEvent)
+                + ", expected=" + DescribeReaderEventSnapshot(expectedEvent));
+    }
+}
+
+void TestParseDocument() {
+    const std::string xml =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<!DOCTYPE catalog SYSTEM \"catalog.dtd\">"
+        "<catalog id=\"root\">"
+        "<book id=\"b1\">Hello &amp; <![CDATA[<raw>]]><!--note--><?pi value?></book>"
+        "</catalog>";
+
+    const auto document = XmlDocument::Parse(xml);
+    Assert(document->Declaration() != nullptr, "XML declaration was not parsed");
+    Assert(document->Declaration()->Encoding() == "utf-8", "Encoding should be parsed from declaration");
+    Assert(document->DocumentType() != nullptr, "DOCTYPE should be parsed");
+    Assert(document->DocumentType()->SystemId() == "catalog.dtd", "DOCTYPE system id mismatch");
+
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "Root element missing");
+    Assert(root->Name() == "catalog", "Root element name mismatch");
+    Assert(root->GetAttribute("id") == "root", "Root attribute mismatch");
+
+    const auto book = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("book"));
+    Assert(book != nullptr, "Nested element should be available");
+    Assert(book->GetAttribute("id") == "b1", "Attribute parsing failed");
+    Assert(book->InnerText() == "Hello & <raw>", "Entity decoding or CDATA handling failed");
+
+    const auto mixed = XmlDocument::Parse("<root><value>A&amp;B&#x43;</value></root>");
+    const auto mixedValue = std::static_pointer_cast<XmlElement>(mixed->DocumentElement()->SelectSingleNode("value"));
+    Assert(mixedValue != nullptr && mixedValue->InnerText() == "A&BC",
+        "DOM parser should preserve decoded mixed entity text semantics");
+}
+
+void TestDocumentTypeDeclarations() {
+    const auto document = XmlDocument::Parse(
+        "<!DOCTYPE catalog ["
+        "<!ENTITY author \"Anne Bronte\">"
+        "<!NOTATION jpg SYSTEM \"image/jpeg\">"
+        "<!ENTITY cover SYSTEM \"cover.jpg\" NDATA jpg>"
+        "]>"
+        "<catalog/>");
+
+    Assert(document->DocumentType() != nullptr, "DOCTYPE with internal subset should be parsed");
+
+    const auto entities = document->DocumentType()->Entities();
+    Assert(entities.Count() == 2, "DocumentType.Entities should expose parsed entity declarations");
+
+    const auto author = entities.GetNamedItem("author");
+    Assert(author != nullptr && author->NodeType() == XmlNodeType::Entity,
+        "Internal entity declarations should materialize as XmlEntity nodes");
+    Assert(author->Value() == "Anne Bronte", "Internal XmlEntity replacement text mismatch");
+
+    const auto cover = entities.GetNamedItem("cover");
+    Assert(cover != nullptr && cover->NodeType() == XmlNodeType::Entity,
+        "External entity declarations should materialize as XmlEntity nodes");
+    Assert(static_cast<XmlEntity*>(cover.get())->SystemId() == "cover.jpg"
+            && static_cast<XmlEntity*>(cover.get())->NotationName() == "jpg",
+        "External XmlEntity metadata mismatch");
+
+    const auto notations = document->DocumentType()->Notations();
+    Assert(notations.Count() == 1, "DocumentType.Notations should expose parsed notation declarations");
+    const auto jpg = notations.GetNamedItem("jpg");
+    Assert(jpg != nullptr && jpg->NodeType() == XmlNodeType::Notation,
+        "Notation declarations should materialize as XmlNotation nodes");
+    Assert(static_cast<XmlNotation*>(jpg.get())->SystemId() == "image/jpeg",
+        "XmlNotation system id mismatch");
+}
+
+void TestDocumentTypeBoundaries() {
+    XmlDocument emptySubsetDocument;
+    const auto emptyDocumentType = emptySubsetDocument.CreateDocumentType("root", {}, {}, {});
+    Assert(emptyDocumentType->Entities().Empty(),
+        "DocumentType.Entities should be empty when no entity declarations are present");
+    Assert(emptyDocumentType->Notations().Empty(),
+        "DocumentType.Notations should be empty when no notation declarations are present");
+
+    XmlDocument source;
+    const auto sourceDocumentType = source.CreateDocumentType(
+        "catalog",
+        {},
+        {},
+        "<!ENTITY publisher \"North Press\"><!NOTATION txt SYSTEM \"text/plain\"><!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>");
+    source.AppendChild(sourceDocumentType);
+
+    const auto publicDocumentType = source.CreateDocumentType(
+        "catalog",
+        "-//LibXML//DTD Catalog 1.0//EN",
+        "catalog.dtd",
+        "<!ENTITY publisher \"North Press\"><!NOTATION txt PUBLIC \"text/plain\" \"text/catalog\">"
+    );
+    const auto clonedPublicDocumentType = std::static_pointer_cast<XmlDocumentType>(publicDocumentType->CloneNode(true));
+    Assert(clonedPublicDocumentType->PublicId() == "-//LibXML//DTD Catalog 1.0//EN",
+        "CloneNode should preserve DocumentType public id metadata");
+    Assert(clonedPublicDocumentType->SystemId() == "catalog.dtd",
+        "CloneNode should preserve DocumentType system id metadata");
+    Assert(clonedPublicDocumentType->Entities().GetNamedItem("publisher") != nullptr,
+        "CloneNode should preserve DocumentType entity declarations for PUBLIC doctypes");
+    Assert(clonedPublicDocumentType->Notations().GetNamedItem("txt") != nullptr,
+        "CloneNode should preserve DocumentType notation declarations for PUBLIC doctypes");
+
+    XmlDocument target;
+    const auto importedDocumentType = std::static_pointer_cast<XmlDocumentType>(target.ImportNode(*sourceDocumentType, true));
+    Assert(importedDocumentType->Entities().GetNamedItem("publisher") != nullptr,
+        "ImportNode should preserve DocumentType internal entity declarations");
+    Assert(importedDocumentType->Entities().GetNamedItem("cover") != nullptr,
+        "ImportNode should preserve DocumentType external entity declarations");
+    Assert(importedDocumentType->Notations().GetNamedItem("txt") != nullptr,
+        "ImportNode should preserve DocumentType notation declarations");
+
+    target.AppendChild(importedDocumentType);
+    target.AppendChild(target.CreateElement("catalog"));
+    const std::string serialized = target.ToString();
+    Assert(serialized.find("<!DOCTYPE catalog [<!ENTITY publisher \"North Press\"><!NOTATION txt SYSTEM \"text/plain\"><!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>]>") != std::string::npos,
+        "Imported DocumentType should serialize its entity and notation metadata intact");
+
+    XmlWriter publicWriter;
+    publicWriter.WriteNode(*clonedPublicDocumentType);
+    publicWriter.WriteStartElement("catalog");
+    publicWriter.WriteEndElement();
+    Assert(publicWriter.GetString().find("<!DOCTYPE catalog PUBLIC \"-//LibXML//DTD Catalog 1.0//EN\" \"catalog.dtd\" [<!ENTITY publisher \"North Press\"><!NOTATION txt PUBLIC \"text/plain\" \"text/catalog\">]>") != std::string::npos,
+        "DocumentType serialization should preserve PUBLIC and SYSTEM identifiers together with the internal subset");
+
+    const auto parsedPublicDocument = XmlDocument::Parse("<!DOCTYPE catalog PUBLIC \"-//LibXML//DTD Catalog 1.0//EN\" \"catalog.dtd\"><catalog/>");
+    Assert(parsedPublicDocument->DocumentType() != nullptr,
+        "PUBLIC DOCTYPE declarations should be parsed");
+    Assert(parsedPublicDocument->DocumentType()->PublicId() == "-//LibXML//DTD Catalog 1.0//EN",
+        "Parsed PUBLIC DOCTYPE should preserve the public id");
+    Assert(parsedPublicDocument->DocumentType()->SystemId() == "catalog.dtd",
+        "Parsed PUBLIC DOCTYPE should preserve the system id");
+}
+
+void TestInvalidDtdInputs() {
+    // DTD support boundary: PUBLIC/SYSTEM DOCTYPE headers plus ENTITY/NOTATION declarations are supported;
+    // ELEMENT, ATTLIST, parameter entities, and conditional sections remain explicitly unsupported.
+    auto expectXmlExceptionContaining = [](const std::string& xml, const std::string& expectedMessage, const std::string& label) {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(xml);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find(expectedMessage) != std::string::npos;
+        }
+        Assert(threw, label);
+    };
+
+    auto expectReaderXmlExceptionContaining = [](const std::string& xml, const std::string& expectedMessage, const std::string& label) {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(xml);
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find(expectedMessage) != std::string::npos;
+        }
+        Assert(threw, label);
+    };
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ELEMENT root ANY>]><root/>",
+        "Unsupported DTD declaration: ELEMENT",
+        "Unsupported ELEMENT declarations should report a stable XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id CDATA #IMPLIED>]><root/>",
+        "Unsupported DTD declaration: ATTLIST",
+        "Unsupported ATTLIST declarations should report a stable XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY % pe 'value'>]><root/>",
+        "Unsupported DTD declaration: parameter entity",
+        "Unsupported parameter entity declarations should report a stable XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY author SYSTEM>]><root/>",
+        "Malformed DTD entity declaration",
+        "Malformed ENTITY declarations should report a stable XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM>]><root/>",
+        "Malformed DTD notation declaration",
+        "Malformed NOTATION declarations should report a stable XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY author \"value\"><!NOTATION jpg SYSTEM \"image/jpeg\">",
+        "Unterminated DOCTYPE internal subset",
+        "Unterminated DOCTYPE internal subsets should report XmlException");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root SYSTEM><root/>",
+        "Expected quoted value",
+        "SYSTEM doctypes without a system literal should report a quoted value error");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root PUBLIC \"-//LibXML//DTD Root 1.0//EN\"><root/>",
+        "Expected quoted value",
+        "PUBLIC doctypes without a system literal should report a quoted value error");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root SYSTEM \"root.dtd\" trailing><root/>",
+        "Expected '>' after DOCTYPE",
+        "DOCTYPE headers with trailing tokens should report a stable closing token error");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root SYSTEM><root/>",
+        "Expected quoted value",
+        "XmlReader should reject SYSTEM doctypes without a system literal");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root PUBLIC \"-//LibXML//DTD Root 1.0//EN\"><root/>",
+        "Expected quoted value",
+        "XmlReader should reject PUBLIC doctypes without a system literal");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root SYSTEM \"root.dtd\" trailing><root/>",
+        "Expected '>' after DOCTYPE",
+        "XmlReader should reject trailing tokens after the DOCTYPE header with a stable error");
+}
+
+void TestDeclaredEntityResolution() {
+    const auto document = XmlDocument::Parse(
+        "<!DOCTYPE catalog ["
+        "<!ENTITY author \"Anne &amp; Co\">"
+        "<!ENTITY suffix \"Ltd\">"
+        "]>"
+        "<catalog name=\"&author;\"><book>&author; &suffix;</book></catalog>");
+
+    Assert(document->DocumentElement() != nullptr, "Declared entity test root missing");
+    Assert(document->DocumentElement()->GetAttribute("name") == "Anne & Co",
+        "Declared internal entities should decode inside attribute values");
+    Assert(document->DocumentElement()->InnerText() == "Anne & Co Ltd",
+        "Declared internal entities should decode inside text content");
+
+    const auto book = document->DocumentElement()->SelectSingleNode("book");
+    Assert(book != nullptr, "Declared entity test child element missing");
+    Assert(book->FirstChild() != nullptr && book->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+        "Declared internal entities in element content should be preserved as EntityReference nodes");
+    Assert(book->ChildNodeList().Count() == 3,
+        "Mixed entity/text/entity content should preserve node boundaries");
+
+    XmlDocument manualDocument;
+    manualDocument.AppendChild(manualDocument.CreateDocumentType("catalog", {}, {}, "<!ENTITY greeting \"Hello &amp; Bye\">"));
+    const auto greeting = manualDocument.CreateEntityReference("greeting");
+    Assert(greeting->Value() == "Hello & Bye",
+        "CreateEntityReference should resolve values from declared internal entities");
+
+    const auto externalDocument = XmlDocument::Parse(
+        "<!DOCTYPE catalog [<!ENTITY cover SYSTEM \"cover.txt\">]>"
+        "<catalog><item>&cover;</item></catalog>");
+    const auto item = externalDocument->DocumentElement()->SelectSingleNode("item");
+    Assert(item != nullptr && item->FirstChild() != nullptr && item->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+        "Declared external entities in element content should remain unresolved EntityReference nodes");
+    Assert(item->OuterXml() == "<item>&cover;</item>",
+        "Unresolved external entities should preserve entity reference serialization");
+}
+
+void TestEntitySemanticsConsistency() {
+    XmlDocument document;
+    document.SetPreserveWhitespace(true);
+    document.LoadXml(
+        "<!DOCTYPE root ["
+        "<!ENTITY inner \"Hello\">"
+        "<!ENTITY nested \"&inner; world\">"
+        "<!NOTATION txt SYSTEM \"text/plain\">"
+        "<!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>"
+        "]>"
+        "<root attr=\"&nested;\"><internal>&nested;</internal><external>&cover;</external></root>");
+
+    const auto root = document.DocumentElement();
+    Assert(root != nullptr, "Entity consistency root missing");
+    Assert(root->GetAttribute("attr") == "Hello world",
+        "Internal entities in attribute values should decode recursively");
+
+    const auto internal = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("internal"));
+    Assert(internal != nullptr, "Internal entity element missing");
+    Assert(internal->ChildNodeList().Count() == 1,
+        "Internal entity-only element should preserve a single EntityReference child");
+    Assert(internal->FirstChild() != nullptr && internal->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+        "Internal entity content should remain visible as an EntityReference DOM node");
+    Assert(internal->FirstChild()->Value() == "Hello world",
+        "Internal EntityReference DOM value should expose decoded recursive text");
+    Assert(internal->InnerText() == "Hello world",
+        "Internal EntityReference should contribute decoded InnerText through its Value");
+
+    const auto external = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("external"));
+    Assert(external != nullptr, "External entity element missing");
+    Assert(external->ChildNodeList().Count() == 1,
+        "External entity-only element should preserve a single EntityReference child");
+    Assert(external->FirstChild() != nullptr && external->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+        "External entity content should remain visible as an EntityReference DOM node");
+    Assert(external->FirstChild()->Value().empty(),
+        "Unresolved external EntityReference DOM values should stay empty");
+    Assert(external->InnerText().empty(),
+        "Unresolved external EntityReference should not contribute decoded InnerText");
+
+    XmlReader reader = XmlReader::Create(document.ToString());
+    bool sawInternalEntity = false;
+    bool sawInternalExpandedText = false;
+    bool sawExternalEntity = false;
+    bool sawExternalEndEntity = false;
+    while (reader.Read()) {
+        if (reader.NodeType() == XmlNodeType::EntityReference && reader.Name() == "nested") {
+            sawInternalEntity = true;
+            Assert(reader.Value() == "Hello world",
+                "XmlReader internal EntityReference Value should match DOM decoded value");
+        } else if (reader.NodeType() == XmlNodeType::Text && reader.Value() == "Hello world") {
+            sawInternalExpandedText = true;
+        } else if (reader.NodeType() == XmlNodeType::EntityReference && reader.Name() == "cover") {
+            sawExternalEntity = true;
+            Assert(reader.Value().empty(),
+                "XmlReader external EntityReference Value should remain empty");
+        } else if (reader.NodeType() == XmlNodeType::EndEntity && reader.Name() == "cover") {
+            sawExternalEndEntity = true;
+        }
+    }
+    Assert(sawInternalEntity && sawInternalExpandedText,
+        "XmlReader should surface internal entities as EntityReference plus expanded text");
+    Assert(sawExternalEntity && sawExternalEndEntity,
+        "XmlReader should surface unresolved external entities as EntityReference plus EndEntity");
+
+    XmlNodeReader nodeReader(*root);
+    bool sawNodeReaderInternalEntity = false;
+    bool sawNodeReaderExternalEntity = false;
+    while (nodeReader.Read()) {
+        if (nodeReader.NodeType() == XmlNodeType::EntityReference && nodeReader.Name() == "nested") {
+            sawNodeReaderInternalEntity = true;
+            Assert(nodeReader.Value() == "Hello world",
+                "XmlNodeReader internal EntityReference Value should match DOM decoded value");
+        }
+        if (nodeReader.NodeType() == XmlNodeType::EntityReference && nodeReader.Name() == "cover") {
+            sawNodeReaderExternalEntity = true;
+            Assert(nodeReader.Value().empty(),
+                "XmlNodeReader external EntityReference Value should remain empty");
+        }
+    }
+    Assert(sawNodeReaderInternalEntity && sawNodeReaderExternalEntity,
+        "XmlNodeReader should preserve both internal and external EntityReference visibility");
+}
+
+void TestEntityResolutionFailures() {
+    std::string deepSubset;
+    for (int index = 0; index < 18; ++index) {
+        deepSubset += "<!ENTITY e" + std::to_string(index) + " \"";
+        if (index == 0) {
+            deepSubset += "leaf";
+        } else {
+            deepSubset += "&e" + std::to_string(index - 1) + ";";
+        }
+        deepSubset += "\">";
+    }
+
+    bool threw = false;
+    try {
+        XmlDocument::Parse("<!DOCTYPE root [" + deepSubset + "]><root attr=\"&e17;\"/>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("Entity reference recursion limit exceeded") != std::string::npos;
+    }
+    Assert(threw, "Entity expansion beyond the recursion limit should throw XmlException");
+
+    threw = false;
+    try {
+        XmlDocument cycleDocument;
+        cycleDocument.AppendChild(cycleDocument.CreateDocumentType("root", {}, {}, "<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">"));
+        (void)cycleDocument.CreateEntityReference("a");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("Entity reference cycle detected") != std::string::npos;
+    }
+    Assert(threw, "CreateEntityReference should reject cyclic internal entity declarations");
+
+    threw = false;
+    try {
+        XmlDocument::Parse("<!DOCTYPE root [<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">]><root>&a;</root>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("Entity reference cycle detected") != std::string::npos;
+    }
+    Assert(threw, "Parsing cyclic entity references in element content should fail");
+
+    threw = false;
+    try {
+        XmlReader reader = XmlReader::Create("<!DOCTYPE root [<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">]><root>&a;</root>");
+        while (reader.Read()) {
+        }
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("Entity reference cycle detected") != std::string::npos;
+    }
+    Assert(threw, "XmlReader should reject cyclic entity references while streaming");
+
+    threw = false;
+    try {
+        (void)XmlDocument::Parse("<!DOCTYPE root [<!ENTITY cover SYSTEM \"cover.txt\">]><root attr=\"&cover;\"/>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("Unknown entity reference: &cover;") != std::string::npos;
+    }
+    Assert(threw, "External entity references should not decode inside attribute values");
+}
+
+void TestDocumentTypeEntityNotationRoundTrip() {
+    XmlDocument document;
+    document.AppendChild(document.CreateDocumentType(
+        "catalog",
+        {},
+        {},
+        "<!ENTITY publisher \"North Press\"><!NOTATION txt SYSTEM \"text/plain\"><!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>"));
+
+    auto root = document.CreateElement("catalog");
+    auto book = document.CreateElement("book");
+    book->AppendChild(document.CreateEntityReference("publisher"));
+    book->AppendChild(document.CreateEntityReference("cover"));
+    root->AppendChild(book);
+    document.AppendChild(root);
+
+    const std::string xml = document.ToString();
+    Assert(xml.find("<!DOCTYPE catalog [<!ENTITY publisher \"North Press\"><!NOTATION txt SYSTEM \"text/plain\"><!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>]>") != std::string::npos,
+        "Writer should preserve combined Entity/Notation/DocumentType declarations");
+    Assert(xml.find("<book>&publisher;&cover;</book>") != std::string::npos,
+        "Writer should preserve internal and external entity references in element content");
+
+    const auto parsed = XmlDocument::Parse(xml);
+    Assert(parsed->DocumentType() != nullptr, "Round-tripped document type missing");
+    Assert(parsed->DocumentType()->Entities().GetNamedItem("publisher") != nullptr,
+        "Round-tripped document type should preserve internal entity declarations");
+    Assert(parsed->DocumentType()->Entities().GetNamedItem("cover") != nullptr,
+        "Round-tripped document type should preserve external entity declarations");
+    Assert(parsed->DocumentType()->Notations().GetNamedItem("txt") != nullptr,
+        "Round-tripped document type should preserve notation declarations");
+
+    const auto parsedBook = std::static_pointer_cast<XmlElement>(parsed->DocumentElement()->SelectSingleNode("book"));
+    Assert(parsedBook != nullptr && parsedBook->ChildNodeList().Count() == 2,
+        "Round-tripped entity host element should preserve both entity reference children");
+    Assert(parsedBook->ChildNodeList().Item(0) != nullptr && parsedBook->ChildNodeList().Item(0)->NodeType() == XmlNodeType::EntityReference,
+        "Round-tripped internal entity should stay visible as an EntityReference node");
+    Assert(parsedBook->ChildNodeList().Item(1) != nullptr && parsedBook->ChildNodeList().Item(1)->NodeType() == XmlNodeType::EntityReference,
+        "Round-tripped external entity should stay visible as an EntityReference node");
+    Assert(parsedBook->ChildNodeList().Item(0)->Value() == "North Press",
+        "Round-tripped internal entity Value mismatch");
+    Assert(parsedBook->ChildNodeList().Item(1)->Value().empty(),
+        "Round-tripped external entity Value should remain empty");
+}
+
+void TestXmlWriterEntitySemantics() {
+    XmlWriter writer;
+    writer.WriteDocType(
+        "catalog",
+        {},
+        {},
+        "<!ENTITY publisher \"North Press\"><!NOTATION txt SYSTEM \"text/plain\"><!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>");
+    writer.WriteStartElement("catalog");
+    writer.WriteStartElement("book");
+    writer.WriteEntityRef("publisher");
+    writer.WriteEntityRef("cover");
+    writer.WriteEndElement();
+    writer.WriteEndElement();
+
+    const std::string xml = writer.GetString();
+    Assert(xml.find("<!DOCTYPE catalog [<!ENTITY publisher \"North Press\"><!NOTATION txt SYSTEM \"text/plain\"><!ENTITY cover SYSTEM \"cover.txt\" NDATA txt>]>") != std::string::npos,
+        "XmlWriter should preserve mixed internal/external entity declarations and notations in DOCTYPE output");
+    Assert(xml.find("<book>&publisher;&cover;</book>") != std::string::npos,
+        "XmlWriter should preserve internal and external entity reference markers in element content");
+
+    XmlReader reader = XmlReader::Create(xml);
+    bool sawInternalEntity = false;
+    bool sawInternalText = false;
+    bool sawExternalEntity = false;
+    bool sawExternalEndEntity = false;
+    while (reader.Read()) {
+        if (reader.NodeType() == XmlNodeType::EntityReference && reader.Name() == "publisher") {
+            sawInternalEntity = true;
+            Assert(reader.Value() == "North Press",
+                "XmlWriter round-trip should keep internal entity decoded Value visible to XmlReader");
+        } else if (reader.NodeType() == XmlNodeType::Text && reader.Value() == "North Press") {
+            sawInternalText = true;
+        } else if (reader.NodeType() == XmlNodeType::EntityReference && reader.Name() == "cover") {
+            sawExternalEntity = true;
+            Assert(reader.Value().empty(),
+                "XmlWriter round-trip should keep unresolved external entity Value empty in XmlReader");
+        } else if (reader.NodeType() == XmlNodeType::EndEntity && reader.Name() == "cover") {
+            sawExternalEndEntity = true;
+        }
+    }
+    Assert(sawInternalEntity && sawInternalText,
+        "XmlWriter round-trip should keep internal entities readable as EntityReference plus expanded text");
+    Assert(sawExternalEntity && sawExternalEndEntity,
+        "XmlWriter round-trip should keep external entities readable as EntityReference plus EndEntity");
+
+    const auto parsed = XmlDocument::Parse(xml);
+    const auto book = std::static_pointer_cast<XmlElement>(parsed->DocumentElement()->SelectSingleNode("book"));
+    Assert(book != nullptr && book->ChildNodeList().Count() == 2,
+        "XmlWriter round-trip should preserve both entity references as DOM child nodes");
+    Assert(book->ChildNodeList().Item(0) != nullptr && book->ChildNodeList().Item(0)->Value() == "North Press",
+        "XmlWriter round-trip internal entity DOM value mismatch");
+    Assert(book->ChildNodeList().Item(1) != nullptr && book->ChildNodeList().Item(1)->Value().empty(),
+        "XmlWriter round-trip external entity DOM value should remain empty");
+}
+
+void TestGenerateDocument() {
+    XmlDocument document;
+    document.AppendChild(document.CreateXmlDeclaration("1.0", "utf-8", "yes"));
+    document.AppendChild(document.CreateDocumentType("catalog", {}, "catalog.dtd", {}));
+
+    auto root = document.CreateElement("catalog");
+    root->SetAttribute("version", "1");
+
+    auto book = document.CreateElement("book");
+    book->SetAttribute("id", "b2");
+    book->AppendChild(document.CreateTextNode("A&B"));
+    book->AppendChild(document.CreateComment("payload"));
+    book->AppendChild(document.CreateCDataSection("<unsafe/>"));
+    root->AppendChild(book);
+    document.AppendChild(root);
+
+    XmlWriterSettings settings;
+    settings.Indent = true;
+    const std::string output = document.ToString(settings);
+
+    Assert(output.find("<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>") != std::string::npos,
+        "XML declaration should be written");
+    Assert(output.find("<!DOCTYPE catalog SYSTEM \"catalog.dtd\">") != std::string::npos,
+        "DOCTYPE should be written");
+    Assert(output.find("<book id=\"b2\">A&amp;B<!--payload--><![CDATA[<unsafe/>]]></book>") != std::string::npos,
+        "Element payload should be serialized");
+}
+
+void TestFileRoundTrip() {
+    XmlDocument document;
+    auto root = document.CreateElement("root");
+    root->AppendChild(document.CreateElement("child"));
+    document.AppendChild(root);
+
+    const auto path = std::filesystem::temp_directory_path() / "libxml-roundtrip.xml";
+    document.Save(path.string(), XmlWriterSettings{true, false, "  ", "\n", XmlNewLineHandling::None});
+
+    XmlDocument loaded;
+    loaded.Load(path.string());
+    Assert(loaded.DocumentElement() != nullptr, "Reloaded document should have root");
+    Assert(loaded.DocumentElement()->SelectSingleNode("child") != nullptr, "Reloaded child should exist");
+
+    std::filesystem::remove(path);
+}
+
+void TestValidationErrors() {
+    bool thrown = false;
+    try {
+        XmlDocument::Parse("<root><a></root>");
+    } catch (const XmlException&) {
+        thrown = true;
+    }
+
+    Assert(thrown, "Invalid XML should throw XmlException");
+}
+
+void TestXmlSchemaValidation() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:catalog\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"book\" minOccurs=\"1\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"title\"/>"
+        "            </xs:sequence>"
+        "            <xs:attribute name=\"id\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    try {
+        schemas.AddXml(schemaXml);
+    } catch (const XmlException& exception) {
+        throw std::runtime_error(std::string("content-restrict schema failed: ") + exception.what());
+    }
+    Assert(schemas.Count() >= 2, "Schema set should register the declared element rules");
+
+    const auto valid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:catalog\">"
+        "  <book id=\"1\"><title>One</title></book>"
+        "  <book id=\"2\"><title>Two</title></book>"
+        "</catalog>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto missingRequiredAttribute = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:catalog\">"
+            "  <book><title>One</title></book>"
+            "</catalog>");
+        missingRequiredAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'id'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject missing required attributes");
+
+    threw = false;
+    try {
+        const auto unexpectedChild = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:catalog\">"
+            "  <book id=\"1\"><name>One</name></book>"
+            "</catalog>");
+        unexpectedChild->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("expected child element 'title'") != std::string::npos
+            || std::string(exception.what()).find("unexpected child element 'name'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject unexpected child elements");
+
+    const auto tempSchemaPath = std::filesystem::temp_directory_path() / "libxml-basic.xsd";
+    {
+        std::ofstream stream(tempSchemaPath);
+        stream << schemaXml;
+    }
+    XmlSchemaSet fileSchemas;
+    fileSchemas.AddFile(tempSchemaPath.string());
+    Assert(fileSchemas.Count() == schemas.Count(), "AddFile should load the same schema rules as AddXml");
+    std::filesystem::remove(tempSchemaPath);
+}
+
+void TestXmlSchemaSimpleTypesAndChoice() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:order\">"
+        "  <xs:element name=\"order\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"status\">"
+        "          <xs:simpleType>"
+        "            <xs:restriction base=\"xs:string\">"
+        "              <xs:enumeration value=\"new\"/>"
+        "              <xs:enumeration value=\"paid\"/>"
+        "            </xs:restriction>"
+        "          </xs:simpleType>"
+        "        </xs:element>"
+        "        <xs:element name=\"payment\">"
+        "          <xs:complexType>"
+        "            <xs:choice>"
+        "              <xs:element name=\"card\"/>"
+        "              <xs:element name=\"cash\"/>"
+        "            </xs:choice>"
+        "            <xs:attribute name=\"amount\" type=\"xs:int\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<order xmlns=\"urn:order\">"
+        "  <status>paid</status>"
+        "  <payment amount=\"42\"><card/></payment>"
+        "</order>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidEnumeration = XmlDocument::Parse(
+            "<order xmlns=\"urn:order\">"
+            "  <status>cancelled</status>"
+            "  <payment amount=\"42\"><card/></payment>"
+            "</order>");
+        invalidEnumeration->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be one of") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce enumeration restrictions");
+
+    threw = false;
+    try {
+        const auto invalidAttributeType = XmlDocument::Parse(
+            "<order xmlns=\"urn:order\">"
+            "  <status>new</status>"
+            "  <payment amount=\"forty-two\"><card/></payment>"
+            "</order>");
+        invalidAttributeType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce typed attribute values");
+
+    threw = false;
+    try {
+        const auto invalidChoice = XmlDocument::Parse(
+            "<order xmlns=\"urn:order\">"
+            "  <status>new</status>"
+            "  <payment amount=\"42\"><card/><cash/></payment>"
+            "</order>");
+        invalidChoice->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("allows only one choice branch") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject multiple choice branches");
+
+    threw = false;
+    try {
+        const auto missingChoice = XmlDocument::Parse(
+            "<order xmlns=\"urn:order\">"
+            "  <status>new</status>"
+            "  <payment amount=\"42\"/>"
+            "</order>");
+        missingChoice->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("requires one of") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should require a choice branch when one is expected");
+}
+
+void TestXmlSchemaNamedTypesAndOccurs() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:typed\" targetNamespace=\"urn:typed\">"
+        "  <xs:simpleType name=\"StatusType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:enumeration value=\"new\"/>"
+        "      <xs:enumeration value=\"paid\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"QuantityType\">"
+        "    <xs:restriction base=\"xs:int\"/>"
+        "  </xs:simpleType>"
+        "  <xs:complexType name=\"LineType\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"item\" minOccurs=\"1\" maxOccurs=\"2\"/>"
+        "    </xs:sequence>"
+        "    <xs:attribute name=\"qty\" type=\"tns:QuantityType\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"PaymentType\">"
+        "    <xs:choice>"
+        "      <xs:element name=\"card\" minOccurs=\"0\" maxOccurs=\"2\"/>"
+        "      <xs:element name=\"cash\" minOccurs=\"0\" maxOccurs=\"1\"/>"
+        "    </xs:choice>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"order\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"status\" type=\"tns:StatusType\"/>"
+        "        <xs:element name=\"line\" type=\"tns:LineType\"/>"
+        "        <xs:element name=\"payment\" type=\"tns:PaymentType\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<order xmlns=\"urn:typed\">"
+        "  <status>paid</status>"
+        "  <line qty=\"2\"><item/><item/></line>"
+        "  <payment><card/><card/></payment>"
+        "</order>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidNamedSimpleType = XmlDocument::Parse(
+            "<order xmlns=\"urn:typed\">"
+            "  <status>cancelled</status>"
+            "  <line qty=\"2\"><item/></line>"
+            "  <payment><cash/></payment>"
+            "</order>");
+        invalidNamedSimpleType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be one of") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should resolve named simpleType references on elements");
+
+    threw = false;
+    try {
+        const auto invalidNamedAttributeType = XmlDocument::Parse(
+            "<order xmlns=\"urn:typed\">"
+            "  <status>paid</status>"
+            "  <line qty=\"many\"><item/></line>"
+            "  <payment><cash/></payment>"
+            "</order>");
+        invalidNamedAttributeType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should resolve named simpleType references on attributes");
+
+    threw = false;
+    try {
+        const auto invalidSequenceOccurs = XmlDocument::Parse(
+            "<order xmlns=\"urn:typed\">"
+            "  <status>paid</status>"
+            "  <line qty=\"3\"><item/><item/><item/></line>"
+            "  <payment><cash/></payment>"
+            "</order>");
+        invalidSequenceOccurs->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unexpected child element 'item'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce maxOccurs in named complexType sequences");
+
+    threw = false;
+    try {
+        const auto invalidChoiceOccurs = XmlDocument::Parse(
+            "<order xmlns=\"urn:typed\">"
+            "  <status>paid</status>"
+            "  <line qty=\"2\"><item/></line>"
+            "  <payment><card/><card/><card/></payment>"
+            "</order>");
+        invalidChoiceOccurs->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("exceeded maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce maxOccurs on the selected choice branch");
+
+    threw = false;
+    try {
+        const auto invalidMixedChoice = XmlDocument::Parse(
+            "<order xmlns=\"urn:typed\">"
+            "  <status>paid</status>"
+            "  <line qty=\"2\"><item/></line>"
+            "  <payment><card/><cash/></payment>"
+            "</order>");
+        invalidMixedChoice->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("allows only one choice branch") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject mixed named choice branches");
+}
+
+void TestXmlSchemaFacets() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:facets\" targetNamespace=\"urn:facets\">"
+        "  <xs:simpleType name=\"CodeType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:whiteSpace value=\"collapse\"/>"
+        "      <xs:length value=\"5\"/>"
+        "      <xs:pattern value=\"[A-Z]{3}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"NoteType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:whiteSpace value=\"collapse\"/>"
+        "      <xs:minLength value=\"3\"/>"
+        "      <xs:maxLength value=\"8\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"PercentType\">"
+        "    <xs:restriction base=\"xs:int\">"
+        "      <xs:whiteSpace value=\"collapse\"/>"
+        "      <xs:minInclusive value=\"0\"/>"
+        "      <xs:maxInclusive value=\"100\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"RankType\">"
+        "    <xs:restriction base=\"xs:int\">"
+        "      <xs:minExclusive value=\"0\"/>"
+        "      <xs:maxExclusive value=\"10\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"AmountType\">"
+        "    <xs:restriction base=\"xs:decimal\">"
+        "      <xs:totalDigits value=\"5\"/>"
+        "      <xs:fractionDigits value=\"2\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"ReplaceType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:whiteSpace value=\"replace\"/>"
+        "      <xs:pattern value=\"A  B\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"payload\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"code\" type=\"tns:CodeType\"/>"
+        "        <xs:element name=\"note\" type=\"tns:NoteType\"/>"
+        "        <xs:element name=\"replace\" type=\"tns:ReplaceType\"/>"
+        "      </xs:sequence>"
+        "      <xs:attribute name=\"percent\" type=\"tns:PercentType\" use=\"required\"/>"
+        "      <xs:attribute name=\"rank\" type=\"tns:RankType\" use=\"required\"/>"
+        "      <xs:attribute name=\"amount\" type=\"tns:AmountType\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<payload xmlns=\"urn:facets\" percent=\" 80 \" rank=\"5\" amount=\"123.45\">"
+        "  <code> ABC12 </code>"
+        "  <note>  hello  </note>"
+        "  <replace>A\t B</replace>"
+        "</payload>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidPattern = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
+            "  <code>abc12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidPattern->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match the declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce pattern facets");
+
+    threw = false;
+    try {
+        const auto invalidLength = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
+            "  <code>AB12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidLength->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must have length 5") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce exact length facets");
+
+    threw = false;
+    try {
+        const auto invalidMinLength = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>hi</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidMinLength->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must have length >= 3") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce minLength facets");
+
+    threw = false;
+    try {
+        const auto invalidMaxLength = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>toolonger</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidMaxLength->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must have length <= 8") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce maxLength facets");
+
+    threw = false;
+    try {
+        const auto invalidMinInclusive = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"-1\" rank=\"5\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidMinInclusive->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be >= 0") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce minInclusive facets");
+
+    threw = false;
+    try {
+        const auto invalidMaxInclusive = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"101\" rank=\"5\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidMaxInclusive->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be <= 100") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce maxInclusive facets");
+
+    threw = false;
+    try {
+        const auto invalidMinExclusive = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"0\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidMinExclusive->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be > 0") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce minExclusive facets");
+
+    threw = false;
+    try {
+        const auto invalidMaxExclusive = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"10\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidMaxExclusive->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be < 10") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce maxExclusive facets");
+
+    threw = false;
+    try {
+        const auto invalidTotalDigits = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"1234.56\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidTotalDigits->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must have at most 5 total digits") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce totalDigits facets");
+
+    threw = false;
+    try {
+        const auto invalidFractionDigits = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"12.345\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidFractionDigits->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must have at most 2 fraction digits") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce fractionDigits facets");
+
+    threw = false;
+    try {
+        const auto invalidCollapsedWhitespace = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
+            "  <code>AB\t12</code>"
+            "  <note>hello</note>"
+            "  <replace>A\t B</replace>"
+            "</payload>");
+        invalidCollapsedWhitespace->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match the declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply collapse whiteSpace before pattern checks");
+
+    threw = false;
+    try {
+        const auto invalidReplaceWhitespace = XmlDocument::Parse(
+            "<payload xmlns=\"urn:facets\" percent=\"80\" rank=\"5\" amount=\"123.45\">"
+            "  <code>ABC12</code>"
+            "  <note>hello</note>"
+            "  <replace>A   B</replace>"
+            "</payload>");
+        invalidReplaceWhitespace->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match the declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should distinguish replace from collapse whiteSpace semantics");
+}
+
+void TestXmlSchemaListAndUnion() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:collections\" targetNamespace=\"urn:collections\">"
+        "  <xs:simpleType name=\"PositiveInt\">"
+        "    <xs:restriction base=\"xs:int\">"
+        "      <xs:minInclusive value=\"1\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"CodeType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:pattern value=\"[A-Z]{3}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"BaseFlexibleValue\">"
+        "    <xs:union memberTypes=\"xs:string xs:int\"/>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"BaseWordList\">"
+        "    <xs:list itemType=\"xs:token\"/>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"UppercaseWordPair\">"
+        "    <xs:restriction base=\"tns:BaseWordList\">"
+        "      <xs:length value=\"2\"/>"
+        "      <xs:pattern value=\"[A-Z]+ [A-Z]+\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"ApprovedWordPair\">"
+        "    <xs:restriction base=\"tns:BaseWordList\">"
+        "      <xs:enumeration value=\"red blue\"/>"
+        "      <xs:enumeration value=\"green yellow\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"KeywordOrTwoDigits\">"
+        "    <xs:restriction base=\"tns:BaseFlexibleValue\">"
+        "      <xs:pattern value=\"([A-Z]{2}|[0-9]{2})\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"ApprovedMode\">"
+        "    <xs:restriction base=\"tns:BaseFlexibleValue\">"
+        "      <xs:enumeration value=\"auto\"/>"
+        "      <xs:enumeration value=\"12\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"payload\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"ids\">"
+        "          <xs:simpleType>"
+        "            <xs:list itemType=\"tns:PositiveInt\"/>"
+        "          </xs:simpleType>"
+        "        </xs:element>"
+        "        <xs:element name=\"value\">"
+        "          <xs:simpleType>"
+        "            <xs:union memberTypes=\"tns:CodeType xs:int\"/>"
+        "          </xs:simpleType>"
+        "        </xs:element>"
+        "        <xs:element name=\"mode\">"
+        "          <xs:simpleType>"
+        "            <xs:union>"
+        "              <xs:simpleType>"
+        "                <xs:restriction base=\"xs:string\">"
+        "                  <xs:enumeration value=\"auto\"/>"
+        "                  <xs:enumeration value=\"manual\"/>"
+        "                </xs:restriction>"
+        "              </xs:simpleType>"
+        "              <xs:simpleType>"
+        "                <xs:restriction base=\"xs:int\">"
+        "                  <xs:minInclusive value=\"10\"/>"
+        "                  <xs:maxInclusive value=\"20\"/>"
+        "                </xs:restriction>"
+        "              </xs:simpleType>"
+        "            </xs:union>"
+        "          </xs:simpleType>"
+        "        </xs:element>"
+        "        <xs:element name=\"wordPair\" type=\"tns:UppercaseWordPair\"/>"
+        "        <xs:element name=\"approvedWords\" type=\"tns:ApprovedWordPair\"/>"
+        "        <xs:element name=\"keyword\" type=\"tns:KeywordOrTwoDigits\"/>"
+        "        <xs:element name=\"approved\" type=\"tns:ApprovedMode\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<payload xmlns=\"urn:collections\">"
+        "  <ids>1 2 3</ids>"
+        "  <value>ABC12</value>"
+        "  <mode>12</mode>"
+        "  <wordPair>GO NOW</wordPair>"
+        "  <approvedWords>red blue</approvedWords>"
+        "  <keyword>AB</keyword>"
+        "  <approved>auto</approved>"
+        "</payload>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidListItem = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>1 0 3</ids>"
+            "  <value>ABC12</value>"
+            "  <mode>12</mode>"
+            "  <wordPair>GO NOW</wordPair>"
+            "  <approvedWords>red blue</approvedWords>"
+            "  <keyword>AB</keyword>"
+            "  <approved>auto</approved>"
+            "</payload>");
+        invalidListItem->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list item 2") != std::string::npos
+            && std::string(exception.what()).find(">= 1") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce named list item types");
+
+    threw = false;
+    try {
+        const auto invalidUnionMemberTypes = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>1 2 3</ids>"
+            "  <value>bad</value>"
+            "  <mode>12</mode>"
+            "  <wordPair>GO NOW</wordPair>"
+            "  <approvedWords>red blue</approvedWords>"
+            "  <keyword>AB</keyword>"
+            "  <approved>auto</approved>"
+            "</payload>");
+        invalidUnionMemberTypes->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match any declared union member type") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce union memberTypes references");
+
+    threw = false;
+    try {
+        const auto invalidInlineUnion = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>1 2 3</ids>"
+            "  <value>123</value>"
+            "  <mode>9</mode>"
+            "  <wordPair>GO NOW</wordPair>"
+            "  <approvedWords>red blue</approvedWords>"
+            "  <keyword>AB</keyword>"
+            "  <approved>auto</approved>"
+            "</payload>");
+        invalidInlineUnion->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match any declared union member type") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce inline union member types");
+
+    const auto validInlineUnion = XmlDocument::Parse(
+        "<payload xmlns=\"urn:collections\">"
+        "  <ids>4 5</ids>"
+        "  <value>42</value>"
+        "  <mode>manual</mode>"
+        "  <wordPair>UP FAST</wordPair>"
+        "  <approvedWords>green yellow</approvedWords>"
+        "  <keyword>34</keyword>"
+        "  <approved>12</approved>"
+        "</payload>");
+    validInlineUnion->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto invalidRestrictedListPattern = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>4 5</ids>"
+            "  <value>42</value>"
+            "  <mode>manual</mode>"
+            "  <wordPair>Up FAST</wordPair>"
+            "  <approvedWords>green yellow</approvedWords>"
+            "  <keyword>34</keyword>"
+            "  <approved>12</approved>"
+            "</payload>");
+        invalidRestrictedListPattern->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match the declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce pattern facets on restriction-derived list simple types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedListEnumeration = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>4 5</ids>"
+            "  <value>42</value>"
+            "  <mode>manual</mode>"
+            "  <wordPair>UP FAST</wordPair>"
+            "  <approvedWords>red green</approvedWords>"
+            "  <keyword>34</keyword>"
+            "  <approved>12</approved>"
+            "</payload>");
+        invalidRestrictedListEnumeration->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be one of the declared enumeration values") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce enumeration facets on restriction-derived list simple types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedUnionPattern = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>4 5</ids>"
+            "  <value>42</value>"
+            "  <mode>manual</mode>"
+            "  <wordPair>UP FAST</wordPair>"
+            "  <approvedWords>green yellow</approvedWords>"
+            "  <keyword>abc</keyword>"
+            "  <approved>12</approved>"
+            "</payload>");
+        invalidRestrictedUnionPattern->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match the declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce pattern facets on restriction-derived union simple types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedUnionEnumeration = XmlDocument::Parse(
+            "<payload xmlns=\"urn:collections\">"
+            "  <ids>4 5</ids>"
+            "  <value>42</value>"
+            "  <mode>manual</mode>"
+            "  <wordPair>UP FAST</wordPair>"
+            "  <approvedWords>green yellow</approvedWords>"
+            "  <keyword>34</keyword>"
+            "  <approved>manual</approved>"
+            "</payload>");
+        invalidRestrictedUnionEnumeration->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be one of the declared enumeration values") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce enumeration facets on restriction-derived union simple types");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:collections-legality\" targetNamespace=\"urn:collections-legality\">"
+            "  <xs:simpleType name=\"BaseWordList\">"
+            "    <xs:list itemType=\"xs:token\"/>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"TwoWords\">"
+            "    <xs:restriction base=\"tns:BaseWordList\">"
+            "      <xs:minLength value=\"2\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"RelaxedWords\">"
+            "    <xs:restriction base=\"tns:TwoWords\">"
+            "      <xs:minLength value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base minLength facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restriction-derived list simple types that relax base item-count facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:collections-legality\" targetNamespace=\"urn:collections-legality\">"
+            "  <xs:simpleType name=\"BaseFlexibleValue\">"
+            "    <xs:union memberTypes=\"xs:string xs:int\"/>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ApprovedMode\">"
+            "    <xs:restriction base=\"tns:BaseFlexibleValue\">"
+            "      <xs:enumeration value=\"auto\"/>"
+            "      <xs:enumeration value=\"12\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ExpandedMode\">"
+            "    <xs:restriction base=\"tns:ApprovedMode\">"
+            "      <xs:enumeration value=\"auto\"/>"
+            "      <xs:enumeration value=\"manual\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add enumeration values outside the base simpleType") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restriction-derived union simple types that expand base enumeration values");
+}
+
+void TestXmlSchemaAnnotations() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:annotations\" targetNamespace=\"urn:annotations\">"
+        "  <xs:annotation>"
+        "    <xs:documentation source=\"urn:test:schema\">Schema level docs</xs:documentation>"
+        "  </xs:annotation>"
+        "  <xs:simpleType name=\"CodeType\">"
+        "    <xs:annotation>"
+        "      <xs:documentation xml:lang=\"en\">Three uppercase letters</xs:documentation>"
+        "    </xs:annotation>"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:pattern value=\"[A-Z]{3}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:group name=\"RecordBody\">"
+        "    <xs:annotation>"
+        "      <xs:documentation>Record body group</xs:documentation>"
+        "    </xs:annotation>"
+        "    <xs:sequence>"
+        "      <xs:element name=\"code\" type=\"tns:CodeType\"/>"
+        "    </xs:sequence>"
+        "  </xs:group>"
+        "  <xs:attributeGroup name=\"SharedAttrs\">"
+        "    <xs:annotation>"
+        "      <xs:appinfo source=\"urn:test:attrs\"><attr-group role=\"shared\"/></xs:appinfo>"
+        "    </xs:annotation>"
+        "    <xs:attribute ref=\"tns:status\"/>"
+        "  </xs:attributeGroup>"
+        "  <xs:complexType name=\"RecordType\">"
+        "    <xs:annotation>"
+        "      <xs:appinfo source=\"urn:test:ui\"><display hint=\"badge\"/></xs:appinfo>"
+        "    </xs:annotation>"
+        "    <xs:group ref=\"tns:RecordBody\"/>"
+        "    <xs:attributeGroup ref=\"tns:SharedAttrs\"/>"
+        "  </xs:complexType>"
+        "  <xs:attribute name=\"status\" type=\"xs:string\">"
+        "    <xs:annotation>"
+        "      <xs:documentation>Global status attribute</xs:documentation>"
+        "    </xs:annotation>"
+        "  </xs:attribute>"
+        "  <xs:element name=\"record\" type=\"tns:RecordType\">"
+        "    <xs:annotation>"
+        "      <xs:documentation source=\"urn:test:docs\">Primary record element</xs:documentation>"
+        "      <xs:appinfo><ui form=\"summary\"/></xs:appinfo>"
+        "    </xs:annotation>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto* schemaAnnotation = schemas.FindSchemaAnnotation("urn:annotations");
+    Assert(schemaAnnotation != nullptr, "XmlSchemaSet should expose annotations for schema roots");
+    Assert(schemaAnnotation->Documentation.size() == 1, "Schema annotation should expose documentation entries");
+    Assert(schemaAnnotation->Documentation[0].Source == "urn:test:schema", "Schema documentation source mismatch");
+    Assert(schemaAnnotation->Documentation[0].Content == "Schema level docs", "Schema documentation content mismatch");
+
+    const auto* elementAnnotation = schemas.FindElementAnnotation("record", "urn:annotations");
+    Assert(elementAnnotation != nullptr, "XmlSchemaSet should expose annotations for global elements");
+    Assert(elementAnnotation->Documentation.size() == 1, "Element annotation should expose documentation entries");
+    Assert(elementAnnotation->Documentation[0].Source == "urn:test:docs", "Element documentation source mismatch");
+    Assert(elementAnnotation->Documentation[0].Content == "Primary record element", "Element documentation content mismatch");
+    Assert(elementAnnotation->AppInfo.size() == 1, "Element annotation should expose appinfo entries");
+    Assert(elementAnnotation->AppInfo[0].Content == "<ui form=\"summary\"/>", "Element appinfo content should preserve child markup");
+
+    const auto* simpleTypeAnnotation = schemas.FindSimpleTypeAnnotation("CodeType", "urn:annotations");
+    Assert(simpleTypeAnnotation != nullptr, "XmlSchemaSet should expose annotations for simpleTypes");
+    Assert(simpleTypeAnnotation->Documentation.size() == 1, "SimpleType annotation should expose documentation entries");
+    Assert(simpleTypeAnnotation->Documentation[0].Language == "en", "SimpleType documentation xml:lang mismatch");
+    Assert(simpleTypeAnnotation->Documentation[0].Content == "Three uppercase letters", "SimpleType documentation content mismatch");
+
+    const auto* complexTypeAnnotation = schemas.FindComplexTypeAnnotation("RecordType", "urn:annotations");
+    Assert(complexTypeAnnotation != nullptr, "XmlSchemaSet should expose annotations for complexTypes");
+    Assert(complexTypeAnnotation->AppInfo.size() == 1, "ComplexType annotation should expose appinfo entries");
+    Assert(complexTypeAnnotation->AppInfo[0].Source == "urn:test:ui", "ComplexType appinfo source mismatch");
+    Assert(complexTypeAnnotation->AppInfo[0].Content == "<display hint=\"badge\"/>", "ComplexType appinfo content should preserve child markup");
+
+    const auto* attributeAnnotation = schemas.FindAttributeAnnotation("status", "urn:annotations");
+    Assert(attributeAnnotation != nullptr, "XmlSchemaSet should expose annotations for global attributes");
+    Assert(attributeAnnotation->Documentation.size() == 1, "Attribute annotation should expose documentation entries");
+    Assert(attributeAnnotation->Documentation[0].Content == "Global status attribute", "Attribute documentation content mismatch");
+
+    const auto* groupAnnotation = schemas.FindGroupAnnotation("RecordBody", "urn:annotations");
+    Assert(groupAnnotation != nullptr, "XmlSchemaSet should expose annotations for groups");
+    Assert(groupAnnotation->Documentation.size() == 1, "Group annotation should expose documentation entries");
+    Assert(groupAnnotation->Documentation[0].Content == "Record body group", "Group documentation content mismatch");
+
+    const auto* attributeGroupAnnotation = schemas.FindAttributeGroupAnnotation("SharedAttrs", "urn:annotations");
+    Assert(attributeGroupAnnotation != nullptr, "XmlSchemaSet should expose annotations for attributeGroups");
+    Assert(attributeGroupAnnotation->AppInfo.size() == 1, "AttributeGroup annotation should expose appinfo entries");
+    Assert(attributeGroupAnnotation->AppInfo[0].Source == "urn:test:attrs", "AttributeGroup appinfo source mismatch");
+    Assert(attributeGroupAnnotation->AppInfo[0].Content == "<attr-group role=\"shared\"/>", "AttributeGroup appinfo content should preserve child markup");
+
+    const auto* missingAnnotation = schemas.FindElementAnnotation("missing", "urn:annotations");
+    Assert(missingAnnotation == nullptr, "XmlSchemaSet should return null for missing declarations");
+}
+
+void TestXmlSchemaSimpleTypeFinalDerivationControls() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:simple-final\" targetNamespace=\"urn:simple-final\">"
+            "  <xs:simpleType name=\"BaseCode\" final=\"restriction\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ShortCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:length value=\"3\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType restriction when the base simpleType final forbids restriction");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:simple-final\" targetNamespace=\"urn:simple-final\">"
+            "  <xs:simpleType name=\"BaseCode\" final=\"list\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:element name=\"codes\">"
+            "    <xs:simpleType>"
+            "      <xs:list itemType=\"tns:BaseCode\"/>"
+            "    </xs:simpleType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks list derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject list simpleType when the itemType final forbids list derivation");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:simple-final\" targetNamespace=\"urn:simple-final\">"
+            "  <xs:simpleType name=\"BaseCode\" final=\"union\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:element name=\"value\">"
+            "    <xs:simpleType>"
+            "      <xs:union memberTypes=\"tns:BaseCode xs:int\"/>"
+            "    </xs:simpleType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks union derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject union simpleType when a member type final forbids union derivation");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:simple-final\" targetNamespace=\"urn:simple-final\">"
+            "  <xs:simpleType name=\"BaseCode\" final=\"list union\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ExactCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:length value=\"3\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:element name=\"value\" type=\"tns:ExactCode\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<value xmlns=\"urn:simple-final\">ABC</value>");
+        valid->Validate(schemas);
+    }
+}
+
+void TestXmlSchemaNestedCompositors() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:nested\">"
+        "  <xs:element name=\"message\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"header\"/>"
+        "        <xs:choice>"
+        "          <xs:sequence>"
+        "            <xs:element name=\"email\"/>"
+        "            <xs:element name=\"subject\"/>"
+        "          </xs:sequence>"
+        "          <xs:sequence>"
+        "            <xs:element name=\"sms\"/>"
+        "            <xs:element name=\"phone\"/>"
+        "          </xs:sequence>"
+        "        </xs:choice>"
+        "        <xs:element name=\"footer\" minOccurs=\"0\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto validEmail = XmlDocument::Parse(
+        "<message xmlns=\"urn:nested\">"
+        "  <header/>"
+        "  <email/>"
+        "  <subject/>"
+        "  <footer/>"
+        "</message>");
+    validEmail->Validate(schemas);
+
+    const auto validSms = XmlDocument::Parse(
+        "<message xmlns=\"urn:nested\">"
+        "  <header/>"
+        "  <sms/>"
+        "  <phone/>"
+        "</message>");
+    validSms->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto mixedBranches = XmlDocument::Parse(
+            "<message xmlns=\"urn:nested\">"
+            "  <header/>"
+            "  <email/>"
+            "  <phone/>"
+            "</message>");
+        mixedBranches->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject mixed nested choice branches");
+
+    threw = false;
+    try {
+        const auto missingNestedRequired = XmlDocument::Parse(
+            "<message xmlns=\"urn:nested\">"
+            "  <header/>"
+            "  <email/>"
+            "</message>");
+        missingNestedRequired->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce nested sequence requirements inside a choice branch");
+
+    threw = false;
+    try {
+        const auto wrongOrder = XmlDocument::Parse(
+            "<message xmlns=\"urn:nested\">"
+            "  <email/>"
+            "  <subject/>"
+            "  <header/>"
+            "</message>");
+        wrongOrder->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce nested top-level sequence order");
+}
+
+void TestXmlSchemaAllCompositor() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:all\" targetNamespace=\"urn:all\">"
+        "  <xs:group name=\"CoreFields\">"
+        "    <xs:all>"
+        "      <xs:element name=\"id\" type=\"xs:int\"/>"
+        "      <xs:element name=\"name\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "    </xs:all>"
+        "  </xs:group>"
+        "  <xs:complexType name=\"PayloadType\">"
+        "    <xs:all>"
+        "      <xs:group ref=\"tns:CoreFields\"/>"
+        "      <xs:element name=\"status\" type=\"xs:string\"/>"
+        "    </xs:all>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"payload\" type=\"tns:PayloadType\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto validUnordered = XmlDocument::Parse(
+        "<payload xmlns=\"urn:all\">"
+        "  <status>ok</status>"
+        "  <id>7</id>"
+        "  <name>primary</name>"
+        "</payload>");
+    validUnordered->Validate(schemas);
+
+    const auto validOptionalOmitted = XmlDocument::Parse(
+        "<payload xmlns=\"urn:all\">"
+        "  <id>7</id>"
+        "  <status>ok</status>"
+        "</payload>");
+    validOptionalOmitted->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto missingRequired = XmlDocument::Parse(
+            "<payload xmlns=\"urn:all\">"
+            "  <status>ok</status>"
+            "</payload>");
+        missingRequired->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should require mandatory xs:all members");
+
+    threw = false;
+    try {
+        const auto duplicateMember = XmlDocument::Parse(
+            "<payload xmlns=\"urn:all\">"
+            "  <id>7</id>"
+            "  <status>ok</status>"
+            "  <id>8</id>"
+            "</payload>");
+        duplicateMember->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject repeated xs:all members");
+
+    threw = false;
+    try {
+        const auto unexpectedMember = XmlDocument::Parse(
+            "<payload xmlns=\"urn:all\">"
+            "  <id>7</id>"
+            "  <extra/>"
+            "  <status>ok</status>"
+            "</payload>");
+        unexpectedMember->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject undeclared xs:all members");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAllMaxOccursSchemas;
+        invalidAllMaxOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all maxOccurs=\"2\">"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("xs:all currently supports maxOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all compositors whose maxOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAllMinOccursSchemas;
+        invalidAllMinOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all minOccurs=\"2\">"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("xs:all currently supports minOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all compositors whose minOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidElementMaxOccursSchemas;
+        invalidElementMaxOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\" maxOccurs=\"2\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("child elements currently support maxOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all child elements whose maxOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidElementMinOccursSchemas;
+        invalidElementMinOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\" minOccurs=\"2\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("child elements currently support minOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all child elements whose minOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidGroupOccursSchemas;
+        invalidGroupOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:all-invalid\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:group name=\"CoreFields\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:all>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:group ref=\"tns:CoreFields\" maxOccurs=\"2\"/>"
+            "      <xs:element name=\"status\" type=\"xs:string\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group references currently support maxOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all group references whose maxOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidGroupMinOccursSchemas;
+        invalidGroupMinOccursSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:all-invalid\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:group name=\"CoreFields\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:all>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:group ref=\"tns:CoreFields\" minOccurs=\"2\"/>"
+            "      <xs:element name=\"status\" type=\"xs:string\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group references currently support minOccurs up to 1") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all group references whose minOccurs exceeds 1");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidNestedSequenceSchemas;
+        invalidNestedSequenceSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      </xs:sequence>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("supports only child element particles and group references") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject nested sequence particles directly under xs:all");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSequenceGroupSchemas;
+        invalidSequenceGroupSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:all-invalid\" targetNamespace=\"urn:all-invalid\">"
+            "  <xs:group name=\"SequentialFields\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"status\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:all>"
+            "      <xs:group ref=\"tns:SequentialFields\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("group references currently support only groups that resolve to xs:all") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:all group references whose target group resolves to sequence content");
+}
+
+void TestXmlSchemaParticleOccursLegality() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:occurs-legality\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\" minOccurs=\"2\" maxOccurs=\"1\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("minOccurs greater than maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element particles whose minOccurs exceeds maxOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:occurs-legality\" targetNamespace=\"urn:occurs-legality\">"
+            "  <xs:group name=\"CoreFields\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:sequence>"
+            "      <xs:group ref=\"tns:CoreFields\" minOccurs=\"3\" maxOccurs=\"2\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("minOccurs greater than maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject group reference particles whose minOccurs exceeds maxOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:occurs-legality\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:choice minOccurs=\"2\" maxOccurs=\"1\">"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"status\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("minOccurs greater than maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject compositor particles whose minOccurs exceeds maxOccurs");
+}
+
+void TestXmlSchemaForwardTypeReferences() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:forward\" targetNamespace=\"urn:forward\">"
+        "  <xs:element name=\"payload\" type=\"tns:PayloadType\"/>"
+        "  <xs:complexType name=\"PayloadType\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"items\" type=\"tns:ItemListType\"/>"
+        "      <xs:element name=\"status\" type=\"tns:StatusType\"/>"
+        "    </xs:sequence>"
+        "    <xs:attribute name=\"version\" type=\"tns:VersionType\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"ItemListType\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"item\" type=\"tns:ItemType\" maxOccurs=\"unbounded\"/>"
+        "    </xs:sequence>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"ItemType\">"
+        "    <xs:attribute name=\"code\" type=\"tns:CodeType\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:simpleType name=\"StatusType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:enumeration value=\"ok\"/>"
+        "      <xs:enumeration value=\"fail\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"VersionType\">"
+        "    <xs:restriction base=\"tns:PositiveIntType\">"
+        "      <xs:maxInclusive value=\"9\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"CodeType\">"
+        "    <xs:restriction base=\"tns:TokenType\">"
+        "      <xs:pattern value=\"[A-Z]{3}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"TokenType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:whiteSpace value=\"collapse\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"PositiveIntType\">"
+        "    <xs:restriction base=\"xs:int\">"
+        "      <xs:minInclusive value=\"1\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<payload xmlns=\"urn:forward\" version=\"2\">"
+        "  <items>"
+        "    <item code=\"ABC12\"/>"
+        "    <item code=\"XYZ99\"/>"
+        "  </items>"
+        "  <status>ok</status>"
+        "</payload>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidAttribute = XmlDocument::Parse(
+            "<payload xmlns=\"urn:forward\" version=\"0\">"
+            "  <items>"
+            "    <item code=\"ABC12\"/>"
+            "  </items>"
+            "  <status>ok</status>"
+            "</payload>");
+        invalidAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'version'") != std::string::npos
+            && std::string(exception.what()).find(">= 1") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should resolve forward-referenced simpleType chains for attributes");
+
+    threw = false;
+    try {
+        const auto invalidNestedComplexType = XmlDocument::Parse(
+            "<payload xmlns=\"urn:forward\" version=\"2\">"
+            "  <items>"
+            "    <item code=\"bad\"/>"
+            "  </items>"
+            "  <status>ok</status>"
+            "</payload>");
+        invalidNestedComplexType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'code'") != std::string::npos
+            && std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should resolve forward-referenced complexType children and their simpleType dependencies");
+}
+
+void TestXmlSchemaElementReferences() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:refs\" targetNamespace=\"urn:refs\">"
+        "  <xs:element name=\"document\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:header\"/>"
+        "        <xs:element ref=\"tns:item\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"item\" type=\"tns:ItemType\"/>"
+        "  <xs:element name=\"header\" type=\"tns:HeaderType\"/>"
+        "  <xs:complexType name=\"ItemType\">"
+        "    <xs:attribute name=\"code\" type=\"tns:CodeType\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"HeaderType\">"
+        "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:simpleType name=\"CodeType\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<document xmlns=\"urn:refs\">"
+        "  <header version=\"1\"/>"
+        "  <item code=\"AB12\"/>"
+        "  <item code=\"CD34\"/>"
+        "</document>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto wrongOrder = XmlDocument::Parse(
+            "<document xmlns=\"urn:refs\">"
+            "  <item code=\"AB12\"/>"
+            "  <header version=\"1\"/>"
+            "</document>");
+        wrongOrder->Validate(schemas);
+    } catch (const XmlException& exception) {
+        const std::string message = exception.what();
+        threw = message.find("expected child element 'header'") != std::string::npos
+            || message.find("unexpected child element 'item'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce sequence order for referenced global elements");
+
+    threw = false;
+    try {
+        const auto invalidReferencedElement = XmlDocument::Parse(
+            "<document xmlns=\"urn:refs\">"
+            "  <header version=\"1\"/>"
+            "  <item code=\"bad\"/>"
+            "</document>");
+        invalidReferencedElement->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'code'") != std::string::npos
+            && std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply referenced global element declarations during nested validation");
+}
+
+void TestXmlSchemaGroupsAndAttributeReuse() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reuse\" targetNamespace=\"urn:reuse\">"
+        "  <xs:element name=\"doc\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:group ref=\"tns:entryGroup\" maxOccurs=\"2\"/>"
+        "      </xs:sequence>"
+        "      <xs:attributeGroup ref=\"tns:commonAttrs\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:attributeGroup name=\"commonAttrs\">"
+        "    <xs:attribute ref=\"tns:id\" use=\"required\"/>"
+        "    <xs:attribute name=\"kind\">"
+        "      <xs:simpleType>"
+        "        <xs:restriction base=\"xs:string\">"
+        "          <xs:enumeration value=\"a\"/>"
+        "          <xs:enumeration value=\"b\"/>"
+        "        </xs:restriction>"
+        "      </xs:simpleType>"
+        "    </xs:attribute>"
+        "  </xs:attributeGroup>"
+        "  <xs:group name=\"entryGroup\">"
+        "    <xs:sequence>"
+        "      <xs:element ref=\"tns:title\"/>"
+        "      <xs:element ref=\"tns:body\"/>"
+        "    </xs:sequence>"
+        "  </xs:group>"
+        "  <xs:element name=\"title\" type=\"xs:string\"/>"
+        "  <xs:element name=\"body\" type=\"xs:string\"/>"
+        "  <xs:attribute name=\"id\" type=\"xs:int\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<doc xmlns=\"urn:reuse\" xmlns:tns=\"urn:reuse\" tns:id=\"7\" kind=\"a\">"
+        "  <title>One</title>"
+        "  <body>First</body>"
+        "  <title>Two</title>"
+        "  <body>Second</body>"
+        "</doc>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto missingRequiredReferencedAttribute = XmlDocument::Parse(
+            "<doc xmlns=\"urn:reuse\">"
+            "  <title>One</title>"
+            "  <body>First</body>"
+            "</doc>");
+        missingRequiredReferencedAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'id'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce required attributes introduced through attributeGroup and attribute ref");
+
+    threw = false;
+    try {
+        const auto invalidReferencedAttributeType = XmlDocument::Parse(
+            "<doc xmlns=\"urn:reuse\" xmlns:tns=\"urn:reuse\" tns:id=\"bad\" kind=\"a\">"
+            "  <title>One</title>"
+            "  <body>First</body>"
+            "</doc>");
+        invalidReferencedAttributeType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'id'") != std::string::npos
+            && std::string(exception.what()).find("xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply global attribute types through attribute ref");
+
+    threw = false;
+    try {
+        const auto invalidGroupedOrder = XmlDocument::Parse(
+            "<doc xmlns=\"urn:reuse\" xmlns:tns=\"urn:reuse\" tns:id=\"7\" kind=\"a\">"
+            "  <body>First</body>"
+            "  <title>One</title>"
+            "</doc>");
+        invalidGroupedOrder->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce group ref content ordering");
+
+    threw = false;
+    try {
+        const auto invalidInlineGroupAttribute = XmlDocument::Parse(
+            "<doc xmlns=\"urn:reuse\" xmlns:tns=\"urn:reuse\" tns:id=\"7\" kind=\"c\">"
+            "  <title>One</title>"
+            "  <body>First</body>"
+            "</doc>");
+        invalidInlineGroupAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'kind'") != std::string::npos
+            && std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply local attribute declarations pulled in through attributeGroup");
+}
+
+void TestXmlSchemaAnyWildcards() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:any\" targetNamespace=\"urn:any\">"
+        "  <xs:element name=\"container\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"known\" type=\"xs:int\"/>"
+        "        <xs:any minOccurs=\"0\" maxOccurs=\"unbounded\" namespace=\"##other\" processContents=\"lax\"/>"
+        "      </xs:sequence>"
+        "      <xs:anyAttribute namespace=\"##other\" processContents=\"lax\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"strict\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"value\" type=\"xs:int\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<container xmlns=\"urn:any\" xmlns:ext=\"urn:ext\" ext:flag=\"x\">"
+        "  <known>3</known>"
+        "  <ext:payload/>"
+        "  <ext:other/>"
+        "</container>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidKnown = XmlDocument::Parse(
+            "<container xmlns=\"urn:any\" xmlns:ext=\"urn:ext\" ext:flag=\"x\">"
+            "  <known>bad</known>"
+            "  <ext:payload/>"
+            "</container>");
+        invalidKnown->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'known'") != std::string::npos
+            && std::string(exception.what()).find("xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should keep validating declared children even when xs:any is present");
+
+    threw = false;
+    try {
+        const auto invalidSameNamespaceWildcard = XmlDocument::Parse(
+            "<container xmlns=\"urn:any\" xmlns:ext=\"urn:ext\" ext:flag=\"x\">"
+            "  <known>3</known>"
+            "  <unexpected/>"
+            "</container>");
+        invalidSameNamespaceWildcard->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:any namespace constraints for child elements");
+
+    threw = false;
+    try {
+        const auto invalidSameNamespaceAttribute = XmlDocument::Parse(
+            "<container xmlns=\"urn:any\" xmlns:tns=\"urn:any\" tns:extra=\"bad\">"
+            "  <known>3</known>"
+            "</container>");
+        invalidSameNamespaceAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'tns:extra'") != std::string::npos
+            && std::string(exception.what()).find("is not declared") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:anyAttribute namespace constraints");
+
+    threw = false;
+    try {
+        const auto strictUnexpected = XmlDocument::Parse(
+            "<strict xmlns=\"urn:any\" xmlns:ext=\"urn:ext\">"
+            "  <value>1</value>"
+            "  <ext:payload/>"
+            "</strict>");
+        strictUnexpected->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unexpected child element") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should still reject undeclared children when xs:any is absent");
+}
+
+void TestXmlSchemaContentExtensions() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:content-ext\" targetNamespace=\"urn:content-ext\">"
+        "  <xs:complexType name=\"LabeledText\">"
+        "    <xs:simpleContent>"
+        "      <xs:extension base=\"xs:int\">"
+        "        <xs:attribute name=\"label\" use=\"required\"/>"
+        "      </xs:extension>"
+        "    </xs:simpleContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"score\" type=\"tns:LabeledText\"/>"
+        "  <xs:complexType name=\"BaseRecord\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"id\" type=\"xs:int\"/>"
+        "    </xs:sequence>"
+        "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"DetailedRecord\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:BaseRecord\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"name\" type=\"xs:string\"/>"
+        "        </xs:sequence>"
+        "        <xs:attribute name=\"status\">"
+        "          <xs:simpleType>"
+        "            <xs:restriction base=\"xs:string\">"
+        "              <xs:enumeration value=\"active\"/>"
+        "              <xs:enumeration value=\"archived\"/>"
+        "            </xs:restriction>"
+        "          </xs:simpleType>"
+        "        </xs:attribute>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"record\" type=\"tns:DetailedRecord\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto validScore = XmlDocument::Parse(
+        "<score xmlns=\"urn:content-ext\" label=\"final\">42</score>");
+    validScore->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidScoreText = XmlDocument::Parse(
+            "<score xmlns=\"urn:content-ext\" label=\"final\">bad</score>");
+        invalidScoreText->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'score'") != std::string::npos
+            && std::string(exception.what()).find("xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve simpleContent base text typing through extension");
+
+    threw = false;
+    try {
+        const auto missingScoreAttribute = XmlDocument::Parse(
+            "<score xmlns=\"urn:content-ext\">42</score>");
+        missingScoreAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'label'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce attributes added by simpleContent extension");
+
+    const auto validRecord = XmlDocument::Parse(
+        "<record xmlns=\"urn:content-ext\" version=\"2\" status=\"active\">"
+        "  <id>7</id>"
+        "  <name>Alpha</name>"
+        "</record>");
+    validRecord->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto invalidRecordOrder = XmlDocument::Parse(
+            "<record xmlns=\"urn:content-ext\" version=\"2\" status=\"active\">"
+            "  <name>Alpha</name>"
+            "  <id>7</id>"
+            "</record>");
+        invalidRecordOrder->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should append complexContent extension particles after the base content");
+
+    threw = false;
+    try {
+        const auto invalidRecordAttribute = XmlDocument::Parse(
+            "<record xmlns=\"urn:content-ext\" version=\"2\" status=\"stale\">"
+            "  <id>7</id>"
+            "  <name>Alpha</name>"
+            "</record>");
+        invalidRecordAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'status'") != std::string::npos
+            && std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce attributes introduced by complexContent extension");
+}
+
+void TestXmlSchemaContentRestrictions() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:content-restrict\" targetNamespace=\"urn:content-restrict\">"
+        "  <xs:attributeGroup name=\"BaseAttrs\">"
+        "    <xs:attribute name=\"code\" use=\"required\"/>"
+        "    <xs:attribute name=\"lang\" type=\"xs:string\"/>"
+        "  </xs:attributeGroup>"
+        "  <xs:attributeGroup name=\"RestrictedAttrs\">"
+        "    <xs:attribute name=\"code\" use=\"required\"/>"
+        "  </xs:attributeGroup>"
+        "  <xs:complexType name=\"BaseLabel\">"
+        "    <xs:simpleContent>"
+        "      <xs:extension base=\"xs:string\">"
+        "        <xs:attribute name=\"label\" use=\"required\"/>"
+        "        <xs:attributeGroup ref=\"tns:BaseAttrs\"/>"
+        "      </xs:extension>"
+        "    </xs:simpleContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"ColorLabel\">"
+        "    <xs:simpleContent>"
+        "      <xs:restriction base=\"tns:BaseLabel\">"
+        "        <xs:simpleType>"
+        "          <xs:restriction base=\"xs:string\">"
+        "            <xs:enumeration value=\"red\"/>"
+        "            <xs:enumeration value=\"blue\"/>"
+        "          </xs:restriction>"
+        "        </xs:simpleType>"
+        "        <xs:attribute name=\"label\" use=\"required\"/>"
+                "        <xs:attributeGroup ref=\"tns:RestrictedAttrs\"/>"
+        "        <xs:attribute name=\"lang\" use=\"prohibited\"/>"
+        "      </xs:restriction>"
+        "    </xs:simpleContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"SizedToken\">"
+        "    <xs:simpleContent>"
+        "      <xs:restriction base=\"xs:string\">"
+        "        <xs:simpleType>"
+        "          <xs:restriction base=\"xs:string\">"
+        "            <xs:minLength value=\"2\"/>"
+        "          </xs:restriction>"
+        "        </xs:simpleType>"
+        "        <xs:attribute name=\"kind\" use=\"required\"/>"
+        "      </xs:restriction>"
+        "    </xs:simpleContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"BaseRecord\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"id\" type=\"xs:int\"/>"
+        "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "    </xs:sequence>"
+        "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+        "    <xs:attribute name=\"deprecated\" type=\"xs:string\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"RestrictedRecord\">"
+        "    <xs:complexContent>"
+        "      <xs:restriction base=\"tns:BaseRecord\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"id\" type=\"xs:int\"/>"
+        "        </xs:sequence>"
+        "        <xs:attribute name=\"version\" use=\"required\">"
+        "          <xs:simpleType>"
+        "            <xs:restriction base=\"xs:int\">"
+        "              <xs:minInclusive value=\"2\"/>"
+        "            </xs:restriction>"
+        "          </xs:simpleType>"
+        "        </xs:attribute>"
+        "        <xs:attribute name=\"deprecated\" use=\"prohibited\"/>"
+        "      </xs:restriction>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"color\" type=\"tns:ColorLabel\"/>"
+        "  <xs:element name=\"token\" type=\"tns:SizedToken\"/>"
+        "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+        "  <xs:complexType name=\"BaseAllRecord\">"
+        "    <xs:all>"
+        "      <xs:element name=\"id\" type=\"xs:int\"/>"
+        "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "    </xs:all>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"RestrictedAllRecord\">"
+        "    <xs:complexContent>"
+        "      <xs:restriction base=\"tns:BaseAllRecord\">"
+        "        <xs:all>"
+        "          <xs:element name=\"id\" type=\"xs:int\"/>"
+        "        </xs:all>"
+        "      </xs:restriction>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"allRecord\" type=\"tns:RestrictedAllRecord\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto validColor = XmlDocument::Parse(
+        "<color xmlns=\"urn:content-restrict\" label=\"primary\" code=\"c1\">red</color>");
+    validColor->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidColorValue = XmlDocument::Parse(
+            "<color xmlns=\"urn:content-restrict\" label=\"primary\" code=\"c1\">green</color>");
+        invalidColorValue->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'color'") != std::string::npos
+            && std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should narrow simpleContent text facets through restriction");
+
+    threw = false;
+    try {
+        const auto prohibitedColorAttribute = XmlDocument::Parse(
+            "<color xmlns=\"urn:content-restrict\" label=\"primary\" code=\"c1\" lang=\"en\">red</color>");
+        prohibitedColorAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'lang'") != std::string::npos
+            && std::string(exception.what()).find("is not declared") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should honor prohibited inherited attributes in simpleContent restriction");
+
+    threw = false;
+    try {
+        const auto missingGroupedRequiredAttribute = XmlDocument::Parse(
+            "<color xmlns=\"urn:content-restrict\" label=\"primary\">red</color>");
+        missingGroupedRequiredAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'code'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve required attributes inherited through attributeGroup in simpleContent restriction");
+
+    const auto validToken = XmlDocument::Parse(
+        "<token xmlns=\"urn:content-restrict\" kind=\"word\">ab</token>");
+    validToken->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto shortToken = XmlDocument::Parse(
+            "<token xmlns=\"urn:content-restrict\" kind=\"word\">a</token>");
+        shortToken->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'token'") != std::string::npos
+            && std::string(exception.what()).find("length >= 2") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support simpleContent restriction directly from builtin simple types");
+
+    const auto validRecord = XmlDocument::Parse(
+        "<record xmlns=\"urn:content-restrict\" version=\"2\">"
+        "  <id>7</id>"
+        "</record>");
+    validRecord->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto invalidRestrictedChild = XmlDocument::Parse(
+            "<record xmlns=\"urn:content-restrict\" version=\"2\">"
+            "  <id>7</id>"
+            "  <summary>extra</summary>"
+            "</record>");
+        invalidRestrictedChild->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos
+            || std::string(exception.what()).find("unexpected child element") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should narrow complexContent particles through restriction");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedAttribute = XmlDocument::Parse(
+            "<record xmlns=\"urn:content-restrict\" version=\"2\" deprecated=\"yes\">"
+            "  <id>7</id>"
+            "</record>");
+        invalidRestrictedAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'deprecated'") != std::string::npos
+            && std::string(exception.what()).find("is not declared") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should honor prohibited inherited attributes in complexContent restriction");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedVersion = XmlDocument::Parse(
+            "<record xmlns=\"urn:content-restrict\" version=\"1\">"
+            "  <id>7</id>"
+            "</record>");
+        invalidRestrictedVersion->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'version'") != std::string::npos
+            && std::string(exception.what()).find(">= 2") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should narrow inherited attribute types through complexContent restriction");
+
+    const auto validAllRecord = XmlDocument::Parse(
+        "<allRecord xmlns=\"urn:content-restrict\">"
+        "  <id>7</id>"
+        "</allRecord>");
+    validAllRecord->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto invalidRestrictedAllChild = XmlDocument::Parse(
+            "<allRecord xmlns=\"urn:content-restrict\">"
+            "  <id>7</id>"
+            "  <summary>extra</summary>"
+            "</allRecord>");
+        invalidRestrictedAllChild->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should narrow xs:all particles through complexContent restriction");
+}
+
+void TestXmlSchemaRestrictionLegality() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\">"
+            "        <xs:attribute name=\"label\" use=\"required\"/>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"EnumLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:restriction base=\"tns:BaseLabel\">"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\">"
+            "            <xs:enumeration value=\"red\"/>"
+            "            <xs:enumeration value=\"blue\"/>"
+            "          </xs:restriction>"
+            "        </xs:simpleType>"
+            "        <xs:attribute name=\"label\" use=\"required\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidBroadLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:restriction base=\"tns:EnumLabel\">"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\">"
+            "            <xs:minLength value=\"1\"/>"
+            "          </xs:restriction>"
+            "        </xs:simpleType>"
+            "        <xs:attribute name=\"label\" use=\"required\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot remove enumeration constraints") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent restrictions that widen base simpleType facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:simpleType name=\"BaseCode\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:pattern value=\"[A-Z]+\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change the base pattern facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType restrictions that change base pattern facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:attribute name=\"version\" type=\"xs:int\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax required attribute 'version'") != std::string::npos
+            || std::string(exception.what()).find("cannot remove required attribute 'version'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that relax required inherited attributes");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "        <xs:attribute name=\"extra\" type=\"xs:string\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add attribute 'extra'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that add new attributes absent from the base type");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:attribute name=\"version\" type=\"xs:string\" fixed=\"v1\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:attribute name=\"version\" type=\"xs:string\" fixed=\"v2\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change fixed value of inherited attribute 'version'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that change inherited attribute fixed values");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\">"
+            "        <xs:attribute name=\"mode\" type=\"xs:string\" default=\"auto\"/>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:restriction base=\"tns:BaseLabel\">"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\">"
+            "            <xs:enumeration value=\"red\"/>"
+            "            <xs:enumeration value=\"blue\"/>"
+            "          </xs:restriction>"
+            "        </xs:simpleType>"
+            "        <xs:attribute name=\"mode\" type=\"xs:string\" default=\"manual\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change default value of inherited attribute 'mode'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that change inherited attribute default values");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:attributeGroup name=\"BaseAttrs\">"
+            "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:attributeGroup name=\"ExtraAttrs\">"
+            "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "    <xs:attribute name=\"extra\" type=\"xs:string\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:attributeGroup ref=\"tns:BaseAttrs\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:attributeGroup ref=\"tns:ExtraAttrs\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add attribute 'extra'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that add new attributes through attributeGroup references");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:attributeGroup name=\"BaseAttrs\">"
+            "    <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:attributeGroup name=\"WidenedAttrs\">"
+            "    <xs:anyAttribute namespace=\"##any\" processContents=\"skip\"/>"
+            "  </xs:attributeGroup>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "    <xs:attributeGroup ref=\"tns:BaseAttrs\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:attributeGroup ref=\"tns:WidenedAttrs\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base anyAttribute namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot weaken the base anyAttribute processContents") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that widen anyAttribute through attributeGroup references");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new sequence particle") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos
+            || std::string(exception.what()).find("cannot omit required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that add new sequence particles");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that reorder required sequence particles");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\" minOccurs=\"0\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base minOccurs") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that relax sequence child minOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"tag\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"2\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"tag\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"3\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that relax sequence child maxOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:choice minOccurs=\"0\">"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:choice>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base minOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that relax choice compositor minOccurs");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice maxOccurs=\"2\">"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:choice maxOccurs=\"3\">"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:choice>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxOccurs") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that relax choice compositor maxOccurs");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice minOccurs=\"0\" maxOccurs=\"2\">"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:choice maxOccurs=\"1\">"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:choice>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##other\" processContents=\"lax\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##other\" processContents=\"lax\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##local\" processContents=\"strict\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##local\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##other\" processContents=\"lax\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##other\" processContents=\"lax\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##targetNamespace\" processContents=\"strict\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base wildcard namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot widen the base anyAttribute namespace constraint") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restriction wildcards that step from ##other to ##targetNamespace");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##local\" processContents=\"lax\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##local\" processContents=\"lax\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##other\" processContents=\"strict\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##other\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base wildcard namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot widen the base anyAttribute namespace constraint") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restriction wildcards that step from ##local to ##other");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot introduce child particles when the base type has no element content") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that introduce sequence content onto an attribute-only base type");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\" version=\"2\"/>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"meta\">"
+            "        <xs:complexType>"
+            "          <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"meta\">"
+            "            <xs:complexType>"
+            "              <xs:sequence>"
+            "                <xs:element name=\"id\" type=\"xs:int\"/>"
+            "              </xs:sequence>"
+            "              <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot introduce child particles when the base complexType has no element content") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject same-name anonymous child restrictions that introduce sequence content onto an attribute-only complexType");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:simpleType name=\"PositiveInt\">"
+            "    <xs:restriction base=\"xs:int\">"
+            "      <xs:minInclusive value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"tns:PositiveInt\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot replace a base child element with an incompatible element type") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that change a child element to an incompatible simple type");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:simpleType name=\"PositiveInt\">"
+            "    <xs:restriction base=\"xs:int\">"
+            "      <xs:minInclusive value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"tns:PositiveInt\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseInfo\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"ExtendedInfo\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:BaseInfo\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"tag\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"info\" type=\"tns:BaseInfo\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"info\" type=\"tns:ExtendedInfo\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot replace a base child element with an incompatible element type") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that swap a child element to an extension-derived complex type");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseInfo\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedInfo\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseInfo\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"info\" type=\"tns:RestrictedInfo\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"info\" type=\"tns:BaseInfo\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <info><id>7</id></info>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"label\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:restriction base=\"xs:string\">"
+            "              <xs:simpleType>"
+            "                <xs:restriction base=\"xs:string\">"
+            "                  <xs:enumeration value=\"red\"/>"
+            "                  <xs:enumeration value=\"blue\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleType>"
+            "              <xs:attribute name=\"lang\" type=\"xs:string\" use=\"required\"/>"
+            "            </xs:restriction>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"label\">"
+            "            <xs:complexType>"
+            "              <xs:simpleContent>"
+            "                <xs:restriction base=\"xs:string\">"
+            "                  <xs:simpleType>"
+            "                    <xs:restriction base=\"xs:string\">"
+            "                      <xs:minLength value=\"1\"/>"
+            "                    </xs:restriction>"
+            "                  </xs:simpleType>"
+            "                  <xs:attribute name=\"lang\" type=\"xs:string\" use=\"required\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleContent>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot remove enumeration constraints") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that widen a same-name child anonymous simpleContent type");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"qty\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:extension base=\"xs:int\">"
+            "              <xs:attribute name=\"unit\" type=\"xs:string\" use=\"required\"/>"
+            "            </xs:extension>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"qty\">"
+            "            <xs:complexType>"
+            "              <xs:simpleContent>"
+            "                <xs:restriction base=\"xs:int\">"
+            "                  <xs:minInclusive value=\"1\"/>"
+            "                  <xs:attribute name=\"unit\" type=\"xs:string\" use=\"required\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleContent>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <qty unit=\"pcs\">7</qty>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"qty\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:extension base=\"xs:int\">"
+            "              <xs:attribute name=\"unit\" type=\"xs:string\" use=\"required\"/>"
+            "            </xs:extension>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"qty\">"
+            "            <xs:complexType>"
+            "              <xs:simpleContent>"
+            "                <xs:restriction base=\"xs:int\">"
+            "                  <xs:minInclusive value=\"1\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleContent>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot remove required attribute 'unit'") != std::string::npos
+            || std::string(exception.what()).find("cannot relax required attribute 'unit'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject anonymous simpleContent child restrictions that remove required attributes");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"label\" fixed=\"red\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:restriction base=\"xs:string\">"
+            "              <xs:simpleType>"
+            "                <xs:restriction base=\"xs:string\">"
+            "                  <xs:enumeration value=\"red\"/>"
+            "                  <xs:enumeration value=\"blue\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleType>"
+            "            </xs:restriction>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"label\" fixed=\"blue\">"
+            "            <xs:complexType>"
+            "              <xs:simpleContent>"
+            "                <xs:restriction base=\"xs:string\">"
+            "                  <xs:simpleType>"
+            "                    <xs:restriction base=\"xs:string\">"
+            "                      <xs:enumeration value=\"blue\"/>"
+            "                    </xs:restriction>"
+            "                  </xs:simpleType>"
+            "                </xs:restriction>"
+            "              </xs:simpleContent>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change the base child element fixed value") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject anonymous simpleContent child restrictions that change element fixed values");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"mode\" default=\"auto\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:restriction base=\"xs:string\">"
+            "              <xs:simpleType>"
+            "                <xs:restriction base=\"xs:string\">"
+            "                  <xs:enumeration value=\"auto\"/>"
+            "                  <xs:enumeration value=\"manual\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleType>"
+            "            </xs:restriction>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"mode\" default=\"manual\">"
+            "            <xs:complexType>"
+            "              <xs:simpleContent>"
+            "                <xs:restriction base=\"xs:string\">"
+            "                  <xs:simpleType>"
+            "                    <xs:restriction base=\"xs:string\">"
+            "                      <xs:enumeration value=\"manual\"/>"
+            "                    </xs:restriction>"
+            "                  </xs:simpleType>"
+            "                </xs:restriction>"
+            "              </xs:simpleContent>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change the base child element default value") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject anonymous simpleContent child restrictions that change element default values");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"note\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"note\" type=\"xs:string\" nillable=\"true\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot make a base child element nillable") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that widen child-element nillability");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"code\" type=\"xs:string\" fixed=\"ABC\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"code\" type=\"xs:string\" fixed=\"XYZ\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change the base child element fixed value") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that change child-element fixed values");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"mode\" type=\"xs:string\" default=\"auto\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"mode\" type=\"xs:string\" default=\"manual\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot change the base child element default value") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that change child-element default values");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"note\" type=\"xs:string\" nillable=\"true\" minOccurs=\"0\"/>"
+            "      <xs:element name=\"mode\" type=\"xs:string\" default=\"auto\" minOccurs=\"0\"/>"
+            "      <xs:element name=\"code\" type=\"xs:string\" fixed=\"ABC\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"note\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "          <xs:element name=\"mode\" type=\"xs:string\" default=\"auto\" minOccurs=\"0\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\" fixed=\"ABC\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <note>ready</note>"
+            "  <code>ABC</code>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"info\">"
+            "        <xs:complexType>"
+            "          <xs:sequence>"
+            "            <xs:element name=\"id\" type=\"xs:int\"/>"
+            "            <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "          </xs:sequence>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"info\">"
+            "            <xs:complexType>"
+            "              <xs:sequence>"
+            "                <xs:element name=\"id\" type=\"xs:int\"/>"
+            "                <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "              </xs:sequence>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new sequence particle") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that widen a same-name child anonymous complexType");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"info\">"
+            "        <xs:complexType>"
+            "          <xs:sequence>"
+            "            <xs:element name=\"id\" type=\"xs:int\"/>"
+            "            <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "          </xs:sequence>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"info\">"
+            "            <xs:complexType>"
+            "              <xs:sequence>"
+            "                <xs:element name=\"id\" type=\"xs:int\"/>"
+            "              </xs:sequence>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <info><id>7</id></info>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:simpleType name=\"BaseCode\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:length value=\"4\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"RestrictedCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"code\" type=\"tns:BaseCode\" block=\"restriction\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"code\" type=\"tns:RestrictedCode\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject same-name child element restrictions when the base element blocks restriction derivation");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:simpleType name=\"BaseCode\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:length value=\"4\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"RestrictedCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"code\" type=\"tns:BaseCode\" final=\"restriction\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"code\" type=\"tns:RestrictedCode\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("final blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject same-name child element restrictions when the base element final blocks restriction derivation");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"qty\" block=\"restriction\">"
+            "        <xs:complexType>"
+            "          <xs:simpleContent>"
+            "            <xs:extension base=\"xs:int\">"
+            "              <xs:attribute name=\"unit\" type=\"xs:string\" use=\"required\"/>"
+            "            </xs:extension>"
+            "          </xs:simpleContent>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"qty\">"
+            "            <xs:complexType>"
+            "              <xs:simpleContent>"
+            "                <xs:restriction base=\"xs:int\">"
+            "                  <xs:minInclusive value=\"1\"/>"
+            "                  <xs:attribute name=\"unit\" type=\"xs:string\" use=\"required\"/>"
+            "                </xs:restriction>"
+            "              </xs:simpleContent>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should report block-based restriction failures for same-name anonymous simpleContent child elements");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"info\" final=\"restriction\">"
+            "        <xs:complexType>"
+            "          <xs:sequence>"
+            "            <xs:element name=\"id\" type=\"xs:int\"/>"
+            "            <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "          </xs:sequence>"
+            "        </xs:complexType>"
+            "      </xs:element>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"info\">"
+            "            <xs:complexType>"
+            "              <xs:sequence>"
+            "                <xs:element name=\"id\" type=\"xs:int\"/>"
+            "              </xs:sequence>"
+            "            </xs:complexType>"
+            "          </xs:element>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("final blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should report final-based restriction failures for same-name anonymous complexContent child elements");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:simpleType name=\"BaseCode\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:length value=\"4\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"RestrictedCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"code\" type=\"tns:BaseCode\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"code\" type=\"tns:RestrictedCode\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <code>AB12</code>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:all>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "        </xs:all>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new all particle") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that add new xs:all particles");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:all>"
+            "          <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:all>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot omit required base all particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that omit required xs:all particles");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:all>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "    </xs:all>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:all>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:all>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##targetNamespace\" processContents=\"strict\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##any\" processContents=\"skip\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base wildcard namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot weaken the base wildcard processContents") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that widen wildcard particles");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##targetNamespace ##local\" processContents=\"lax\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##targetNamespace ##local\" processContents=\"lax\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##local\" processContents=\"strict\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##local\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:any namespace=\"##targetNamespace ##local\" processContents=\"lax\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "    <xs:anyAttribute namespace=\"##targetNamespace ##local\" processContents=\"lax\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##other\" processContents=\"skip\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##other\" processContents=\"skip\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base wildcard namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot widen the base anyAttribute namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot weaken the base wildcard processContents") != std::string::npos
+            || std::string(exception.what()).find("cannot weaken the base anyAttribute processContents") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restrictions that step outside wildcard namespace lists");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:choice>"
+            "        <xs:any namespace=\"##targetNamespace\" processContents=\"lax\"/>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##targetNamespace\" processContents=\"lax\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <payload/>"
+            "  <code>x</code>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:choice>"
+            "        <xs:any namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:any namespace=\"##any\" processContents=\"skip\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base wildcard namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot weaken the base wildcard processContents") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject mixed sequence-choice restrictions that widen a selected wildcard branch");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:anyAttribute namespace=\"##any\" processContents=\"skip\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot widen the base anyAttribute namespace constraint") != std::string::npos
+            || std::string(exception.what()).find("cannot weaken the base anyAttribute processContents") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that widen anyAttribute wildcards");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "        <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add an anyAttribute wildcard") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restrictions that add a new anyAttribute wildcard");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:anyAttribute namespace=\"##any\" processContents=\"lax\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:group name=\"IdGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:group ref=\"tns:IdGroup\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "      <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "  <summary>ok</summary>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:choice>"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "  <summary>ok</summary>"
+            "  <code>x</code>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:group name=\"NestedChoiceGroup\">"
+            "    <xs:choice>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "      <xs:element name=\"tag\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:choice>"
+            "        <xs:group ref=\"tns:NestedChoiceGroup\"/>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "  <summary>ok</summary>"
+            "  <code>x</code>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice>"
+            "      <xs:choice>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:choice>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "        </xs:choice>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <alias>ok</alias>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:group name=\"IdOnlyGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:group name=\"DetailedGroup\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice>"
+            "      <xs:group ref=\"tns:IdOnlyGroup\"/>"
+            "      <xs:group ref=\"tns:DetailedGroup\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "  <summary>ok</summary>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:sequence minOccurs=\"0\">"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      </xs:sequence>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"RestrictedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:RestrictedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:restriction-legality\">"
+            "  <id>7</id>"
+            "  <summary>ok</summary>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "      <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new sequence particle") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos
+            || std::string(exception.what()).find("cannot select a branch outside the base choice") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject nested complexContent restrictions that select content outside the base choice");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "      </xs:sequence>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos
+            || std::string(exception.what()).find("cannot omit required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should still reject sequence restrictions that skip required overlapping base particles");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:choice>"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new sequence particle") != std::string::npos
+            || std::string(exception.what()).find("cannot select a branch outside the base choice") != std::string::npos
+            || std::string(exception.what()).find("cannot add a new choice branch") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject mixed sequence-choice restrictions that add content outside the chosen choice branch");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:group name=\"NestedChoiceGroup\">"
+            "    <xs:choice>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"summary\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "      <xs:element name=\"tag\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:group>"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:choice>"
+            "        <xs:group ref=\"tns:NestedChoiceGroup\"/>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "          <xs:element name=\"code\" type=\"xs:string\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new sequence particle") != std::string::npos
+            || std::string(exception.what()).find("cannot select a branch outside the base choice") != std::string::npos
+            || std::string(exception.what()).find("cannot add a new choice branch") != std::string::npos
+            || std::string(exception.what()).find("cannot omit or reorder required base sequence particles") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject deeply nested mixed compositor restrictions that add content outside the chosen branch");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:restriction-legality\" targetNamespace=\"urn:restriction-legality\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:choice>"
+            "      <xs:choice>"
+            "        <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "      </xs:choice>"
+            "      <xs:element name=\"code\" type=\"xs:string\"/>"
+            "    </xs:choice>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:choice>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "          <xs:element name=\"alias\" type=\"xs:string\"/>"
+            "          <xs:element name=\"extra\" type=\"xs:string\"/>"
+            "        </xs:choice>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add a new choice branch") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject nested choice restrictions that introduce branches outside the base choice");
+}
+
+void TestXmlSchemaComplexTypeFinalDerivationControls() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:type-final\" targetNamespace=\"urn:type-final\">"
+            "  <xs:complexType name=\"BaseRecord\" final=\"restriction\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"id\" type=\"xs:int\"/>"
+            "        </xs:sequence>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent restriction when the base complexType final forbids restriction");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:type-final\" targetNamespace=\"urn:type-final\">"
+            "  <xs:complexType name=\"BaseRecord\" final=\"extension\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"extra\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks extension derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject complexContent extension when the base complexType final forbids extension");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:type-final\" targetNamespace=\"urn:type-final\">"
+            "  <xs:complexType name=\"BaseLabel\" final=\"restriction\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\">"
+            "        <xs:attribute name=\"lang\" type=\"xs:string\"/>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:restriction base=\"tns:BaseLabel\">"
+            "        <xs:simpleType>"
+            "          <xs:restriction base=\"xs:string\">"
+            "            <xs:enumeration value=\"red\"/>"
+            "          </xs:restriction>"
+            "        </xs:simpleType>"
+            "        <xs:attribute name=\"lang\" type=\"xs:string\"/>"
+            "      </xs:restriction>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent restriction when the base complexType final forbids restriction");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:type-final\" targetNamespace=\"urn:type-final\">"
+            "  <xs:complexType name=\"BaseLabel\" final=\"extension\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"xs:string\">"
+            "        <xs:attribute name=\"lang\" type=\"xs:string\"/>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidLabel\">"
+            "    <xs:simpleContent>"
+            "      <xs:extension base=\"tns:BaseLabel\">"
+            "        <xs:attribute name=\"tone\" type=\"xs:string\"/>"
+            "      </xs:extension>"
+            "    </xs:simpleContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks extension derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleContent extension when the base complexType final forbids extension");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:type-final\" targetNamespace=\"urn:type-final\">"
+            "  <xs:complexType name=\"BaseRecord\" final=\"restriction\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"ExtendedRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"extra\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"record\" type=\"tns:ExtendedRecord\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<record xmlns=\"urn:type-final\">"
+            "  <id>7</id>"
+            "  <extra>x</extra>"
+            "</record>");
+        valid->Validate(schemas);
+    }
+}
+
+void TestXmlSchemaSchemaDerivationDefaults() {
+    bool threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:default-derivation\" targetNamespace=\"urn:default-derivation\" finalDefault=\"restriction\">"
+            "  <xs:simpleType name=\"BaseCode\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ShortCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:length value=\"3\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should apply finalDefault to named simpleType restriction derivation");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:default-derivation\" targetNamespace=\"urn:default-derivation\" finalDefault=\"extension\">"
+            "  <xs:complexType name=\"BaseRecord\">"
+            "    <xs:sequence>"
+            "      <xs:element name=\"id\" type=\"xs:int\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"InvalidRecord\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:BaseRecord\">"
+            "        <xs:sequence>"
+            "          <xs:element name=\"extra\" type=\"xs:string\" minOccurs=\"0\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks extension derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should apply finalDefault to named complexType extension derivation");
+
+    threw = false;
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:default-derivation\" targetNamespace=\"urn:default-derivation\" finalDefault=\"substitution\">"
+            "  <xs:element name=\"animal\"/>"
+            "  <xs:element name=\"dog\" substitutionGroup=\"tns:animal\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks substitution derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should apply finalDefault to substitutionGroup heads");
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:default-derivation\" targetNamespace=\"urn:default-derivation\" blockDefault=\"substitution\">"
+            "  <xs:element name=\"animal\"/>"
+            "  <xs:element name=\"dog\" substitutionGroup=\"tns:animal\">"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"name\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "  <xs:element name=\"zoo\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element ref=\"tns:animal\"/>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        threw = false;
+        try {
+            const auto blockedSubstitution = XmlDocument::Parse(
+                "<zoo xmlns=\"urn:default-derivation\">"
+                "  <dog name=\"Rex\"/>"
+                "</zoo>");
+            blockedSubstitution->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+                || std::string(exception.what()).find("expected child element 'animal'") != std::string::npos
+                || std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should apply blockDefault to referenced substitutionGroup heads");
+
+        const auto exactHead = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:default-derivation\">"
+            "  <animal/>"
+            "</zoo>");
+        exactHead->Validate(schemas);
+    }
+
+    {
+        XmlSchemaSet schemas;
+        schemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:default-derivation\" targetNamespace=\"urn:default-derivation\" finalDefault=\"list union\">"
+            "  <xs:simpleType name=\"BaseCode\">"
+            "    <xs:restriction base=\"xs:string\">"
+            "      <xs:pattern value=\"[A-Z]{3}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ExactCode\">"
+            "    <xs:restriction base=\"tns:BaseCode\">"
+            "      <xs:length value=\"3\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:element name=\"value\" type=\"tns:ExactCode\"/>"
+            "</xs:schema>");
+
+        const auto valid = XmlDocument::Parse(
+            "<value xmlns=\"urn:default-derivation\">ABC</value>");
+        valid->Validate(schemas);
+    }
+}
+
+void TestXmlSchemaSubstitutionGroups() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst\" targetNamespace=\"urn:subst\">"
+        "  <xs:element name=\"animal\" abstract=\"true\"/>"
+        "  <xs:element name=\"mammal\" substitutionGroup=\"tns:animal\"/>"
+        "  <xs:element name=\"dog\" substitutionGroup=\"tns:mammal\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"name\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"zoo\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:animal\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"singleAnimal\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:animal\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<zoo xmlns=\"urn:subst\">"
+        "  <dog name=\"Rex\"/>"
+        "  <mammal/>"
+        "</zoo>");
+    valid->Validate(schemas);
+
+    const auto validChain = XmlDocument::Parse(
+        "<singleAnimal xmlns=\"urn:subst\">"
+        "  <dog name=\"Bolt\"/>"
+        "</singleAnimal>");
+    validChain->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto abstractRoot = XmlDocument::Parse(
+            "<animal xmlns=\"urn:subst\"/>");
+        abstractRoot->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("is abstract") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject abstract substitutionGroup heads as concrete elements");
+
+    threw = false;
+    try {
+        const auto invalidMember = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:subst\">"
+            "  <dog/>"
+            "</zoo>");
+        invalidMember->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'name'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should keep validating the concrete substitutionGroup member declaration");
+
+    {
+        XmlSchemaSet numericAbstractSchemas;
+        numericAbstractSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-bool\" targetNamespace=\"urn:subst-bool\">"
+            "  <xs:element name=\"animal\" abstract=\"1\"/>"
+            "</xs:schema>");
+
+        threw = false;
+        try {
+            const auto abstractRoot = XmlDocument::Parse(
+                "<animal xmlns=\"urn:subst-bool\"/>");
+            abstractRoot->Validate(numericAbstractSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("is abstract") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should treat abstract=1 as a true schema boolean value");
+    }
+}
+
+void TestXmlSchemaSubstitutionDerivationControls() {
+    const std::string blockSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-controls\" targetNamespace=\"urn:subst-controls\">"
+        "  <xs:element name=\"animal\" block=\"substitution\"/>"
+        "  <xs:element name=\"dog\" substitutionGroup=\"tns:animal\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"name\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"zoo\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:animal\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet blockSchemas;
+    blockSchemas.AddXml(blockSchemaXml);
+
+    bool threw = false;
+    try {
+        const auto blockedSubstitution = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:subst-controls\">"
+            "  <dog name=\"Rex\"/>"
+            "</zoo>");
+        blockedSubstitution->Validate(blockSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+            || std::string(exception.what()).find("expected child element 'animal'") != std::string::npos
+            || std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject substitutionGroup members when the referenced head blocks substitution");
+
+    const auto exactHead = XmlDocument::Parse(
+        "<zoo xmlns=\"urn:subst-controls\">"
+        "  <animal/>"
+        "</zoo>");
+    exactHead->Validate(blockSchemas);
+
+    const std::string finalSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-controls\" targetNamespace=\"urn:subst-controls\">"
+        "  <xs:element name=\"animal\" final=\"substitution\"/>"
+        "  <xs:element name=\"dog\" substitutionGroup=\"tns:animal\"/>"
+        "</xs:schema>";
+
+    threw = false;
+    try {
+        XmlSchemaSet finalSchemas;
+        finalSchemas.AddXml(finalSchemaXml);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks substitution derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject substitutionGroup members when the head declares final substitution");
+
+    const std::string blockDerivationSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-derivation\" targetNamespace=\"urn:subst-derivation\">"
+        "  <xs:complexType name=\"AnimalType\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"name\" type=\"xs:string\"/>"
+        "      <xs:element name=\"note\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "    </xs:sequence>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"DogType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:AnimalType\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"breed\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "        </xs:sequence>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"CatType\">"
+        "    <xs:complexContent>"
+        "      <xs:restriction base=\"tns:AnimalType\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"name\" type=\"xs:string\"/>"
+        "        </xs:sequence>"
+        "      </xs:restriction>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"animal\" type=\"tns:AnimalType\" block=\"extension restriction\"/>"
+        "  <xs:element name=\"dog\" type=\"tns:DogType\" substitutionGroup=\"tns:animal\"/>"
+        "  <xs:element name=\"cat\" type=\"tns:CatType\" substitutionGroup=\"tns:animal\"/>"
+        "  <xs:element name=\"zoo\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:animal\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet blockDerivationSchemas;
+    blockDerivationSchemas.AddXml(blockDerivationSchemaXml);
+
+    threw = false;
+    try {
+        const auto blockedExtension = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:subst-derivation\">"
+            "  <dog><name>Rex</name></dog>"
+            "</zoo>");
+        blockedExtension->Validate(blockDerivationSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+            || std::string(exception.what()).find("expected child element 'animal'") != std::string::npos
+            || std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject substitutionGroup members whose type derivation uses blocked extension");
+
+    threw = false;
+    try {
+        const auto blockedRestriction = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:subst-derivation\">"
+            "  <cat><name>Milo</name></cat>"
+            "</zoo>");
+        blockedRestriction->Validate(blockDerivationSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+            || std::string(exception.what()).find("expected child element 'animal'") != std::string::npos
+            || std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject substitutionGroup members whose type derivation uses blocked restriction");
+
+    const auto exactTypedHead = XmlDocument::Parse(
+        "<zoo xmlns=\"urn:subst-derivation\">"
+        "  <animal><name>Base</name></animal>"
+        "</zoo>");
+    exactTypedHead->Validate(blockDerivationSchemas);
+
+    const std::string finalDerivationSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-derivation\" targetNamespace=\"urn:subst-derivation\">"
+        "  <xs:complexType name=\"AnimalType\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"name\" type=\"xs:string\"/>"
+        "      <xs:element name=\"note\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "    </xs:sequence>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"DogType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:AnimalType\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"breed\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "        </xs:sequence>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"CatType\">"
+        "    <xs:complexContent>"
+        "      <xs:restriction base=\"tns:AnimalType\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"name\" type=\"xs:string\"/>"
+        "        </xs:sequence>"
+        "      </xs:restriction>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"animal\" type=\"tns:AnimalType\" final=\"extension restriction\"/>"
+        "  <xs:element name=\"dog\" type=\"tns:DogType\" substitutionGroup=\"tns:animal\"/>"
+        "  <xs:element name=\"cat\" type=\"tns:CatType\" substitutionGroup=\"tns:animal\"/>"
+        "</xs:schema>";
+
+    threw = false;
+    try {
+        XmlSchemaSet finalDerivationSchemas;
+        finalDerivationSchemas.AddXml(finalDerivationSchemaXml);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks the required type derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject substitutionGroup members when the head final blocks extension or restriction derivation");
+
+    const std::string simpleTypeSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-simple\" targetNamespace=\"urn:subst-simple\">"
+        "  <xs:simpleType name=\"AnimalCode\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:length value=\"4\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"DogCode\">"
+        "    <xs:restriction base=\"tns:AnimalCode\">"
+        "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"animalCode\" type=\"tns:AnimalCode\" block=\"restriction\"/>"
+        "  <xs:element name=\"dogCode\" type=\"tns:DogCode\" substitutionGroup=\"tns:animalCode\"/>"
+        "  <xs:element name=\"codes\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:animalCode\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet simpleTypeSchemas;
+    simpleTypeSchemas.AddXml(simpleTypeSchemaXml);
+
+    threw = false;
+    try {
+        const auto blockedSimpleRestriction = XmlDocument::Parse(
+            "<codes xmlns=\"urn:subst-simple\">"
+            "  <dogCode>AB12</dogCode>"
+            "</codes>");
+        blockedSimpleRestriction->Validate(simpleTypeSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+            || std::string(exception.what()).find("expected child element 'animalCode'") != std::string::npos
+            || std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject simpleType substitutionGroup members when the referenced head blocks restriction");
+
+    const auto exactSimpleHead = XmlDocument::Parse(
+        "<codes xmlns=\"urn:subst-simple\">"
+        "  <animalCode>AB12</animalCode>"
+        "</codes>");
+    exactSimpleHead->Validate(simpleTypeSchemas);
+
+    const std::string simpleTypeFinalSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:subst-simple\" targetNamespace=\"urn:subst-simple\">"
+        "  <xs:simpleType name=\"AnimalCode\">"
+        "    <xs:restriction base=\"xs:string\">"
+        "      <xs:length value=\"4\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"DogCode\">"
+        "    <xs:restriction base=\"tns:AnimalCode\">"
+        "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"animalCode\" type=\"tns:AnimalCode\" final=\"restriction\"/>"
+        "  <xs:element name=\"dogCode\" type=\"tns:DogCode\" substitutionGroup=\"tns:animalCode\"/>"
+        "</xs:schema>";
+
+    threw = false;
+    try {
+        XmlSchemaSet simpleTypeFinalSchemas;
+        simpleTypeFinalSchemas.AddXml(simpleTypeFinalSchemaXml);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("blocks the required type derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject simpleType substitutionGroup members when the head final blocks restriction derivation");
+}
+
+void TestXmlSchemaWildcardProcessContents() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:process\" targetNamespace=\"urn:process\">"
+        "  <xs:element name=\"knownForeign\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"code\" type=\"xs:int\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"strictBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"strict\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "      <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"strict\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"laxBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"lax\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "      <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"lax\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"skipBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"skip\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "      <xs:anyAttribute namespace=\"##targetNamespace\" processContents=\"skip\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"listBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace ##local\" processContents=\"skip\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "      <xs:anyAttribute namespace=\"##targetNamespace ##local\" processContents=\"skip\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:complexType name=\"AnimalType\">"
+        "    <xs:attribute name=\"age\" type=\"xs:int\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"DogType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:AnimalType\">"
+        "        <xs:attribute name=\"breed\" type=\"xs:string\" use=\"required\"/>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"animal\" type=\"tns:AnimalType\" abstract=\"true\"/>"
+        "  <xs:element name=\"dog\" type=\"tns:DogType\" substitutionGroup=\"tns:animal\"/>"
+        "  <xs:element name=\"strictSubstitutionBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"strict\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"laxSubstitutionBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"lax\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"skipSubstitutionBox\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"skip\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    bool threw = false;
+    try {
+        const auto strictUnknown = XmlDocument::Parse(
+            "<strictBox xmlns=\"urn:process\" xmlns:tns=\"urn:process\" tns:flag=\"1\">"
+            "  <payload/>"
+            "</strictBox>");
+        strictUnknown->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos
+            || std::string(exception.what()).find("attribute 'tns:flag'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject undeclared wildcard content under strict processContents");
+
+    const auto laxUnknown = XmlDocument::Parse(
+        "<laxBox xmlns=\"urn:process\" xmlns:tns=\"urn:process\" tns:flag=\"1\">"
+        "  <payload/>"
+        "</laxBox>");
+    laxUnknown->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto laxDeclaredInvalid = XmlDocument::Parse(
+            "<laxBox xmlns=\"urn:process\" xmlns:ext=\"urn:ext\">"
+            "  <knownForeign xmlns=\"urn:process\" code=\"bad\"/>"
+            "</laxBox>");
+        laxDeclaredInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'code'") != std::string::npos
+            && std::string(exception.what()).find("xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should still validate declared wildcard content under lax processContents");
+
+    const auto skipDeclaredInvalid = XmlDocument::Parse(
+        "<skipBox xmlns=\"urn:process\">"
+        "  <knownForeign xmlns=\"urn:process\" code=\"bad\"/>"
+        "</skipBox>");
+    skipDeclaredInvalid->Validate(schemas);
+
+    const auto namespaceListValid = XmlDocument::Parse(
+        "<listBox xmlns=\"urn:process\" xmlns:tns=\"urn:process\" localFlag=\"1\" tns:flag=\"1\">"
+        "  <payload/>"
+        "  <local xmlns=\"\"/>"
+        "</listBox>");
+    namespaceListValid->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto namespaceListInvalid = XmlDocument::Parse(
+            "<listBox xmlns=\"urn:process\" xmlns:ext=\"urn:ext\" ext:flag=\"1\">"
+            "  <foreign xmlns=\"urn:ext\"/>"
+            "</listBox>");
+        namespaceListInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos
+            || std::string(exception.what()).find("attribute 'ext:flag'") != std::string::npos
+            || std::string(exception.what()).find("is not declared") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce wildcard namespace lists for elements and attributes");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAnyProcessContentsSchemas;
+        invalidAnyProcessContentsSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:process-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:sequence>"
+            "      <xs:any processContents=\"loose\" minOccurs=\"0\"/>"
+            "    </xs:sequence>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("wildcard processContents must be one of strict, lax, or skip") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:any declarations with invalid processContents values");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAnyAttributeProcessContentsSchemas;
+        invalidAnyAttributeProcessContentsSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:process-invalid\">"
+            "  <xs:complexType name=\"PayloadType\">"
+            "    <xs:anyAttribute processContents=\"relaxed\"/>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("wildcard processContents must be one of strict, lax, or skip") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:anyAttribute declarations with invalid processContents values");
+
+    const auto strictSubstitutionValid = XmlDocument::Parse(
+        "<strictSubstitutionBox xmlns=\"urn:process\">"
+        "  <dog age=\"7\" breed=\"collie\"/>"
+        "</strictSubstitutionBox>");
+    strictSubstitutionValid->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto laxSubstitutionInvalid = XmlDocument::Parse(
+            "<laxSubstitutionBox xmlns=\"urn:process\">"
+            "  <dog age=\"bad\" breed=\"collie\"/>"
+            "</laxSubstitutionBox>");
+        laxSubstitutionInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'age'") != std::string::npos
+            && std::string(exception.what()).find("xs:int") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should validate declared substitutionGroup members that enter through lax wildcards");
+
+    const auto skipSubstitutionInvalid = XmlDocument::Parse(
+        "<skipSubstitutionBox xmlns=\"urn:process\">"
+        "  <dog age=\"bad\"/>"
+        "</skipSubstitutionBox>");
+    skipSubstitutionInvalid->Validate(schemas);
+}
+
+void TestXmlSchemaNillableElements() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:nil\" targetNamespace=\"urn:nil\">"
+        "  <xs:element name=\"note\" nillable=\"true\" type=\"xs:string\"/>"
+        "  <xs:element name=\"binaryNote\" nillable=\"1\" type=\"xs:string\"/>"
+        "  <xs:element name=\"container\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"item\" nillable=\"true\" type=\"xs:int\"/>"
+        "      </xs:sequence>"
+        "      <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"strictNote\" type=\"xs:string\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto validNilledRoot = XmlDocument::Parse(
+        "<note xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"true\"/>");
+    validNilledRoot->Validate(schemas);
+
+    const auto validNilledChild = XmlDocument::Parse(
+        "<container xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" id=\"box\">"
+        "  <item xsi:nil=\"true\"/>"
+        "</container>");
+    validNilledChild->Validate(schemas);
+
+    const auto validFalseNil = XmlDocument::Parse(
+        "<note xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"false\">hello</note>");
+    validFalseNil->Validate(schemas);
+
+    const auto validNumericNilledRoot = XmlDocument::Parse(
+        "<binaryNote xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"true\"/>");
+    validNumericNilledRoot->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto nilledWithText = XmlDocument::Parse(
+            "<note xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"true\">hello</note>");
+        nilledWithText->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("is nilled and must not contain text or child elements") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject text content on xsi:nil elements");
+
+    threw = false;
+    try {
+        const auto nonNillable = XmlDocument::Parse(
+            "<strictNote xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"true\"/>");
+        nonNillable->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("is not declared nillable") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject xsi:nil on non-nillable elements");
+
+    threw = false;
+    try {
+        const auto invalidNilValue = XmlDocument::Parse(
+            "<note xmlns=\"urn:nil\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"maybe\"/>");
+        invalidNilValue->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:boolean value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should validate xsi:nil as xs:boolean");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidNillableSchemas;
+        invalidNillableSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:nil-invalid\">"
+            "  <xs:element name=\"note\" nillable=\"maybe\" type=\"xs:string\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'nillable' must be one of true, false, 1, or 0") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject element declarations with invalid nillable values");
+}
+
+void TestXmlSchemaFileIncludesAndImports() {
+    const auto tempDir = std::filesystem::temp_directory_path() / "libxml-schema-files";
+    std::filesystem::remove_all(tempDir);
+    std::filesystem::create_directories(tempDir);
+
+    const auto sharedSchemaPath = tempDir / "shared.xsd";
+    const auto importedSchemaPath = tempDir / "meta.xsd";
+    const auto rootSchemaPath = tempDir / "root.xsd";
+    const auto badIncludeSchemaPath = tempDir / "bad-include.xsd";
+    const auto badRootIncludeSchemaPath = tempDir / "bad-root-include.xsd";
+    const auto wrongImportedSchemaPath = tempDir / "wrong-meta.xsd";
+    const auto badRootImportSchemaPath = tempDir / "bad-root-import.xsd";
+
+    {
+        std::ofstream stream(sharedSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:catalog-files\">"
+            << "  <xs:element name=\"detail\">"
+            << "    <xs:simpleType>"
+            << "      <xs:restriction base=\"xs:string\">"
+            << "        <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "      </xs:restriction>"
+            << "    </xs:simpleType>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importedSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:meta-files\">"
+            << "  <xs:element name=\"meta\">"
+            << "    <xs:complexType>"
+            << "      <xs:attribute name=\"version\" type=\"xs:int\" use=\"required\"/>"
+            << "    </xs:complexType>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(rootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:meta=\"urn:meta-files\" targetNamespace=\"urn:catalog-files\">"
+            << "  <xs:include schemaLocation=\"shared.xsd\"/>"
+            << "  <xs:import namespace=\"urn:meta-files\" schemaLocation=\"meta.xsd\"/>"
+            << "  <xs:element name=\"catalog\">"
+            << "    <xs:complexType>"
+            << "      <xs:sequence>"
+            << "        <xs:element ref=\"detail\"/>"
+            << "        <xs:element ref=\"meta:meta\" minOccurs=\"0\"/>"
+            << "      </xs:sequence>"
+            << "    </xs:complexType>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(badIncludeSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:other-files\">"
+            << "  <xs:element name=\"foreign\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(badRootIncludeSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:catalog-files\">"
+            << "  <xs:include schemaLocation=\"bad-include.xsd\"/>"
+            << "  <xs:element name=\"catalog\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(wrongImportedSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:wrong-meta-files\">"
+            << "  <xs:element name=\"meta\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(badRootImportSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:meta=\"urn:meta-files\" targetNamespace=\"urn:catalog-files\">"
+            << "  <xs:import namespace=\"urn:meta-files\" schemaLocation=\"wrong-meta.xsd\"/>"
+            << "  <xs:element name=\"catalog\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddFile(rootSchemaPath.string());
+
+        const auto valid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:catalog-files\" xmlns:m=\"urn:meta-files\">"
+            "  <detail>AB12</detail>"
+            "  <m:meta version=\"2\"/>"
+            "</catalog>");
+        valid->Validate(schemas);
+
+        bool threw = false;
+        try {
+            const auto invalidIncludedValue = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:catalog-files\">"
+                "  <detail>bad</detail>"
+                "</catalog>");
+            invalidIncludedValue->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should validate declarations loaded through xs:include");
+
+        threw = false;
+        try {
+            const auto invalidImportedValue = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:catalog-files\" xmlns:m=\"urn:meta-files\">"
+                "  <detail>AB12</detail>"
+                "  <m:meta version=\"bad\"/>"
+                "</catalog>");
+            invalidImportedValue->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("attribute 'version'") != std::string::npos
+                && std::string(exception.what()).find("xs:int") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should validate declarations loaded through xs:import");
+
+        threw = false;
+        try {
+            XmlSchemaSet badIncludeSchemas;
+            badIncludeSchemas.AddFile(badRootIncludeSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("same targetNamespace") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject xs:include with a mismatched targetNamespace");
+
+        threw = false;
+        try {
+            XmlSchemaSet badImportSchemas;
+            badImportSchemas.AddFile(badRootImportSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("match the declared namespace") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject xs:import when the referenced schema targetNamespace mismatches");
+    } catch (...) {
+        std::filesystem::remove_all(tempDir);
+        throw;
+    }
+
+    std::filesystem::remove_all(tempDir);
+}
+
+void TestXmlSchemaElementAndAttributeFormDefaults() {
+    {
+        const std::string schemaXml =
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:form-defaults-1\" targetNamespace=\"urn:form-defaults-1\" elementFormDefault=\"qualified\" attributeFormDefault=\"qualified\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"qualifiedChild\" type=\"xs:string\"/>"
+            "        <xs:element name=\"localChild\" type=\"xs:string\" form=\"unqualified\"/>"
+            "      </xs:sequence>"
+            "      <xs:attribute name=\"qualifiedAttr\" type=\"xs:string\" use=\"required\"/>"
+            "      <xs:attribute name=\"localAttr\" type=\"xs:string\" use=\"required\" form=\"unqualified\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>";
+
+        XmlSchemaSet schemas;
+        schemas.AddXml(schemaXml);
+
+        const auto valid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:form-defaults-1\" xmlns:tns=\"urn:form-defaults-1\" tns:qualifiedAttr=\"A\" localAttr=\"B\">"
+            "  <qualifiedChild>ok</qualifiedChild>"
+            "  <localChild xmlns=\"\">plain</localChild>"
+            "</catalog>");
+        valid->Validate(schemas);
+
+        bool threw = false;
+        try {
+            const auto invalidElement = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:form-defaults-1\" xmlns:tns=\"urn:form-defaults-1\" tns:qualifiedAttr=\"A\" localAttr=\"B\">"
+                "  <qualifiedChild xmlns=\"\">wrong</qualifiedChild>"
+                "  <localChild xmlns=\"\">plain</localChild>"
+                "</catalog>");
+            invalidElement->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+                || std::string(exception.what()).find("expected child element") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should honor elementFormDefault=qualified for local elements");
+
+        threw = false;
+        try {
+            const auto invalidAttribute = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:form-defaults-1\" qualifiedAttr=\"A\" localAttr=\"B\">"
+                "  <qualifiedChild>ok</qualifiedChild>"
+                "  <localChild xmlns=\"\">plain</localChild>"
+                "</catalog>");
+            invalidAttribute->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("required attribute") != std::string::npos
+                || std::string(exception.what()).find("unexpected attribute") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should honor attributeFormDefault=qualified for local attributes");
+    }
+
+    {
+        const std::string schemaXml =
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:form-defaults-2\" targetNamespace=\"urn:form-defaults-2\" elementFormDefault=\"unqualified\" attributeFormDefault=\"unqualified\">"
+            "  <xs:element name=\"container\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"localDefault\" type=\"xs:string\"/>"
+            "        <xs:element name=\"forcedQualified\" type=\"xs:string\" form=\"qualified\"/>"
+            "      </xs:sequence>"
+            "      <xs:attribute name=\"localDefaultAttr\" type=\"xs:string\" use=\"required\"/>"
+            "      <xs:attribute name=\"forcedQualifiedAttr\" type=\"xs:string\" use=\"required\" form=\"qualified\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>";
+
+        XmlSchemaSet schemas;
+        schemas.AddXml(schemaXml);
+
+        const auto valid = XmlDocument::Parse(
+            "<container xmlns=\"urn:form-defaults-2\" xmlns:tns=\"urn:form-defaults-2\" localDefaultAttr=\"A\" tns:forcedQualifiedAttr=\"B\">"
+            "  <localDefault xmlns=\"\">plain</localDefault>"
+            "  <forcedQualified>ns</forcedQualified>"
+            "</container>");
+        valid->Validate(schemas);
+
+        bool threw = false;
+        try {
+            const auto invalidElement = XmlDocument::Parse(
+                "<container xmlns=\"urn:form-defaults-2\" xmlns:tns=\"urn:form-defaults-2\" localDefaultAttr=\"A\" tns:forcedQualifiedAttr=\"B\">"
+                "  <localDefault xmlns=\"\">plain</localDefault>"
+                "  <forcedQualified xmlns=\"\">wrong</forcedQualified>"
+                "</container>");
+            invalidElement->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+                || std::string(exception.what()).find("expected child element") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should honor form=qualified on local elements when elementFormDefault=unqualified");
+
+        threw = false;
+        try {
+            const auto invalidAttribute = XmlDocument::Parse(
+                "<container xmlns=\"urn:form-defaults-2\" forcedQualifiedAttr=\"B\" localDefaultAttr=\"A\">"
+                "  <localDefault xmlns=\"\">plain</localDefault>"
+                "  <forcedQualified>ns</forcedQualified>"
+                "</container>");
+            invalidAttribute->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("required attribute") != std::string::npos
+                || std::string(exception.what()).find("unexpected attribute") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should honor form=qualified on local attributes when attributeFormDefault=unqualified");
+    }
+
+    bool threw = false;
+    try {
+        XmlSchemaSet invalidSchemaDefaults;
+        invalidSchemaDefaults.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:form-defaults-invalid\" elementFormDefault=\"sideways\">"
+            "  <xs:element name=\"catalog\" type=\"xs:string\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("elementFormDefault must be 'qualified' or 'unqualified'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject invalid elementFormDefault values");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAttributeSchemaDefaults;
+        invalidAttributeSchemaDefaults.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:form-defaults-invalid\" attributeFormDefault=\"sideways\">"
+            "  <xs:element name=\"catalog\" type=\"xs:string\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attributeFormDefault must be 'qualified' or 'unqualified'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject invalid attributeFormDefault values");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidLocalForm;
+        invalidLocalForm.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:form-defaults-invalid\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"child\" type=\"xs:string\" form=\"sideways\"/>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("element form must be 'qualified' or 'unqualified'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject invalid local element form values");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidLocalAttributeForm;
+        invalidLocalAttributeForm.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:form-defaults-invalid\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"code\" type=\"xs:string\" form=\"sideways\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute form must be 'qualified' or 'unqualified'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject invalid local attribute form values");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidAttributeUse;
+        invalidAttributeUse.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:form-defaults-invalid\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"code\" type=\"xs:string\" use=\"sometimes\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute use must be 'optional' or 'required'") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject invalid attribute use values");
+}
+
+void TestXmlSchemaFileOverrideAndRedefineHandling() {
+    const auto tempDir = std::filesystem::temp_directory_path() / "libxml-schema-override";
+    std::filesystem::remove_all(tempDir);
+    std::filesystem::create_directories(tempDir);
+
+    const auto baseSchemaPath = tempDir / "base.xsd";
+    const auto overrideSchemaPath = tempDir / "override.xsd";
+    const auto badOverrideSchemaPath = tempDir / "bad-override.xsd";
+    const auto wrongNamespaceSchemaPath = tempDir / "wrong-namespace.xsd";
+    const auto redefineBaseSchemaPath = tempDir / "redefine-base.xsd";
+    const auto redefineSchemaPath = tempDir / "redefine.xsd";
+    const auto redefineGroupSchemaPath = tempDir / "redefine-group.xsd";
+    const auto redefineAttributeGroupSchemaPath = tempDir / "redefine-attr-group.xsd";
+    const auto unsupportedRedefineSchemaPath = tempDir / "unsupported-redefine.xsd";
+
+    {
+        std::ofstream stream(baseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:element name=\"detail\" type=\"xs:string\"/>"
+            << "  <xs:element name=\"catalog\">"
+            << "    <xs:complexType>"
+            << "      <xs:sequence>"
+            << "        <xs:element ref=\"tns:detail\"/>"
+            << "      </xs:sequence>"
+            << "    </xs:complexType>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(overrideSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:override schemaLocation=\"base.xsd\">"
+            << "    <xs:element name=\"detail\">"
+            << "      <xs:simpleType>"
+            << "        <xs:restriction base=\"xs:string\">"
+            << "          <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "        </xs:restriction>"
+            << "      </xs:simpleType>"
+            << "    </xs:element>"
+            << "  </xs:override>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(wrongNamespaceSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:wrong-override-files\">"
+            << "  <xs:element name=\"detail\" type=\"xs:string\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(badOverrideSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:override schemaLocation=\"wrong-namespace.xsd\">"
+            << "    <xs:element name=\"detail\" type=\"xs:string\"/>"
+            << "  </xs:override>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(redefineBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:simpleType name=\"CodeType\">"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "  <xs:group name=\"DetailGroup\">"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"detail\" type=\"tns:CodeType\"/>"
+            << "    </xs:sequence>"
+            << "  </xs:group>"
+            << "  <xs:attributeGroup name=\"CommonAttrs\">"
+            << "    <xs:attribute name=\"code\" type=\"tns:CodeType\" use=\"required\"/>"
+            << "  </xs:attributeGroup>"
+            << "  <xs:complexType name=\"CatalogType\">"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"detail\" type=\"tns:CodeType\"/>"
+            << "      <xs:element name=\"note\" type=\"xs:string\" minOccurs=\"0\"/>"
+            << "    </xs:sequence>"
+            << "  </xs:complexType>"
+            << "</xs:schema>";
+        }
+
+        {
+        std::ofstream stream(redefineSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:redefine schemaLocation=\"redefine-base.xsd\">"
+            << "    <xs:simpleType name=\"CodeType\">"
+            << "      <xs:restriction base=\"tns:CodeType\">"
+            << "        <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "      </xs:restriction>"
+            << "    </xs:simpleType>"
+            << "    <xs:complexType name=\"CatalogType\">"
+            << "      <xs:complexContent>"
+            << "        <xs:restriction base=\"tns:CatalogType\">"
+            << "          <xs:sequence>"
+            << "            <xs:element name=\"detail\" type=\"tns:CodeType\"/>"
+            << "          </xs:sequence>"
+            << "        </xs:restriction>"
+            << "      </xs:complexContent>"
+            << "    </xs:complexType>"
+            << "  </xs:redefine>"
+            << "  <xs:element name=\"catalog\" type=\"tns:CatalogType\"/>"
+            << "</xs:schema>";
+    }
+
+        {
+            std::ofstream stream(redefineGroupSchemaPath);
+            stream
+                << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+                << "  <xs:redefine schemaLocation=\"redefine-base.xsd\">"
+                << "    <xs:group name=\"DetailGroup\">"
+                << "      <xs:sequence>"
+                << "        <xs:group ref=\"tns:DetailGroup\"/>"
+                << "        <xs:element name=\"summary\" type=\"tns:CodeType\"/>"
+                << "      </xs:sequence>"
+                << "    </xs:group>"
+                << "  </xs:redefine>"
+                << "  <xs:element name=\"groupCatalog\">"
+                << "    <xs:complexType>"
+                << "      <xs:sequence>"
+                << "        <xs:group ref=\"tns:DetailGroup\"/>"
+                << "      </xs:sequence>"
+                << "    </xs:complexType>"
+                << "  </xs:element>"
+                << "</xs:schema>";
+            }
+
+            {
+            std::ofstream stream(redefineAttributeGroupSchemaPath);
+            stream
+                << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+                << "  <xs:redefine schemaLocation=\"redefine-base.xsd\">"
+                << "    <xs:attributeGroup name=\"CommonAttrs\">"
+                << "      <xs:attributeGroup ref=\"tns:CommonAttrs\"/>"
+                << "      <xs:attribute name=\"extra\" type=\"tns:CodeType\" use=\"required\"/>"
+                << "    </xs:attributeGroup>"
+                << "  </xs:redefine>"
+                << "  <xs:element name=\"attrCatalog\">"
+                << "    <xs:complexType>"
+                << "      <xs:attributeGroup ref=\"tns:CommonAttrs\"/>"
+                << "    </xs:complexType>"
+                << "  </xs:element>"
+                << "</xs:schema>";
+            }
+
+            {
+        std::ofstream stream(unsupportedRedefineSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:override-files\" targetNamespace=\"urn:override-files\">"
+            << "  <xs:redefine schemaLocation=\"redefine-base.xsd\">"
+                << "    <xs:element name=\"detail\" type=\"tns:CodeType\"/>"
+            << "  </xs:redefine>"
+            << "</xs:schema>";
+        }
+
+    try {
+        XmlSchemaSet schemas;
+        schemas.AddFile(overrideSchemaPath.string());
+
+        const auto valid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:override-files\">"
+            "  <detail>AB12</detail>"
+            "</catalog>");
+        valid->Validate(schemas);
+
+        bool threw = false;
+        try {
+            const auto invalid = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:override-files\">"
+                "  <detail>abcd</detail>"
+                "</catalog>");
+            invalid->Validate(schemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should let xs:override replace referenced declarations");
+
+        threw = false;
+        try {
+            XmlSchemaSet badOverrideSchemas;
+            badOverrideSchemas.AddFile(badOverrideSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("same targetNamespace") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject xs:override when the referenced schema targetNamespace mismatches");
+
+        XmlSchemaSet redefineSchemas;
+        redefineSchemas.AddFile(redefineSchemaPath.string());
+
+        const auto redefineValid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:override-files\">"
+            "  <detail>AB12</detail>"
+            "</catalog>");
+        redefineValid->Validate(redefineSchemas);
+
+        threw = false;
+        try {
+            const auto invalidPattern = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:override-files\">"
+                "  <detail>abcd</detail>"
+                "</catalog>");
+            invalidPattern->Validate(redefineSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should let xs:redefine narrow simpleType restrictions");
+
+        threw = false;
+        try {
+            const auto invalidStructure = XmlDocument::Parse(
+                "<catalog xmlns=\"urn:override-files\">"
+                "  <detail>AB12</detail>"
+                "  <note>legacy</note>"
+                "</catalog>");
+            invalidStructure->Validate(redefineSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("unexpected child element") != std::string::npos
+                || std::string(exception.what()).find("declared content model") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should let xs:redefine narrow complexType content");
+
+        XmlSchemaSet redefineGroupSchemas;
+        redefineGroupSchemas.AddFile(redefineGroupSchemaPath.string());
+
+        const auto redefineGroupValid = XmlDocument::Parse(
+            "<groupCatalog xmlns=\"urn:override-files\">"
+            "  <detail>AB12</detail>"
+            "  <summary>CD34</summary>"
+            "</groupCatalog>");
+        redefineGroupValid->Validate(redefineGroupSchemas);
+
+        threw = false;
+        try {
+            const auto redefineGroupInvalid = XmlDocument::Parse(
+                "<groupCatalog xmlns=\"urn:override-files\">"
+                "  <detail>AB12</detail>"
+                "</groupCatalog>");
+            redefineGroupInvalid->Validate(redefineGroupSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("expected child element") != std::string::npos
+                || std::string(exception.what()).find("unexpected end") != std::string::npos
+                || std::string(exception.what()).find("declared content model") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should let xs:redefine extend group references through the original group alias");
+
+        XmlSchemaSet redefineAttributeGroupSchemas;
+        redefineAttributeGroupSchemas.AddFile(redefineAttributeGroupSchemaPath.string());
+
+        const auto redefineAttributeGroupValid = XmlDocument::Parse(
+            "<attrCatalog xmlns=\"urn:override-files\" code=\"AB12\" extra=\"CD34\"/>");
+        redefineAttributeGroupValid->Validate(redefineAttributeGroupSchemas);
+
+        threw = false;
+        try {
+            const auto redefineAttributeGroupInvalid = XmlDocument::Parse(
+                "<attrCatalog xmlns=\"urn:override-files\" code=\"AB12\"/>");
+            redefineAttributeGroupInvalid->Validate(redefineAttributeGroupSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("required attribute") != std::string::npos
+                || std::string(exception.what()).find("unexpected attribute") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should let xs:redefine extend attributeGroup references through the original attributeGroup alias");
+
+        threw = false;
+        try {
+            XmlSchemaSet unsupportedRedefineSchemas;
+            unsupportedRedefineSchemas.AddFile(unsupportedRedefineSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("currently supports only top-level simpleType, complexType, group, and attributeGroup") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should still fail explicitly for unsupported xs:redefine element declarations");
+    } catch (...) {
+        std::filesystem::remove_all(tempDir);
+        throw;
+    }
+
+    std::filesystem::remove_all(tempDir);
+}
+
+void TestXmlSchemaFileCompositionWithTypeDerivation() {
+    const auto tempDir = std::filesystem::temp_directory_path() / "libxml-schema-file-derivation";
+    std::filesystem::remove_all(tempDir);
+    std::filesystem::create_directories(tempDir);
+
+    const auto includeBaseSchemaPath = tempDir / "include-base.xsd";
+    const auto includeRootSchemaPath = tempDir / "include-root.xsd";
+    const auto importBaseSchemaPath = tempDir / "import-base.xsd";
+    const auto importRootSchemaPath = tempDir / "import-root.xsd";
+    const auto importIdentityBaseSchemaPath = tempDir / "import-identity-base.xsd";
+    const auto importIdentityRootSchemaPath = tempDir / "import-identity-root.xsd";
+    const auto namespaceOnlyImportIdentityRootSchemaPath = tempDir / "namespace-only-import-identity-root.xsd";
+    const auto importOverrideBaseSchemaPath = tempDir / "import-override-base.xsd";
+    const auto importOverrideSchemaPath = tempDir / "import-override.xsd";
+    const auto importOverrideConsumerSchemaPath = tempDir / "import-override-consumer.xsd";
+    const auto namespaceOnlyImportOverrideConsumerSchemaPath = tempDir / "namespace-only-import-override-consumer.xsd";
+    const auto importRedefineBaseSchemaPath = tempDir / "import-redefine-base.xsd";
+    const auto importRedefineSchemaPath = tempDir / "import-redefine.xsd";
+    const auto importRedefineConsumerSchemaPath = tempDir / "import-redefine-consumer.xsd";
+    const auto namespaceOnlyImportRedefineConsumerSchemaPath = tempDir / "namespace-only-import-redefine-consumer.xsd";
+    const auto namespaceOnlyImportBaseSchemaPath = tempDir / "namespace-only-import-base.xsd";
+    const auto namespaceOnlyImportRootSchemaPath = tempDir / "namespace-only-import-root.xsd";
+    const auto namespaceOnlyImportCompositionRootSchemaPath = tempDir / "namespace-only-import-composition-root.xsd";
+    const auto namespaceOnlyImportSubstitutionRootSchemaPath = tempDir / "namespace-only-import-substitution-root.xsd";
+    const auto overrideBaseSchemaPath = tempDir / "override-base.xsd";
+    const auto overrideRootSchemaPath = tempDir / "override-root.xsd";
+
+    {
+        std::ofstream stream(includeBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:file-include-derive\" targetNamespace=\"urn:file-include-derive\">"
+            << "  <xs:simpleType name=\"BaseCode\">"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "  <xs:complexType name=\"BaseRecord\">"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"code\" type=\"tns:BaseCode\"/>"
+            << "    </xs:sequence>"
+            << "  </xs:complexType>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(includeRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:file-include-derive\" targetNamespace=\"urn:file-include-derive\">"
+            << "  <xs:include schemaLocation=\"include-base.xsd\"/>"
+            << "  <xs:simpleType name=\"StrictCode\">"
+            << "    <xs:restriction base=\"tns:BaseCode\">"
+            << "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "  <xs:complexType name=\"DerivedRecord\">"
+            << "    <xs:complexContent>"
+            << "      <xs:extension base=\"tns:BaseRecord\">"
+            << "        <xs:sequence>"
+            << "          <xs:element name=\"suffix\" type=\"tns:StrictCode\"/>"
+            << "        </xs:sequence>"
+            << "      </xs:extension>"
+            << "    </xs:complexContent>"
+            << "  </xs:complexType>"
+            << "  <xs:element name=\"record\" type=\"tns:DerivedRecord\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-base\" targetNamespace=\"urn:file-import-base\" elementFormDefault=\"qualified\">"
+            << "  <xs:annotation>"
+            << "    <xs:documentation source=\"urn:test:import-schema\">Imported schema docs</xs:documentation>"
+            << "  </xs:annotation>"
+            << "  <xs:simpleType name=\"ImportedCode\">"
+            << "    <xs:annotation>"
+            << "      <xs:documentation xml:lang=\"en\">Imported code type</xs:documentation>"
+            << "    </xs:annotation>"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "  <xs:attribute name=\"flag\" type=\"xs:string\">"
+            << "    <xs:annotation>"
+            << "      <xs:documentation>Imported flag attribute</xs:documentation>"
+            << "    </xs:annotation>"
+            << "  </xs:attribute>"
+            << "  <xs:attribute name=\"note\" type=\"xs:string\"/>"
+            << "  <xs:attributeGroup name=\"SharedAttrs\">"
+            << "    <xs:annotation>"
+            << "      <xs:appinfo source=\"urn:test:import-attrs\"><attrs role=\"shared\"/></xs:appinfo>"
+            << "    </xs:annotation>"
+            << "    <xs:attribute ref=\"imp:note\" use=\"required\"/>"
+            << "  </xs:attributeGroup>"
+            << "  <xs:group name=\"ImportedFields\">"
+            << "    <xs:annotation>"
+            << "      <xs:documentation>Imported field group</xs:documentation>"
+            << "    </xs:annotation>"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"extra\" type=\"imp:ImportedCode\"/>"
+            << "    </xs:sequence>"
+            << "  </xs:group>"
+            << "  <xs:element name=\"animal\" type=\"xs:string\" abstract=\"true\">"
+            << "    <xs:annotation>"
+            << "      <xs:documentation source=\"urn:test:animal\">Imported head element</xs:documentation>"
+            << "    </xs:annotation>"
+            << "  </xs:element>"
+            << "  <xs:element name=\"dog\" substitutionGroup=\"imp:animal\">"
+            << "    <xs:simpleType>"
+            << "      <xs:restriction base=\"xs:string\">"
+            << "        <xs:pattern value=\"dog-[A-Z]{2}\"/>"
+            << "      </xs:restriction>"
+            << "    </xs:simpleType>"
+            << "  </xs:element>"
+            << "  <xs:complexType name=\"ImportedRecord\">"
+            << "    <xs:annotation>"
+            << "      <xs:appinfo source=\"urn:test:import-record\"><record kind=\"imported\"/></xs:appinfo>"
+            << "    </xs:annotation>"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"code\" type=\"imp:ImportedCode\"/>"
+            << "    </xs:sequence>"
+            << "    <xs:attribute ref=\"imp:flag\" use=\"required\"/>"
+            << "    <xs:attributeGroup ref=\"imp:SharedAttrs\"/>"
+            << "  </xs:complexType>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-base\" xmlns:tns=\"urn:file-import-root\" targetNamespace=\"urn:file-import-root\" elementFormDefault=\"qualified\">"
+            << "  <xs:import namespace=\"urn:file-import-base\" schemaLocation=\"import-base.xsd\"/>"
+            << "  <xs:simpleType name=\"LocalCode\">"
+            << "    <xs:restriction base=\"imp:ImportedCode\">"
+            << "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "  <xs:complexType name=\"DecoratedRecord\">"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"value\" type=\"tns:LocalCode\"/>"
+            << "    </xs:sequence>"
+            << "    <xs:attribute ref=\"imp:flag\" use=\"required\"/>"
+            << "    <xs:attributeGroup ref=\"imp:SharedAttrs\"/>"
+            << "  </xs:complexType>"
+                << "  <xs:complexType name=\"GroupedRecord\">"
+                << "    <xs:sequence>"
+                << "      <xs:group ref=\"imp:ImportedFields\"/>"
+                << "    </xs:sequence>"
+                << "  </xs:complexType>"
+                    << "  <xs:complexType name=\"SubstitutionHolder\">"
+                    << "    <xs:sequence>"
+                    << "      <xs:element ref=\"imp:animal\"/>"
+                    << "    </xs:sequence>"
+                    << "  </xs:complexType>"
+            << "  <xs:element name=\"entry\" type=\"tns:LocalCode\"/>"
+            << "  <xs:element name=\"record\" type=\"imp:ImportedRecord\"/>"
+            << "  <xs:element name=\"decorated\" type=\"tns:DecoratedRecord\"/>"
+                << "  <xs:element name=\"grouped\" type=\"tns:GroupedRecord\"/>"
+                    << "  <xs:element name=\"zoo\" type=\"tns:SubstitutionHolder\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-preloaded\" targetNamespace=\"urn:file-import-preloaded\">"
+            << "  <xs:simpleType name=\"ImportedCode\">"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-preloaded\" xmlns:tns=\"urn:file-import-preloaded-root\" targetNamespace=\"urn:file-import-preloaded-root\">"
+            << "  <xs:import namespace=\"urn:file-import-preloaded\"/>"
+            << "  <xs:element name=\"entry\" type=\"imp:ImportedCode\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportCompositionRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-base\" xmlns:tns=\"urn:file-import-preloaded-composition-root\" targetNamespace=\"urn:file-import-preloaded-composition-root\" elementFormDefault=\"qualified\">"
+            << "  <xs:import namespace=\"urn:file-import-base\"/>"
+            << "  <xs:complexType name=\"DecoratedRecord\">"
+            << "    <xs:sequence>"
+            << "      <xs:element name=\"value\" type=\"imp:ImportedCode\"/>"
+            << "    </xs:sequence>"
+            << "    <xs:attribute ref=\"imp:flag\" use=\"required\"/>"
+            << "    <xs:attributeGroup ref=\"imp:SharedAttrs\"/>"
+            << "  </xs:complexType>"
+            << "  <xs:complexType name=\"GroupedRecord\">"
+            << "    <xs:sequence>"
+            << "      <xs:group ref=\"imp:ImportedFields\"/>"
+            << "    </xs:sequence>"
+            << "  </xs:complexType>"
+            << "  <xs:element name=\"decorated\" type=\"tns:DecoratedRecord\"/>"
+            << "  <xs:element name=\"grouped\" type=\"tns:GroupedRecord\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportSubstitutionRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-base\" xmlns:tns=\"urn:file-import-preloaded-substitution-root\" targetNamespace=\"urn:file-import-preloaded-substitution-root\">"
+            << "  <xs:import namespace=\"urn:file-import-base\"/>"
+            << "  <xs:complexType name=\"SubstitutionHolder\">"
+            << "    <xs:sequence>"
+            << "      <xs:element ref=\"imp:animal\"/>"
+            << "    </xs:sequence>"
+            << "  </xs:complexType>"
+            << "  <xs:element name=\"zoo\" type=\"tns:SubstitutionHolder\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importIdentityBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-identity-base\" targetNamespace=\"urn:file-import-identity-base\" elementFormDefault=\"qualified\">"
+            << "  <xs:element name=\"catalog\">"
+            << "    <xs:complexType>"
+            << "      <xs:sequence>"
+            << "        <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            << "          <xs:complexType>"
+            << "            <xs:attribute name=\"id\" type=\"xs:string\"/>"
+            << "          </xs:complexType>"
+            << "        </xs:element>"
+            << "        <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            << "          <xs:complexType>"
+            << "            <xs:attribute name=\"bookId\" type=\"xs:string\"/>"
+            << "          </xs:complexType>"
+            << "        </xs:element>"
+            << "      </xs:sequence>"
+            << "    </xs:complexType>"
+            << "    <xs:key name=\"bookKey\">"
+            << "      <xs:annotation>"
+            << "        <xs:documentation source=\"urn:test:import-key\">Imported key docs</xs:documentation>"
+            << "      </xs:annotation>"
+            << "      <xs:selector xpath=\"imp:book\"/>"
+            << "      <xs:field xpath=\"@id\"/>"
+            << "    </xs:key>"
+            << "    <xs:keyref name=\"bookReference\" refer=\"imp:bookKey\">"
+            << "      <xs:annotation>"
+            << "        <xs:documentation xml:lang=\"en\">Imported keyref docs</xs:documentation>"
+            << "      </xs:annotation>"
+            << "      <xs:selector xpath=\"imp:reference\"/>"
+            << "      <xs:field xpath=\"@bookId\"/>"
+            << "    </xs:keyref>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importIdentityRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-identity-base\" xmlns:tns=\"urn:file-import-identity-root\" targetNamespace=\"urn:file-import-identity-root\">"
+            << "  <xs:import namespace=\"urn:file-import-identity-base\" schemaLocation=\"import-identity-base.xsd\"/>"
+            << "  <xs:element name=\"wrapper\">"
+            << "    <xs:complexType>"
+            << "      <xs:sequence>"
+            << "        <xs:element ref=\"imp:catalog\"/>"
+            << "      </xs:sequence>"
+            << "    </xs:complexType>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportIdentityRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-identity-base\" xmlns:tns=\"urn:file-import-identity-preloaded-root\" targetNamespace=\"urn:file-import-identity-preloaded-root\">"
+            << "  <xs:import namespace=\"urn:file-import-identity-base\"/>"
+            << "  <xs:element name=\"wrapper\">"
+            << "    <xs:complexType>"
+            << "      <xs:sequence>"
+            << "        <xs:element ref=\"imp:catalog\"/>"
+            << "      </xs:sequence>"
+            << "    </xs:complexType>"
+            << "  </xs:element>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importOverrideBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-override\" targetNamespace=\"urn:file-import-override\">"
+            << "  <xs:annotation>"
+            << "    <xs:documentation>Imported override base schema docs</xs:documentation>"
+            << "  </xs:annotation>"
+            << "  <xs:simpleType name=\"CodeType\">"
+            << "    <xs:annotation>"
+            << "      <xs:documentation>Imported override base code docs</xs:documentation>"
+            << "    </xs:annotation>"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importOverrideSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-override\" targetNamespace=\"urn:file-import-override\">"
+            << "  <xs:annotation>"
+            << "    <xs:documentation source=\"urn:test:import-override-schema\">Imported override schema docs</xs:documentation>"
+            << "  </xs:annotation>"
+            << "  <xs:override schemaLocation=\"import-override-base.xsd\">"
+            << "    <xs:simpleType name=\"CodeType\">"
+            << "      <xs:annotation>"
+            << "        <xs:documentation xml:lang=\"en\">Imported override code docs</xs:documentation>"
+            << "      </xs:annotation>"
+            << "      <xs:restriction base=\"xs:string\">"
+            << "        <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "      </xs:restriction>"
+            << "    </xs:simpleType>"
+            << "  </xs:override>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importOverrideConsumerSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-override\" xmlns:tns=\"urn:file-import-override-consumer\" targetNamespace=\"urn:file-import-override-consumer\">"
+            << "  <xs:import namespace=\"urn:file-import-override\" schemaLocation=\"import-override.xsd\"/>"
+            << "  <xs:element name=\"code\" type=\"imp:CodeType\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportOverrideConsumerSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-override\" xmlns:tns=\"urn:file-import-override-preloaded-consumer\" targetNamespace=\"urn:file-import-override-preloaded-consumer\">"
+            << "  <xs:import namespace=\"urn:file-import-override\"/>"
+            << "  <xs:element name=\"code\" type=\"imp:CodeType\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importRedefineBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-redefine\" targetNamespace=\"urn:file-import-redefine\">"
+            << "  <xs:annotation>"
+            << "    <xs:documentation>Imported redefine base schema docs</xs:documentation>"
+            << "  </xs:annotation>"
+            << "  <xs:simpleType name=\"CodeType\">"
+            << "    <xs:annotation>"
+            << "      <xs:documentation>Imported redefine base code docs</xs:documentation>"
+            << "    </xs:annotation>"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importRedefineSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-redefine\" targetNamespace=\"urn:file-import-redefine\">"
+            << "  <xs:annotation>"
+            << "    <xs:documentation source=\"urn:test:import-redefine-schema\">Imported redefine schema docs</xs:documentation>"
+            << "  </xs:annotation>"
+            << "  <xs:redefine schemaLocation=\"import-redefine-base.xsd\">"
+            << "    <xs:simpleType name=\"CodeType\">"
+            << "      <xs:annotation>"
+            << "        <xs:appinfo source=\"urn:test:import-redefine-code\"><redefine code=\"strict\"/></xs:appinfo>"
+            << "      </xs:annotation>"
+            << "      <xs:restriction base=\"imp:CodeType\">"
+            << "        <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "      </xs:restriction>"
+            << "    </xs:simpleType>"
+            << "  </xs:redefine>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(importRedefineConsumerSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-redefine\" xmlns:tns=\"urn:file-import-redefine-consumer\" targetNamespace=\"urn:file-import-redefine-consumer\">"
+            << "  <xs:import namespace=\"urn:file-import-redefine\" schemaLocation=\"import-redefine.xsd\"/>"
+            << "  <xs:element name=\"code\" type=\"imp:CodeType\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(namespaceOnlyImportRedefineConsumerSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:imp=\"urn:file-import-redefine\" xmlns:tns=\"urn:file-import-redefine-preloaded-consumer\" targetNamespace=\"urn:file-import-redefine-preloaded-consumer\">"
+            << "  <xs:import namespace=\"urn:file-import-redefine\"/>"
+            << "  <xs:element name=\"code\" type=\"imp:CodeType\"/>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(overrideBaseSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:file-override-derive\" targetNamespace=\"urn:file-override-derive\">"
+            << "  <xs:simpleType name=\"CodeType\">"
+            << "    <xs:restriction base=\"xs:string\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "</xs:schema>";
+    }
+
+    {
+        std::ofstream stream(overrideRootSchemaPath);
+        stream
+            << "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:file-override-derive\" targetNamespace=\"urn:file-override-derive\">"
+            << "  <xs:override schemaLocation=\"override-base.xsd\">"
+            << "    <xs:simpleType name=\"CodeType\">"
+            << "      <xs:restriction base=\"xs:string\">"
+            << "        <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            << "      </xs:restriction>"
+            << "    </xs:simpleType>"
+            << "  </xs:override>"
+            << "  <xs:simpleType name=\"DerivedCode\">"
+            << "    <xs:restriction base=\"tns:CodeType\">"
+            << "      <xs:length value=\"4\"/>"
+            << "    </xs:restriction>"
+            << "  </xs:simpleType>"
+            << "  <xs:element name=\"code\" type=\"tns:DerivedCode\"/>"
+            << "</xs:schema>";
+    }
+
+    try {
+        XmlSchemaSet includeSchemas;
+        includeSchemas.AddFile(includeRootSchemaPath.string());
+
+        const auto includeValid = XmlDocument::Parse(
+            "<record xmlns=\"urn:file-include-derive\">"
+            "  <code>AB12</code>"
+            "  <suffix>CD34</suffix>"
+            "</record>");
+        includeValid->Validate(includeSchemas);
+
+        bool threw = false;
+        try {
+            const auto includeInvalid = XmlDocument::Parse(
+                "<record xmlns=\"urn:file-include-derive\">"
+                "  <code>AB12</code>"
+                "  <suffix>ab12</suffix>"
+                "</record>");
+            includeInvalid->Validate(includeSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:include with named type derivation");
+
+        XmlSchemaSet importSchemas;
+        importSchemas.AddFile(importRootSchemaPath.string());
+
+        const auto* importedSchemaAnnotation = importSchemas.FindSchemaAnnotation("urn:file-import-base");
+        Assert(importedSchemaAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported schema roots");
+        Assert(importedSchemaAnnotation->Documentation.size() == 1, "Imported schema annotation should expose documentation entries");
+        Assert(importedSchemaAnnotation->Documentation[0].Content == "Imported schema docs", "Imported schema documentation content mismatch");
+
+        const auto* importedElementAnnotation = importSchemas.FindElementAnnotation("animal", "urn:file-import-base");
+        Assert(importedElementAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported global elements");
+        Assert(importedElementAnnotation->Documentation.size() == 1, "Imported element annotation should expose documentation entries");
+        Assert(importedElementAnnotation->Documentation[0].Source == "urn:test:animal", "Imported element documentation source mismatch");
+
+        const auto* importedSimpleTypeAnnotation = importSchemas.FindSimpleTypeAnnotation("ImportedCode", "urn:file-import-base");
+        Assert(importedSimpleTypeAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported simpleTypes");
+        Assert(importedSimpleTypeAnnotation->Documentation.size() == 1, "Imported simpleType annotation should expose documentation entries");
+        Assert(importedSimpleTypeAnnotation->Documentation[0].Language == "en", "Imported simpleType xml:lang mismatch");
+
+        const auto* importedComplexTypeAnnotation = importSchemas.FindComplexTypeAnnotation("ImportedRecord", "urn:file-import-base");
+        Assert(importedComplexTypeAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported complexTypes");
+        Assert(importedComplexTypeAnnotation->AppInfo.size() == 1, "Imported complexType annotation should expose appinfo entries");
+        Assert(importedComplexTypeAnnotation->AppInfo[0].Content == "<record kind=\"imported\"/>", "Imported complexType appinfo content mismatch");
+
+        const auto* importedAttributeAnnotation = importSchemas.FindAttributeAnnotation("flag", "urn:file-import-base");
+        Assert(importedAttributeAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported global attributes");
+        Assert(importedAttributeAnnotation->Documentation.size() == 1, "Imported attribute annotation should expose documentation entries");
+        Assert(importedAttributeAnnotation->Documentation[0].Content == "Imported flag attribute", "Imported attribute documentation content mismatch");
+
+        const auto* importedGroupAnnotation = importSchemas.FindGroupAnnotation("ImportedFields", "urn:file-import-base");
+        Assert(importedGroupAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported groups");
+        Assert(importedGroupAnnotation->Documentation.size() == 1, "Imported group annotation should expose documentation entries");
+        Assert(importedGroupAnnotation->Documentation[0].Content == "Imported field group", "Imported group documentation content mismatch");
+
+        const auto* importedAttributeGroupAnnotation = importSchemas.FindAttributeGroupAnnotation("SharedAttrs", "urn:file-import-base");
+        Assert(importedAttributeGroupAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported attributeGroups");
+        Assert(importedAttributeGroupAnnotation->AppInfo.size() == 1, "Imported attributeGroup annotation should expose appinfo entries");
+        Assert(importedAttributeGroupAnnotation->AppInfo[0].Source == "urn:test:import-attrs", "Imported attributeGroup appinfo source mismatch");
+
+        const auto importValid = XmlDocument::Parse("<entry xmlns=\"urn:file-import-root\">AB12</entry>");
+        importValid->Validate(importSchemas);
+
+        threw = false;
+        try {
+            const auto importInvalid = XmlDocument::Parse("<entry xmlns=\"urn:file-import-root\">ab12</entry>");
+            importInvalid->Validate(importSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with cross-namespace type derivation");
+
+        const auto importedComplexTypeValid = XmlDocument::Parse(
+            "<record xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\" imp:flag=\"on\" imp:note=\"ok\">"
+            "  <imp:code>AB12</imp:code>"
+            "</record>");
+        importedComplexTypeValid->Validate(importSchemas);
+
+        threw = false;
+        try {
+            const auto importedComplexTypeMissingAttribute = XmlDocument::Parse(
+                "<record xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\" imp:flag=\"on\">"
+                "  <imp:code>AB12</imp:code>"
+                "</record>");
+            importedComplexTypeMissingAttribute->Validate(importSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("attribute 'note'") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported complexTypes and imported attributeGroups");
+
+        const auto importedAttributeGroupValid = XmlDocument::Parse(
+            "<decorated xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\" imp:flag=\"on\" imp:note=\"ok\">"
+            "  <value>AB12</value>"
+            "</decorated>");
+        importedAttributeGroupValid->Validate(importSchemas);
+
+        threw = false;
+        try {
+            const auto importedAttributeMissing = XmlDocument::Parse(
+                "<decorated xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\" imp:note=\"ok\">"
+                "  <value>AB12</value>"
+                "</decorated>");
+            importedAttributeMissing->Validate(importSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("attribute 'flag'") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported global attribute references");
+
+        const auto importedGroupValid = XmlDocument::Parse(
+            "<grouped xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\">"
+            "  <imp:extra>AB12</imp:extra>"
+            "</grouped>");
+        importedGroupValid->Validate(importSchemas);
+
+        threw = false;
+        try {
+            const auto importedGroupInvalid = XmlDocument::Parse(
+                "<grouped xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\">"
+                "  <imp:extra>ABC</imp:extra>"
+                "</grouped>");
+            importedGroupInvalid->Validate(importSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must have length") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported groups");
+
+        const auto importedSubstitutionGroupValid = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\">"
+            "  <imp:dog>dog-AB</imp:dog>"
+            "</zoo>");
+        importedSubstitutionGroupValid->Validate(importSchemas);
+
+        threw = false;
+        try {
+            const auto importedSubstitutionGroupInvalid = XmlDocument::Parse(
+                "<zoo xmlns=\"urn:file-import-root\" xmlns:imp=\"urn:file-import-base\">"
+                "  <imp:dog>cat-AB</imp:dog>"
+                "</zoo>");
+            importedSubstitutionGroupInvalid->Validate(importSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported substitutionGroup members");
+
+        XmlSchemaSet namespaceOnlyImportSchemas;
+        namespaceOnlyImportSchemas.AddFile(namespaceOnlyImportBaseSchemaPath.string());
+        namespaceOnlyImportSchemas.AddFile(namespaceOnlyImportRootSchemaPath.string());
+
+        const auto namespaceOnlyImportValid = XmlDocument::Parse("<entry xmlns=\"urn:file-import-preloaded-root\">AB12</entry>");
+        namespaceOnlyImportValid->Validate(namespaceOnlyImportSchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportInvalid = XmlDocument::Parse("<entry xmlns=\"urn:file-import-preloaded-root\">ab12</entry>");
+            namespaceOnlyImportInvalid->Validate(namespaceOnlyImportSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should allow namespace-only xs:import when the imported namespace is already loaded");
+
+        threw = false;
+        try {
+            XmlSchemaSet missingNamespaceOnlyImportSchemas;
+            missingNamespaceOnlyImportSchemas.AddFile(namespaceOnlyImportRootSchemaPath.string());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("already be loaded") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should reject namespace-only xs:import when the namespace has not been preloaded");
+
+        XmlSchemaSet namespaceOnlyImportCompositionSchemas;
+        namespaceOnlyImportCompositionSchemas.AddFile(importBaseSchemaPath.string());
+        namespaceOnlyImportCompositionSchemas.AddFile(namespaceOnlyImportCompositionRootSchemaPath.string());
+
+        const auto* namespaceOnlyImportedSchemaAnnotation = namespaceOnlyImportCompositionSchemas.FindSchemaAnnotation("urn:file-import-base");
+        Assert(namespaceOnlyImportedSchemaAnnotation != nullptr, "XmlSchemaSet should expose imported schema annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedSchemaAnnotation->Documentation.size() == 1, "Namespace-only imported schema annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedSchemaAnnotation->Documentation[0].Content == "Imported schema docs", "Namespace-only imported schema documentation content mismatch");
+
+        const auto* namespaceOnlyImportedElementAnnotation = namespaceOnlyImportCompositionSchemas.FindElementAnnotation("animal", "urn:file-import-base");
+        Assert(namespaceOnlyImportedElementAnnotation != nullptr, "XmlSchemaSet should expose imported element annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedElementAnnotation->Documentation.size() == 1, "Namespace-only imported element annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedElementAnnotation->Documentation[0].Source == "urn:test:animal", "Namespace-only imported element documentation source mismatch");
+
+        const auto* namespaceOnlyImportedSimpleTypeAnnotation = namespaceOnlyImportCompositionSchemas.FindSimpleTypeAnnotation("ImportedCode", "urn:file-import-base");
+        Assert(namespaceOnlyImportedSimpleTypeAnnotation != nullptr, "XmlSchemaSet should expose imported simpleType annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedSimpleTypeAnnotation->Documentation.size() == 1, "Namespace-only imported simpleType annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedSimpleTypeAnnotation->Documentation[0].Language == "en", "Namespace-only imported simpleType xml:lang mismatch");
+
+        const auto* namespaceOnlyImportedAttributeAnnotation = namespaceOnlyImportCompositionSchemas.FindAttributeAnnotation("flag", "urn:file-import-base");
+        Assert(namespaceOnlyImportedAttributeAnnotation != nullptr, "XmlSchemaSet should expose imported attribute annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedAttributeAnnotation->Documentation.size() == 1, "Namespace-only imported attribute annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedAttributeAnnotation->Documentation[0].Content == "Imported flag attribute", "Namespace-only imported attribute documentation content mismatch");
+
+        const auto* namespaceOnlyImportedGroupAnnotation = namespaceOnlyImportCompositionSchemas.FindGroupAnnotation("ImportedFields", "urn:file-import-base");
+        Assert(namespaceOnlyImportedGroupAnnotation != nullptr, "XmlSchemaSet should expose imported group annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedGroupAnnotation->Documentation.size() == 1, "Namespace-only imported group annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedGroupAnnotation->Documentation[0].Content == "Imported field group", "Namespace-only imported group documentation content mismatch");
+
+        const auto* namespaceOnlyImportedAttributeGroupAnnotation = namespaceOnlyImportCompositionSchemas.FindAttributeGroupAnnotation("SharedAttrs", "urn:file-import-base");
+        Assert(namespaceOnlyImportedAttributeGroupAnnotation != nullptr, "XmlSchemaSet should expose imported attributeGroup annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedAttributeGroupAnnotation->AppInfo.size() == 1, "Namespace-only imported attributeGroup annotation should expose appinfo entries");
+        Assert(namespaceOnlyImportedAttributeGroupAnnotation->AppInfo[0].Source == "urn:test:import-attrs", "Namespace-only imported attributeGroup appinfo source mismatch");
+
+        const auto namespaceOnlyImportDecoratedValid = XmlDocument::Parse(
+            "<decorated xmlns=\"urn:file-import-preloaded-composition-root\" xmlns:imp=\"urn:file-import-base\" imp:flag=\"on\" imp:note=\"ok\">"
+            "  <value>AB12</value>"
+            "</decorated>");
+        namespaceOnlyImportDecoratedValid->Validate(namespaceOnlyImportCompositionSchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportDecoratedInvalid = XmlDocument::Parse(
+                "<decorated xmlns=\"urn:file-import-preloaded-composition-root\" xmlns:imp=\"urn:file-import-base\" imp:note=\"ok\">"
+                "  <value>AB12</value>"
+                "</decorated>");
+            namespaceOnlyImportDecoratedInvalid->Validate(namespaceOnlyImportCompositionSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("attribute 'flag'") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should preserve imported attributeGroup expansion through namespace-only xs:import");
+
+        const auto namespaceOnlyImportGroupedValid = XmlDocument::Parse(
+            "<grouped xmlns=\"urn:file-import-preloaded-composition-root\" xmlns:imp=\"urn:file-import-base\">"
+            "  <imp:extra>AB12</imp:extra>"
+            "</grouped>");
+        namespaceOnlyImportGroupedValid->Validate(namespaceOnlyImportCompositionSchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportGroupedInvalid = XmlDocument::Parse(
+                "<grouped xmlns=\"urn:file-import-preloaded-composition-root\" xmlns:imp=\"urn:file-import-base\">"
+                "  <imp:extra>ABC</imp:extra>"
+                "</grouped>");
+            namespaceOnlyImportGroupedInvalid->Validate(namespaceOnlyImportCompositionSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must have length") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should preserve imported group expansion through namespace-only xs:import");
+
+        XmlSchemaSet namespaceOnlyImportSubstitutionSchemas;
+        namespaceOnlyImportSubstitutionSchemas.AddFile(importBaseSchemaPath.string());
+        namespaceOnlyImportSubstitutionSchemas.AddFile(namespaceOnlyImportSubstitutionRootSchemaPath.string());
+
+        const auto* namespaceOnlyImportedHeadAnnotation = namespaceOnlyImportSubstitutionSchemas.FindElementAnnotation("animal", "urn:file-import-base");
+        Assert(namespaceOnlyImportedHeadAnnotation != nullptr, "XmlSchemaSet should expose imported substitutionGroup head annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedHeadAnnotation->Documentation.size() == 1, "Namespace-only imported substitutionGroup head annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedHeadAnnotation->Documentation[0].Source == "urn:test:animal", "Namespace-only imported substitutionGroup head documentation source mismatch");
+
+        const auto namespaceOnlyImportSubstitutionValid = XmlDocument::Parse(
+            "<zoo xmlns=\"urn:file-import-preloaded-substitution-root\" xmlns:imp=\"urn:file-import-base\">"
+            "  <imp:dog>dog-AB</imp:dog>"
+            "</zoo>");
+        namespaceOnlyImportSubstitutionValid->Validate(namespaceOnlyImportSubstitutionSchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportSubstitutionInvalid = XmlDocument::Parse(
+                "<zoo xmlns=\"urn:file-import-preloaded-substitution-root\" xmlns:imp=\"urn:file-import-base\">"
+                "  <imp:dog>cat-AB</imp:dog>"
+                "</zoo>");
+            namespaceOnlyImportSubstitutionInvalid->Validate(namespaceOnlyImportSubstitutionSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should preserve imported substitutionGroup members through namespace-only xs:import");
+
+        XmlSchemaSet namespaceOnlyImportIdentitySchemas;
+        namespaceOnlyImportIdentitySchemas.AddFile(importIdentityBaseSchemaPath.string());
+        namespaceOnlyImportIdentitySchemas.AddFile(namespaceOnlyImportIdentityRootSchemaPath.string());
+
+        const auto* namespaceOnlyImportedKeyAnnotation = namespaceOnlyImportIdentitySchemas.FindIdentityConstraintAnnotation("bookKey", "urn:file-import-identity-base");
+        Assert(namespaceOnlyImportedKeyAnnotation != nullptr, "XmlSchemaSet should expose imported identity annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedKeyAnnotation->Documentation.size() == 1, "Namespace-only imported xs:key annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedKeyAnnotation->Documentation[0].Source == "urn:test:import-key", "Namespace-only imported xs:key documentation source mismatch");
+
+        const auto* namespaceOnlyImportedKeyrefAnnotation = namespaceOnlyImportIdentitySchemas.FindIdentityConstraintAnnotation("bookReference", "urn:file-import-identity-base");
+        Assert(namespaceOnlyImportedKeyrefAnnotation != nullptr, "XmlSchemaSet should expose imported keyref annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportedKeyrefAnnotation->Documentation.size() == 1, "Namespace-only imported xs:keyref annotation should expose documentation entries");
+        Assert(namespaceOnlyImportedKeyrefAnnotation->Documentation[0].Language == "en", "Namespace-only imported xs:keyref xml:lang mismatch");
+
+        const auto namespaceOnlyImportIdentityValid = XmlDocument::Parse(
+            "<wrapper xmlns=\"urn:file-import-identity-preloaded-root\" xmlns:imp=\"urn:file-import-identity-base\">"
+            "  <imp:catalog>"
+            "    <imp:book id=\"b1\"/>"
+            "    <imp:reference bookId=\"b1\"/>"
+            "  </imp:catalog>"
+            "</wrapper>");
+        namespaceOnlyImportIdentityValid->Validate(namespaceOnlyImportIdentitySchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportIdentityInvalid = XmlDocument::Parse(
+                "<wrapper xmlns=\"urn:file-import-identity-preloaded-root\" xmlns:imp=\"urn:file-import-identity-base\">"
+                "  <imp:catalog>"
+                "    <imp:book id=\"b1\"/>"
+                "    <imp:reference bookId=\"missing\"/>"
+                "  </imp:catalog>"
+                "</wrapper>");
+            namespaceOnlyImportIdentityInvalid->Validate(namespaceOnlyImportIdentitySchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("bookReference") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should preserve imported identity constraints through namespace-only xs:import");
+
+        XmlSchemaSet importIdentitySchemas;
+        importIdentitySchemas.AddFile(importIdentityRootSchemaPath.string());
+
+        const auto* importedKeyAnnotation = importIdentitySchemas.FindIdentityConstraintAnnotation("bookKey", "urn:file-import-identity-base");
+        Assert(importedKeyAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported xs:key declarations");
+        Assert(importedKeyAnnotation->Documentation.size() == 1, "Imported xs:key annotation should expose documentation entries");
+        Assert(importedKeyAnnotation->Documentation[0].Source == "urn:test:import-key", "Imported xs:key documentation source mismatch");
+
+        const auto* importedKeyrefAnnotation = importIdentitySchemas.FindIdentityConstraintAnnotation("bookReference", "urn:file-import-identity-base");
+        Assert(importedKeyrefAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported xs:keyref declarations");
+        Assert(importedKeyrefAnnotation->Documentation.size() == 1, "Imported xs:keyref annotation should expose documentation entries");
+        Assert(importedKeyrefAnnotation->Documentation[0].Language == "en", "Imported xs:keyref xml:lang mismatch");
+
+        const auto importIdentityValid = XmlDocument::Parse(
+            "<wrapper xmlns=\"urn:file-import-identity-root\" xmlns:imp=\"urn:file-import-identity-base\">"
+            "  <imp:catalog>"
+            "    <imp:book id=\"b1\"/>"
+            "    <imp:reference bookId=\"b1\"/>"
+            "  </imp:catalog>"
+            "</wrapper>");
+        importIdentityValid->Validate(importIdentitySchemas);
+
+        threw = false;
+        try {
+            const auto importIdentityInvalid = XmlDocument::Parse(
+                "<wrapper xmlns=\"urn:file-import-identity-root\" xmlns:imp=\"urn:file-import-identity-base\">"
+                "  <imp:catalog>"
+                "    <imp:book id=\"b1\"/>"
+                "    <imp:reference bookId=\"missing\"/>"
+                "  </imp:catalog>"
+                "</wrapper>");
+            importIdentityInvalid->Validate(importIdentitySchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("bookReference") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported identity constraints");
+
+        XmlSchemaSet importOverrideSchemas;
+        importOverrideSchemas.AddFile(importOverrideConsumerSchemaPath.string());
+
+        const auto* importOverrideSchemaAnnotation = importOverrideSchemas.FindSchemaAnnotation("urn:file-import-override");
+        Assert(importOverrideSchemaAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported xs:override schema roots");
+        Assert(importOverrideSchemaAnnotation->Documentation.size() == 1, "Imported xs:override schema annotation should expose documentation entries");
+        Assert(importOverrideSchemaAnnotation->Documentation[0].Source == "urn:test:import-override-schema", "Imported xs:override schema documentation source mismatch");
+
+        const auto* importOverrideTypeAnnotation = importOverrideSchemas.FindSimpleTypeAnnotation("CodeType", "urn:file-import-override");
+        Assert(importOverrideTypeAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported xs:override rewritten simpleTypes");
+        Assert(importOverrideTypeAnnotation->Documentation.size() == 1, "Imported xs:override simpleType annotation should expose documentation entries");
+        Assert(importOverrideTypeAnnotation->Documentation[0].Content == "Imported override code docs", "Imported xs:override simpleType documentation content mismatch");
+
+        XmlSchemaSet namespaceOnlyImportOverrideSchemas;
+        namespaceOnlyImportOverrideSchemas.AddFile(importOverrideSchemaPath.string());
+        namespaceOnlyImportOverrideSchemas.AddFile(namespaceOnlyImportOverrideConsumerSchemaPath.string());
+
+        const auto* namespaceOnlyImportOverrideSchemaAnnotation = namespaceOnlyImportOverrideSchemas.FindSchemaAnnotation("urn:file-import-override");
+        Assert(namespaceOnlyImportOverrideSchemaAnnotation != nullptr, "XmlSchemaSet should expose imported override schema annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportOverrideSchemaAnnotation->Documentation.size() == 1, "Namespace-only imported override schema annotation should expose documentation entries");
+        Assert(namespaceOnlyImportOverrideSchemaAnnotation->Documentation[0].Source == "urn:test:import-override-schema", "Namespace-only imported override schema documentation source mismatch");
+
+        const auto* namespaceOnlyImportOverrideTypeAnnotation = namespaceOnlyImportOverrideSchemas.FindSimpleTypeAnnotation("CodeType", "urn:file-import-override");
+        Assert(namespaceOnlyImportOverrideTypeAnnotation != nullptr, "XmlSchemaSet should expose imported override rewritten simpleTypes through namespace-only xs:import");
+        Assert(namespaceOnlyImportOverrideTypeAnnotation->Documentation.size() == 1, "Namespace-only imported override simpleType annotation should expose documentation entries");
+        Assert(namespaceOnlyImportOverrideTypeAnnotation->Documentation[0].Content == "Imported override code docs", "Namespace-only imported override simpleType documentation content mismatch");
+
+        const auto namespaceOnlyImportOverrideValid = XmlDocument::Parse("<code xmlns=\"urn:file-import-override-preloaded-consumer\">AB12</code>");
+        namespaceOnlyImportOverrideValid->Validate(namespaceOnlyImportOverrideSchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportOverrideInvalid = XmlDocument::Parse("<code xmlns=\"urn:file-import-override-preloaded-consumer\">ab12</code>");
+            namespaceOnlyImportOverrideInvalid->Validate(namespaceOnlyImportOverrideSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should preserve imported xs:override results through namespace-only xs:import");
+
+        const auto importOverrideValid = XmlDocument::Parse("<code xmlns=\"urn:file-import-override-consumer\">AB12</code>");
+        importOverrideValid->Validate(importOverrideSchemas);
+
+        threw = false;
+        try {
+            const auto importOverrideInvalid = XmlDocument::Parse("<code xmlns=\"urn:file-import-override-consumer\">ab12</code>");
+            importOverrideInvalid->Validate(importOverrideSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported xs:override results");
+
+        XmlSchemaSet importRedefineSchemas;
+        importRedefineSchemas.AddFile(importRedefineConsumerSchemaPath.string());
+
+        const auto* importRedefineSchemaAnnotation = importRedefineSchemas.FindSchemaAnnotation("urn:file-import-redefine");
+        Assert(importRedefineSchemaAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported xs:redefine schema roots");
+        Assert(importRedefineSchemaAnnotation->Documentation.size() == 1, "Imported xs:redefine schema annotation should expose documentation entries");
+        Assert(importRedefineSchemaAnnotation->Documentation[0].Content == "Imported redefine schema docs", "Imported xs:redefine schema documentation content mismatch");
+
+        const auto* importRedefineTypeAnnotation = importRedefineSchemas.FindSimpleTypeAnnotation("CodeType", "urn:file-import-redefine");
+        Assert(importRedefineTypeAnnotation != nullptr, "XmlSchemaSet should expose annotations for imported xs:redefine rewritten simpleTypes");
+        Assert(importRedefineTypeAnnotation->AppInfo.size() == 1, "Imported xs:redefine simpleType annotation should expose appinfo entries");
+        Assert(importRedefineTypeAnnotation->AppInfo[0].Source == "urn:test:import-redefine-code", "Imported xs:redefine simpleType appinfo source mismatch");
+
+        XmlSchemaSet namespaceOnlyImportRedefineSchemas;
+        namespaceOnlyImportRedefineSchemas.AddFile(importRedefineSchemaPath.string());
+        namespaceOnlyImportRedefineSchemas.AddFile(namespaceOnlyImportRedefineConsumerSchemaPath.string());
+
+        const auto* namespaceOnlyImportRedefineSchemaAnnotation = namespaceOnlyImportRedefineSchemas.FindSchemaAnnotation("urn:file-import-redefine");
+        Assert(namespaceOnlyImportRedefineSchemaAnnotation != nullptr, "XmlSchemaSet should expose imported redefine schema annotations through namespace-only xs:import");
+        Assert(namespaceOnlyImportRedefineSchemaAnnotation->Documentation.size() == 1, "Namespace-only imported redefine schema annotation should expose documentation entries");
+        Assert(namespaceOnlyImportRedefineSchemaAnnotation->Documentation[0].Content == "Imported redefine schema docs", "Namespace-only imported redefine schema documentation content mismatch");
+
+        const auto* namespaceOnlyImportRedefineTypeAnnotation = namespaceOnlyImportRedefineSchemas.FindSimpleTypeAnnotation("CodeType", "urn:file-import-redefine");
+        Assert(namespaceOnlyImportRedefineTypeAnnotation != nullptr, "XmlSchemaSet should expose imported redefine rewritten simpleTypes through namespace-only xs:import");
+        Assert(namespaceOnlyImportRedefineTypeAnnotation->AppInfo.size() == 1, "Namespace-only imported redefine simpleType annotation should expose appinfo entries");
+        Assert(namespaceOnlyImportRedefineTypeAnnotation->AppInfo[0].Source == "urn:test:import-redefine-code", "Namespace-only imported redefine simpleType appinfo source mismatch");
+
+        const auto namespaceOnlyImportRedefineValid = XmlDocument::Parse("<code xmlns=\"urn:file-import-redefine-preloaded-consumer\">AB12</code>");
+        namespaceOnlyImportRedefineValid->Validate(namespaceOnlyImportRedefineSchemas);
+
+        threw = false;
+        try {
+            const auto namespaceOnlyImportRedefineInvalid = XmlDocument::Parse("<code xmlns=\"urn:file-import-redefine-preloaded-consumer\">ab12</code>");
+            namespaceOnlyImportRedefineInvalid->Validate(namespaceOnlyImportRedefineSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should preserve imported xs:redefine results through namespace-only xs:import");
+
+        const auto importRedefineValid = XmlDocument::Parse("<code xmlns=\"urn:file-import-redefine-consumer\">AB12</code>");
+        importRedefineValid->Validate(importRedefineSchemas);
+
+        threw = false;
+        try {
+            const auto importRedefineInvalid = XmlDocument::Parse("<code xmlns=\"urn:file-import-redefine-consumer\">ab12</code>");
+            importRedefineInvalid->Validate(importRedefineSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:import with imported xs:redefine results");
+
+        XmlSchemaSet overrideSchemas;
+        overrideSchemas.AddFile(overrideRootSchemaPath.string());
+
+        const auto overrideValid = XmlDocument::Parse("<code xmlns=\"urn:file-override-derive\">AB12</code>");
+        overrideValid->Validate(overrideSchemas);
+
+        threw = false;
+        try {
+            const auto overrideInvalid = XmlDocument::Parse("<code xmlns=\"urn:file-override-derive\">ab12</code>");
+            overrideInvalid->Validate(overrideSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+        }
+        Assert(threw, "Schema AddFile should compose xs:override with downstream named type derivation");
+    } catch (...) {
+        std::filesystem::remove_all(tempDir);
+        throw;
+    }
+
+    std::filesystem::remove_all(tempDir);
+}
+
+void TestXmlSchemaDefaultAndFixedValues() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:defaults\">"
+        "  <xs:element name=\"settings\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"mode\" default=\"auto\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "        <xs:element name=\"token\" fixed=\"ABC\" type=\"xs:string\" minOccurs=\"0\"/>"
+        "        <xs:element name=\"threshold\" minOccurs=\"0\">"
+        "          <xs:simpleType>"
+        "            <xs:restriction base=\"xs:int\">"
+        "              <xs:minInclusive value=\"1\"/>"
+        "            </xs:restriction>"
+        "          </xs:simpleType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "      <xs:attribute name=\"lang\" default=\"en\" type=\"xs:string\"/>"
+        "      <xs:attribute name=\"edition\" fixed=\"2\" type=\"xs:int\"/>"
+        "      <xs:attribute name=\"requiredFixed\" fixed=\"stable\" type=\"xs:string\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "  <xs:element name=\"badThreshold\" default=\"0\">"
+        "    <xs:simpleType>"
+        "      <xs:restriction base=\"xs:int\">"
+        "        <xs:minInclusive value=\"1\"/>"
+        "      </xs:restriction>"
+        "    </xs:simpleType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<settings xmlns=\"urn:defaults\" requiredFixed=\"stable\">"
+        "  <mode/>"
+        "  <token/>"
+        "  <threshold>5</threshold>"
+        "</settings>");
+    valid->Validate(schemas);
+
+    const auto validWithoutOptionalValues = XmlDocument::Parse(
+        "<settings xmlns=\"urn:defaults\" requiredFixed=\"stable\"/>");
+    validWithoutOptionalValues->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto badFixedElement = XmlDocument::Parse(
+            "<settings xmlns=\"urn:defaults\" requiredFixed=\"stable\">"
+            "  <token>XYZ</token>"
+            "</settings>");
+        badFixedElement->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must match the fixed value 'ABC'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce fixed values on element text content");
+
+    threw = false;
+    try {
+        const auto badFixedAttribute = XmlDocument::Parse(
+            "<settings xmlns=\"urn:defaults\" requiredFixed=\"stable\" edition=\"3\"/>");
+        badFixedAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'edition'") != std::string::npos
+            && std::string(exception.what()).find("fixed value '2'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce fixed values on attributes");
+
+    threw = false;
+    try {
+        const auto missingRequiredFixed = XmlDocument::Parse(
+            "<settings xmlns=\"urn:defaults\"/>");
+        missingRequiredFixed->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'requiredFixed'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should still require required fixed attributes to be present");
+
+    threw = false;
+    try {
+        const auto invalidDefaultValue = XmlDocument::Parse(
+            "<badThreshold xmlns=\"urn:defaults\"/>");
+        invalidDefaultValue->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be >= 1") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should validate element default values against the declared type facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"flag\" type=\"xs:string\" default=\"x\" fixed=\"y\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot specify both default and fixed") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject attributes that declare both default and fixed values");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:attribute name=\"flag\" type=\"xs:string\" use=\"required\" default=\"x\"/>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attributes cannot specify a default value") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject required attributes that declare a default value");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">"
+            "  <xs:element name=\"wrapper\" default=\"x\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"child\" type=\"xs:string\"/>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("only supported for simple-content elements") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject default/fixed on element declarations with child-element content");
+}
+
+void TestXmlSchemaIdentityConstraints() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity\" targetNamespace=\"urn:identity\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"id\" type=\"xs:string\"/>"
+        "            <xs:attribute name=\"code\" type=\"xs:string\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"bookId\" type=\"xs:string\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"bookKey\">"
+        "      <xs:annotation>"
+        "        <xs:documentation source=\"urn:test:key\">Primary book key</xs:documentation>"
+        "      </xs:annotation>"
+        "      <xs:selector xpath=\"tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:unique name=\"bookCodeUnique\">"
+        "      <xs:annotation>"
+        "        <xs:appinfo source=\"urn:test:unique\"><identity mode=\"unique\"/></xs:appinfo>"
+        "      </xs:annotation>"
+        "      <xs:selector xpath=\"tns:book\"/>"
+        "      <xs:field xpath=\"@code\"/>"
+        "    </xs:unique>"
+        "    <xs:keyref name=\"bookReference\" refer=\"tns:bookKey\">"
+        "      <xs:annotation>"
+        "        <xs:documentation xml:lang=\"en\">Book reference lookup</xs:documentation>"
+        "      </xs:annotation>"
+        "      <xs:selector xpath=\"tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto* keyAnnotation = schemas.FindIdentityConstraintAnnotation("bookKey", "urn:identity");
+    Assert(keyAnnotation != nullptr, "XmlSchemaSet should expose annotations for xs:key declarations");
+    Assert(keyAnnotation->Documentation.size() == 1, "xs:key annotation should expose documentation entries");
+    Assert(keyAnnotation->Documentation[0].Source == "urn:test:key", "xs:key documentation source mismatch");
+    Assert(keyAnnotation->Documentation[0].Content == "Primary book key", "xs:key documentation content mismatch");
+
+    const auto* uniqueAnnotation = schemas.FindIdentityConstraintAnnotation("bookCodeUnique", "urn:identity");
+    Assert(uniqueAnnotation != nullptr, "XmlSchemaSet should expose annotations for xs:unique declarations");
+    Assert(uniqueAnnotation->AppInfo.size() == 1, "xs:unique annotation should expose appinfo entries");
+    Assert(uniqueAnnotation->AppInfo[0].Source == "urn:test:unique", "xs:unique appinfo source mismatch");
+    Assert(uniqueAnnotation->AppInfo[0].Content == "<identity mode=\"unique\"/>", "xs:unique appinfo content mismatch");
+
+    const auto* keyrefAnnotation = schemas.FindIdentityConstraintAnnotation("bookReference", "urn:identity");
+    Assert(keyrefAnnotation != nullptr, "XmlSchemaSet should expose annotations for xs:keyref declarations");
+    Assert(keyrefAnnotation->Documentation.size() == 1, "xs:keyref annotation should expose documentation entries");
+    Assert(keyrefAnnotation->Documentation[0].Language == "en", "xs:keyref documentation xml:lang mismatch");
+    Assert(keyrefAnnotation->Documentation[0].Content == "Book reference lookup", "xs:keyref documentation content mismatch");
+
+    const auto* missingAnnotation = schemas.FindIdentityConstraintAnnotation("missing", "urn:identity");
+    Assert(missingAnnotation == nullptr, "XmlSchemaSet should return null for missing identity constraints");
+
+    const auto valid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity\">"
+        "  <book id=\"b1\" code=\"A\"/>"
+        "  <book id=\"b2\"/>"
+        "  <reference bookId=\"b1\"/>"
+        "</catalog>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto duplicateKey = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity\">"
+            "  <book id=\"b1\"/>"
+            "  <book id=\"b1\"/>"
+            "</catalog>");
+        duplicateKey->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("bookKey") != std::string::npos
+            && std::string(exception.what()).find("uniqueness") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:key uniqueness");
+
+    threw = false;
+    try {
+        const auto missingKeyField = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity\">"
+            "  <book code=\"A\"/>"
+            "</catalog>");
+        missingKeyField->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("bookKey") != std::string::npos
+            && std::string(exception.what()).find("@id") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should require xs:key fields on every selected node");
+
+    threw = false;
+    try {
+        const auto duplicateUnique = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity\">"
+            "  <book id=\"b1\" code=\"A\"/>"
+            "  <book id=\"b2\" code=\"A\"/>"
+            "</catalog>");
+        duplicateUnique->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("bookCodeUnique") != std::string::npos
+            && std::string(exception.what()).find("uniqueness") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:unique uniqueness for present values");
+
+    threw = false;
+    try {
+        const auto unresolvedKeyref = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity\">"
+            "  <book id=\"b1\"/>"
+            "  <reference bookId=\"missing\"/>"
+            "</catalog>");
+        unresolvedKeyref->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("bookReference") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:keyref lookups");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity\" targetNamespace=\"urn:identity\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"book\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\"/></xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:keyref name=\"badRef\" refer=\"tns:missingKey\">"
+            "      <xs:selector xpath=\"tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("unknown identity constraint") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject xs:keyref that targets an unknown constraint");
+
+    const std::string nestedSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-nested\" targetNamespace=\"urn:identity-nested\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType>"
+        "                  <xs:sequence>"
+        "                    <xs:element name=\"meta\">"
+        "                      <xs:complexType>"
+        "                        <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+        "                      </xs:complexType>"
+        "                    </xs:element>"
+        "                  </xs:sequence>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType>"
+        "                  <xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"nestedBookKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"tns:meta/@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"nestedBookRef\" refer=\"tns:nestedBookKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet nestedSchemas;
+    nestedSchemas.AddXml(nestedSchemaXml);
+
+    const auto nestedValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-nested\">"
+        "  <section>"
+        "    <book><meta id=\"b1\"/></book>"
+        "    <reference bookId=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    nestedValid->Validate(nestedSchemas);
+
+    threw = false;
+    try {
+        const auto nestedInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-nested\">"
+            "  <section>"
+            "    <book><meta id=\"b1\"/></book>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        nestedInvalid->Validate(nestedSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("nestedBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support nested identity constraint selector and field paths");
+
+    const std::string descendantSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-desc\" targetNamespace=\"urn:identity-desc\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"descBookKey\">"
+        "      <xs:selector xpath=\".//tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"descBookRef\" refer=\"tns:descBookKey\">"
+        "      <xs:selector xpath=\".//tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet descendantSchemas;
+    descendantSchemas.AddXml(descendantSchemaXml);
+
+    const auto descendantValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-desc\">"
+        "  <section>"
+        "    <book id=\"b1\"/>"
+        "    <reference bookId=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    descendantValid->Validate(descendantSchemas);
+
+    threw = false;
+    try {
+        const auto descendantInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-desc\">"
+            "  <section>"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        descendantInvalid->Validate(descendantSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("descBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support descendant identity constraint selectors");
+
+    const std::string leadingDescendantSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-leading-desc\" targetNamespace=\"urn:identity-leading-desc\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"leadDescBookKey\">"
+        "      <xs:selector xpath=\"//tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"leadDescBookRef\" refer=\"tns:leadDescBookKey\">"
+        "      <xs:selector xpath=\"//tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet leadingDescendantSchemas;
+    leadingDescendantSchemas.AddXml(leadingDescendantSchemaXml);
+
+    const auto leadingDescendantValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-leading-desc\">"
+        "  <section>"
+        "    <book id=\"b1\"/>"
+        "    <reference bookId=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    leadingDescendantValid->Validate(leadingDescendantSchemas);
+
+    threw = false;
+    try {
+        const auto leadingDescendantInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-leading-desc\">"
+            "  <section>"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        leadingDescendantInvalid->Validate(leadingDescendantSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("leadDescBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support leading descendant identity constraint selectors");
+
+    const std::string wildcardChildSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-wildcard-child\" targetNamespace=\"urn:identity-wildcard-child\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"books\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"refs\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"reference\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"wildBookKey\">"
+        "      <xs:selector xpath=\"tns:books/*\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"wildBookRef\" refer=\"tns:wildBookKey\">"
+        "      <xs:selector xpath=\"tns:refs/*\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet wildcardChildSchemas;
+    wildcardChildSchemas.AddXml(wildcardChildSchemaXml);
+
+    const auto wildcardChildValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-wildcard-child\">"
+        "  <books><book id=\"b1\"/></books>"
+        "  <refs><reference bookId=\"b1\"/></refs>"
+        "</catalog>");
+    wildcardChildValid->Validate(wildcardChildSchemas);
+
+    threw = false;
+    try {
+        const auto wildcardChildInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-wildcard-child\">"
+            "  <books><book id=\"b1\"/></books>"
+            "  <refs><reference bookId=\"missing\"/></refs>"
+            "</catalog>");
+        wildcardChildInvalid->Validate(wildcardChildSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("wildBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support child wildcard identity constraint selectors");
+
+    const std::string wildcardDescendantSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-wildcard-desc\" targetNamespace=\"urn:identity-wildcard-desc\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"books\">"
+        "                <xs:complexType>"
+        "                  <xs:sequence>"
+        "                    <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                      <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "                    </xs:element>"
+        "                  </xs:sequence>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"refs\">"
+        "                <xs:complexType>"
+        "                  <xs:sequence>"
+        "                    <xs:element name=\"reference\" maxOccurs=\"unbounded\">"
+        "                      <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "                    </xs:element>"
+        "                  </xs:sequence>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"wildDescBookKey\">"
+        "      <xs:selector xpath=\".//*/tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"wildDescBookRef\" refer=\"tns:wildDescBookKey\">"
+        "      <xs:selector xpath=\".//*/tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet wildcardDescendantSchemas;
+    wildcardDescendantSchemas.AddXml(wildcardDescendantSchemaXml);
+
+    const auto wildcardDescendantValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-wildcard-desc\">"
+        "  <section>"
+        "    <books><book id=\"b1\"/></books>"
+        "    <refs><reference bookId=\"b1\"/></refs>"
+        "  </section>"
+        "</catalog>");
+    wildcardDescendantValid->Validate(wildcardDescendantSchemas);
+
+    threw = false;
+    try {
+        const auto wildcardDescendantInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-wildcard-desc\">"
+            "  <section>"
+            "    <books><book id=\"b1\"/></books>"
+            "    <refs><reference bookId=\"missing\"/></refs>"
+            "  </section>"
+            "</catalog>");
+        wildcardDescendantInvalid->Validate(wildcardDescendantSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("wildDescBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support descendant wildcard identity constraint selectors");
+
+    const std::string predicateSelectorSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-selector\" targetNamespace=\"urn:identity-fallback-selector\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "            <xs:attribute name=\"kind\" type=\"xs:string\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"predSelectorBookKey\">"
+        "      <xs:selector xpath=\"tns:section[@kind='primary']/tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"predSelectorBookRef\" refer=\"tns:predSelectorBookKey\">"
+        "      <xs:selector xpath=\"tns:section[@kind='primary']/tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet predicateSelectorSchemas;
+    predicateSelectorSchemas.AddXml(predicateSelectorSchemaXml);
+
+    const auto predicateSelectorValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-fallback-selector\">"
+        "  <section kind=\"primary\">"
+        "    <book id=\"b1\"/>"
+        "    <reference bookId=\"b1\"/>"
+        "  </section>"
+        "  <section kind=\"secondary\">"
+        "    <book id=\"ignored\"/>"
+        "    <reference bookId=\"also-ignored\"/>"
+        "  </section>"
+        "</catalog>");
+    predicateSelectorValid->Validate(predicateSelectorSchemas);
+
+    threw = false;
+    try {
+        const auto predicateSelectorInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-fallback-selector\">"
+            "  <section kind=\"primary\">"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "  <section kind=\"secondary\">"
+            "    <book id=\"ignored\"/>"
+            "    <reference bookId=\"ignored\"/>"
+            "  </section>"
+            "</catalog>");
+        predicateSelectorInvalid->Validate(predicateSelectorSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("predSelectorBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should fall back to DOM XPath for predicate selector identity constraints");
+
+    const std::string predicateFieldSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-field\" targetNamespace=\"urn:identity-fallback-field\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType>"
+        "                  <xs:sequence>"
+        "                    <xs:element name=\"meta\" maxOccurs=\"unbounded\">"
+        "                      <xs:complexType>"
+        "                        <xs:attribute name=\"kind\" type=\"xs:string\" use=\"required\"/>"
+        "                        <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+        "                      </xs:complexType>"
+        "                    </xs:element>"
+        "                  </xs:sequence>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"predFieldBookKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"tns:meta[@kind='canonical']/@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"predFieldBookRef\" refer=\"tns:predFieldBookKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet predicateFieldSchemas;
+    predicateFieldSchemas.AddXml(predicateFieldSchemaXml);
+
+    const auto predicateFieldValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-fallback-field\">"
+        "  <section>"
+        "    <book>"
+        "      <meta kind=\"alternate\" id=\"ignored\"/>"
+        "      <meta kind=\"canonical\" id=\"b1\"/>"
+        "    </book>"
+        "    <reference bookId=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    predicateFieldValid->Validate(predicateFieldSchemas);
+
+    threw = false;
+    try {
+        const auto predicateFieldInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-fallback-field\">"
+            "  <section>"
+            "    <book>"
+            "      <meta kind=\"alternate\" id=\"ignored\"/>"
+            "      <meta kind=\"canonical\" id=\"b1\"/>"
+            "    </book>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        predicateFieldInvalid->Validate(predicateFieldSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("predFieldBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should fall back to DOM XPath for predicate field identity constraints");
+
+    const std::string namespaceWildcardSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-ns-wildcard\" targetNamespace=\"urn:identity-ns-wildcard\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"items\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"magazine\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"refs\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"reference\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"refId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"nsWildKey\">"
+        "      <xs:selector xpath=\"tns:items/tns:*\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"nsWildRef\" refer=\"tns:nsWildKey\">"
+        "      <xs:selector xpath=\"tns:refs/tns:*\"/>"
+        "      <xs:field xpath=\"@refId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet namespaceWildcardSchemas;
+    namespaceWildcardSchemas.AddXml(namespaceWildcardSchemaXml);
+
+    const auto namespaceWildcardValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-ns-wildcard\">"
+        "  <items>"
+        "    <book id=\"b1\"/>"
+        "    <magazine id=\"m1\"/>"
+        "  </items>"
+        "  <refs><reference refId=\"m1\"/></refs>"
+        "</catalog>");
+    namespaceWildcardValid->Validate(namespaceWildcardSchemas);
+
+    threw = false;
+    try {
+        const auto namespaceWildcardInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-ns-wildcard\">"
+            "  <items>"
+            "    <book id=\"b1\"/>"
+            "    <magazine id=\"m1\"/>"
+            "  </items>"
+            "  <refs><reference refId=\"missing\"/></refs>"
+            "</catalog>");
+        namespaceWildcardInvalid->Validate(namespaceWildcardSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("nsWildRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support namespace-scoped wildcard identity constraint selectors");
+
+    const std::string namespaceAttributeWildcardSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-attr-ns-wildcard\" targetNamespace=\"urn:identity-attr-ns-wildcard\" attributeFormDefault=\"qualified\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"refId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"nsAttrWildKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"@tns:*\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"nsAttrWildRef\" refer=\"tns:nsAttrWildKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"@tns:*\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet namespaceAttributeWildcardSchemas;
+    namespaceAttributeWildcardSchemas.AddXml(namespaceAttributeWildcardSchemaXml);
+
+    const auto namespaceAttributeWildcardValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-attr-ns-wildcard\" xmlns:t=\"urn:identity-attr-ns-wildcard\">"
+        "  <section>"
+        "    <book t:id=\"b1\"/>"
+        "    <reference t:refId=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    namespaceAttributeWildcardValid->Validate(namespaceAttributeWildcardSchemas);
+
+    threw = false;
+    try {
+        const auto namespaceAttributeWildcardInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-attr-ns-wildcard\" xmlns:t=\"urn:identity-attr-ns-wildcard\">"
+            "  <section>"
+            "    <book t:id=\"b1\"/>"
+            "    <reference t:refId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        namespaceAttributeWildcardInvalid->Validate(namespaceAttributeWildcardSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("nsAttrWildRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support namespace-scoped wildcard identity constraint fields");
+
+    const std::string attributeWildcardSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-attr-wildcard\" targetNamespace=\"urn:identity-attr-wildcard\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"attrWildKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"@*\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"attrWildRef\" refer=\"tns:attrWildKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"@*\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet attributeWildcardSchemas;
+    attributeWildcardSchemas.AddXml(attributeWildcardSchemaXml);
+
+    const auto attributeWildcardValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-attr-wildcard\">"
+        "  <section>"
+        "    <book token=\"b1\"/>"
+        "    <reference tokenRef=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    attributeWildcardValid->Validate(attributeWildcardSchemas);
+
+    threw = false;
+    try {
+        const auto attributeWildcardInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-attr-wildcard\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        attributeWildcardInvalid->Validate(attributeWildcardSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attrWildRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support wildcard terminal attribute identity constraint fields");
+
+    const std::string positionalSelectorSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-position\" targetNamespace=\"urn:identity-fallback-position\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"posBookKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book[position()=2]\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"posBookRef\" refer=\"tns:posBookKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference[position()=1]\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet positionalSelectorSchemas;
+    positionalSelectorSchemas.AddXml(positionalSelectorSchemaXml);
+
+    const auto positionalSelectorValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-fallback-position\">"
+        "  <section>"
+        "    <book id=\"ignored\"/>"
+        "    <book id=\"b2\"/>"
+        "    <reference bookId=\"b2\"/>"
+        "  </section>"
+        "</catalog>");
+    positionalSelectorValid->Validate(positionalSelectorSchemas);
+
+    threw = false;
+    try {
+        const auto positionalSelectorInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-fallback-position\">"
+            "  <section>"
+            "    <book id=\"ignored\"/>"
+            "    <book id=\"b2\"/>"
+            "    <reference bookId=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        positionalSelectorInvalid->Validate(positionalSelectorSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("posBookRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should fall back to DOM XPath for positional selector identity constraints");
+
+    const std::string axisFieldSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-axis-field\" targetNamespace=\"urn:identity-fallback-axis-field\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"axisFieldKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"self::tns:book/@token\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"axisFieldRef\" refer=\"tns:axisFieldKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"self::tns:reference/@tokenRef\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet axisFieldSchemas;
+    axisFieldSchemas.AddXml(axisFieldSchemaXml);
+
+    const auto axisFieldValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-fallback-axis-field\">"
+        "  <section>"
+        "    <book token=\"b1\"/>"
+        "    <reference tokenRef=\"b1\"/>"
+        "  </section>"
+        "</catalog>");
+    axisFieldValid->Validate(axisFieldSchemas);
+
+    threw = false;
+    try {
+        const auto axisFieldInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-fallback-axis-field\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        axisFieldInvalid->Validate(axisFieldSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("axisFieldRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should fall back to DOM XPath for axis-based field identity constraints");
+
+    const std::string partialFieldFallbackSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-partial-field\" targetNamespace=\"urn:identity-fallback-partial-field\">"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:sequence>"
+        "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType>"
+        "                  <xs:sequence>"
+        "                    <xs:element name=\"meta\" maxOccurs=\"unbounded\">"
+        "                      <xs:complexType>"
+        "                        <xs:attribute name=\"kind\" type=\"xs:string\" use=\"required\"/>"
+        "                        <xs:attribute name=\"code\" type=\"xs:string\" use=\"required\"/>"
+        "                      </xs:complexType>"
+        "                    </xs:element>"
+        "                  </xs:sequence>"
+        "                  <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "                <xs:complexType>"
+        "                  <xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/>"
+        "                  <xs:attribute name=\"bookCode\" type=\"xs:string\" use=\"required\"/>"
+        "                </xs:complexType>"
+        "              </xs:element>"
+        "            </xs:sequence>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "    <xs:key name=\"partialFieldKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+        "      <xs:field xpath=\"@id\"/>"
+        "      <xs:field xpath=\"tns:meta[@kind='canonical']/@code\"/>"
+        "    </xs:key>"
+        "    <xs:keyref name=\"partialFieldRef\" refer=\"tns:partialFieldKey\">"
+        "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+        "      <xs:field xpath=\"@bookId\"/>"
+        "      <xs:field xpath=\"@bookCode\"/>"
+        "    </xs:keyref>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet partialFieldFallbackSchemas;
+    partialFieldFallbackSchemas.AddXml(partialFieldFallbackSchemaXml);
+
+    const auto partialFieldFallbackValid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:identity-fallback-partial-field\">"
+        "  <section>"
+        "    <book id=\"b1\">"
+        "      <meta kind=\"alternate\" code=\"ignored\"/>"
+        "      <meta kind=\"canonical\" code=\"c1\"/>"
+        "    </book>"
+        "    <reference bookId=\"b1\" bookCode=\"c1\"/>"
+        "  </section>"
+        "</catalog>");
+    partialFieldFallbackValid->Validate(partialFieldFallbackSchemas);
+
+    threw = false;
+    try {
+        const auto partialFieldFallbackInvalid = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:identity-fallback-partial-field\">"
+            "  <section>"
+            "    <book id=\"b1\">"
+            "      <meta kind=\"alternate\" code=\"ignored\"/>"
+            "      <meta kind=\"canonical\" code=\"c1\"/>"
+            "    </book>"
+            "    <reference bookId=\"b1\" bookCode=\"missing\"/>"
+            "  </section>"
+            "</catalog>");
+        partialFieldFallbackInvalid->Validate(partialFieldFallbackSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("partialFieldRef") != std::string::npos
+            && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should fall back to DOM XPath when only part of a multi-field identity constraint can be compiled");
+}
+
+void TestXmlSchemaIdAndIdRefTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:id-types\" targetNamespace=\"urn:id-types\">"
+        "  <xs:simpleType name=\"RestrictedId\">"
+        "    <xs:restriction base=\"xs:ID\">"
+        "      <xs:pattern value=\"[A-Za-z_][A-Za-z0-9_-]*\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"PairOfRefs\">"
+        "    <xs:restriction base=\"xs:IDREFS\">"
+        "      <xs:length value=\"2\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"PatternedPairOfRefs\">"
+        "    <xs:restriction base=\"xs:IDREFS\">"
+        "      <xs:pattern value=\"[A-Za-z_][A-Za-z0-9_-]* [A-Za-z_][A-Za-z0-9_-]*\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"NamedRefSet\">"
+        "    <xs:restriction base=\"xs:IDREFS\">"
+        "      <xs:enumeration value=\"book1 alias_1\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"id\" type=\"xs:ID\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"alias\" minOccurs=\"0\" maxOccurs=\"unbounded\" type=\"tns:RestrictedId\"/>"
+        "        <xs:element name=\"ref\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"target\" type=\"xs:IDREF\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"refList\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"targets\" type=\"xs:IDREFS\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"restrictedRefList\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"targets\" type=\"tns:PairOfRefs\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"patternedRefList\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"targets\" type=\"tns:PatternedPairOfRefs\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "        <xs:element name=\"enumeratedRefList\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+        "          <xs:complexType>"
+        "            <xs:attribute name=\"targets\" type=\"tns:NamedRefSet\" use=\"required\"/>"
+        "          </xs:complexType>"
+        "        </xs:element>"
+        "      </xs:sequence>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:id-types\">"
+        "  <book id=\"book1\"/>"
+        "  <book id=\"book2\"/>"
+        "  <alias>alias_1</alias>"
+        "  <ref target=\"book1\"/>"
+        "  <ref target=\"alias_1\"/>"
+        "  <refList targets=\"book1 book2 alias_1\"/>"
+        "  <restrictedRefList targets=\"book1 alias_1\"/>"
+        "  <patternedRefList targets=\"book1 alias_1\"/>"
+        "  <enumeratedRefList targets=\"book1 alias_1\"/>"
+        "</catalog>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto duplicateId = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <book id=\"book1\"/>"
+            "</catalog>");
+        duplicateId->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("duplicates xs:ID value 'book1'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:ID uniqueness across the document");
+
+    threw = false;
+    try {
+        const auto unresolvedIdref = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <ref target=\"missing\"/>"
+            "</catalog>");
+        unresolvedIdref->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("references unknown xs:ID value 'missing'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should resolve xs:IDREF values against declared xs:ID values");
+
+    threw = false;
+    try {
+        const auto unresolvedIdrefs = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <refList targets=\"book1 missing\"/>"
+            "</catalog>");
+        unresolvedIdrefs->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("references unknown xs:ID value 'missing'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should resolve every xs:IDREFS item against declared xs:ID values");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedIdrefsLength = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <restrictedRefList targets=\"book1\"/>"
+            "</catalog>");
+        invalidRestrictedIdrefsLength->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must contain exactly 2 list items") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce list facets on restriction-derived xs:IDREFS types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedIdrefsResolution = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <restrictedRefList targets=\"book1 missing\"/>"
+            "</catalog>");
+        invalidRestrictedIdrefsResolution->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("references unknown xs:ID value 'missing'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve item-level xs:IDREF resolution for restriction-derived xs:IDREFS types");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedIdrefs = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <patternedRefList targets=\"book1\"/>"
+            "</catalog>");
+        invalidPatternDerivedIdrefs->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply pattern facets on restriction-derived xs:IDREFS types");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedIdrefsResolution = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <patternedRefList targets=\"book1 missing\"/>"
+            "</catalog>");
+        invalidPatternDerivedIdrefsResolution->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("references unknown xs:ID value 'missing'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve item-level xs:IDREF resolution after derived xs:IDREFS pattern matching");
+
+    threw = false;
+    try {
+        const auto invalidEnumeratedDerivedIdrefs = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <book id=\"book2\"/>"
+            "  <enumeratedRefList targets=\"book1 book2\"/>"
+            "</catalog>");
+        invalidEnumeratedDerivedIdrefs->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply enumeration facets on restriction-derived xs:IDREFS types");
+
+    threw = false;
+    try {
+        const auto invalidIdLexical = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"bad:id\"/>"
+            "</catalog>");
+        invalidIdLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:ID value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:ID lexical constraints");
+
+    threw = false;
+    try {
+        const auto invalidDerivedId = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:id-types\">"
+            "  <book id=\"book1\"/>"
+            "  <alias>9alias</alias>"
+            "</catalog>");
+        invalidDerivedId->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'alias'") != std::string::npos
+            && std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support restriction-derived xs:ID simple types");
+}
+
+void TestXmlSchemaEntityTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:entity-types\" targetNamespace=\"urn:entity-types\">"
+        "  <xs:simpleType name=\"PatternedEntity\">"
+        "    <xs:restriction base=\"xs:ENTITY\">"
+        "      <xs:pattern value=\"[A-Za-z_][A-Za-z0-9_-]*\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"NamedEntity\">"
+        "    <xs:restriction base=\"xs:ENTITY\">"
+        "      <xs:enumeration value=\"hero\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"PairOfEntities\">"
+        "    <xs:restriction base=\"xs:ENTITIES\">"
+        "      <xs:length value=\"2\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"PatternedPairOfEntities\">"
+        "    <xs:restriction base=\"xs:ENTITIES\">"
+        "      <xs:pattern value=\"[A-Za-z_][A-Za-z0-9_-]* [A-Za-z_][A-Za-z0-9_-]*\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"NamedEntities\">"
+        "    <xs:restriction base=\"xs:ENTITIES\">"
+        "      <xs:enumeration value=\"thumb hero\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"asset\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"cover\" type=\"xs:ENTITY\" use=\"required\"/>"
+        "      <xs:attribute name=\"patternedSingle\" type=\"tns:PatternedEntity\" use=\"optional\"/>"
+        "      <xs:attribute name=\"namedSingle\" type=\"tns:NamedEntity\" use=\"optional\"/>"
+        "      <xs:attribute name=\"related\" type=\"xs:ENTITIES\" use=\"required\"/>"
+        "      <xs:attribute name=\"featured\" type=\"tns:PairOfEntities\" use=\"optional\"/>"
+        "      <xs:attribute name=\"patterned\" type=\"tns:PatternedPairOfEntities\" use=\"optional\"/>"
+        "      <xs:attribute name=\"named\" type=\"tns:NamedEntities\" use=\"optional\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" patternedSingle=\"hero\" namedSingle=\"hero\" related=\"thumb hero\" featured=\"thumb hero\" patterned=\"thumb hero\" named=\"thumb hero\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidLexical = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"bad:name\" related=\"thumb\"/>");
+        invalidLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:ENTITY value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:ENTITY lexical values");
+
+    threw = false;
+    try {
+        const auto invalidParsedEntity = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!ENTITY cover \"inline\"><!NOTATION img SYSTEM \"image/png\"><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb\"/>");
+        invalidParsedEntity->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must reference a declared unparsed xs:ENTITY value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should require xs:ENTITY values to reference declared unparsed entities");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedEntity = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"hero\" patternedSingle=\"bad:name\"/>");
+        invalidPatternDerivedEntity->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply pattern facets on restriction-derived xs:ENTITY types");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedEntityReference = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"hero\" patternedSingle=\"missing\"/>");
+        invalidPatternDerivedEntityReference->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("declared unparsed xs:ENTITY value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve unparsed-entity checks after derived xs:ENTITY pattern matching");
+
+    threw = false;
+    try {
+        const auto invalidEnumeratedDerivedEntity = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"hero\" namedSingle=\"cover\"/>");
+        invalidEnumeratedDerivedEntity->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply enumeration facets on restriction-derived xs:ENTITY types");
+
+    threw = false;
+    try {
+        const auto invalidEntitiesList = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb missing\"/>");
+        invalidEntitiesList->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list item 2") != std::string::npos
+            && std::string(exception.what()).find("declared unparsed xs:ENTITY value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should validate each xs:ENTITIES list item as xs:ENTITY");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedEntitiesLength = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb hero\" featured=\"thumb\"/>");
+        invalidRestrictedEntitiesLength->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must contain exactly 2 list items") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce list facets on restriction-derived xs:ENTITIES types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedEntitiesItem = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb thumb\" featured=\"thumb missing\"/>");
+        invalidRestrictedEntitiesItem->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list item 2") != std::string::npos
+            && std::string(exception.what()).find("declared unparsed xs:ENTITY value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve item-level xs:ENTITY checks for restriction-derived xs:ENTITIES types");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedEntities = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb hero\" patterned=\"thumb\"/>");
+        invalidPatternDerivedEntities->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply pattern facets on restriction-derived xs:ENTITIES types");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedEntitiesItem = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb\" patterned=\"thumb missing\"/>");
+        invalidPatternDerivedEntitiesItem->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list item 2") != std::string::npos
+            && std::string(exception.what()).find("declared unparsed xs:ENTITY value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve item-level xs:ENTITY checks after derived xs:ENTITIES pattern matching");
+
+    threw = false;
+    try {
+        const auto invalidEnumeratedDerivedEntities = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION img SYSTEM \"image/png\"><!ENTITY cover SYSTEM \"cover.png\" NDATA img><!ENTITY thumb SYSTEM \"thumb.png\" NDATA img><!ENTITY hero SYSTEM \"hero.png\" NDATA img>]><asset xmlns=\"urn:entity-types\" cover=\"cover\" related=\"thumb hero\" named=\"cover hero\"/>");
+        invalidEnumeratedDerivedEntities->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply enumeration facets on restriction-derived xs:ENTITIES types");
+}
+
+void TestXmlSchemaNotationType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:notation-types\" targetNamespace=\"urn:notation-types\">"
+        "  <xs:simpleType name=\"PatternedNotation\">"
+        "    <xs:restriction base=\"xs:NOTATION\">"
+        "      <xs:pattern value=\"[a-z]+\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"NamedNotation\">"
+        "    <xs:restriction base=\"xs:NOTATION\">"
+        "      <xs:enumeration value=\"png\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"asset\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"format\" type=\"xs:NOTATION\" use=\"required\"/>"
+        "      <xs:attribute name=\"patterned\" type=\"tns:PatternedNotation\" use=\"optional\"/>"
+        "      <xs:attribute name=\"named\" type=\"tns:NamedNotation\" use=\"optional\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<!DOCTYPE asset [<!NOTATION png SYSTEM \"image/png\">]><asset xmlns=\"urn:notation-types\" format=\"png\" patterned=\"png\" named=\"png\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidLexical = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION png SYSTEM \"image/png\">]><asset xmlns=\"urn:notation-types\" format=\"bad:name\"/>");
+        invalidLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:NOTATION value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:NOTATION lexical values");
+
+    threw = false;
+    try {
+        const auto invalidReference = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION png SYSTEM \"image/png\">]><asset xmlns=\"urn:notation-types\" format=\"jpg\"/>");
+        invalidReference->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must reference a declared xs:NOTATION value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should require xs:NOTATION values to reference declared notations");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedNotation = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION png SYSTEM \"image/png\">]><asset xmlns=\"urn:notation-types\" format=\"png\" patterned=\"bad:name\"/>");
+        invalidPatternDerivedNotation->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply pattern facets on restriction-derived xs:NOTATION types");
+
+    threw = false;
+    try {
+        const auto invalidPatternDerivedNotationReference = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION png SYSTEM \"image/png\">]><asset xmlns=\"urn:notation-types\" format=\"png\" patterned=\"jpg\"/>");
+        invalidPatternDerivedNotationReference->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("declared xs:NOTATION value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should preserve notation-reference checks after derived xs:NOTATION pattern matching");
+
+    threw = false;
+    try {
+        const auto invalidEnumeratedDerivedNotation = XmlDocument::Parse(
+            "<!DOCTYPE asset [<!NOTATION png SYSTEM \"image/png\"><!NOTATION jpg SYSTEM \"image/jpeg\">]><asset xmlns=\"urn:notation-types\" format=\"png\" named=\"jpg\"/>");
+        invalidEnumeratedDerivedNotation->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("enumeration") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply enumeration facets on restriction-derived xs:NOTATION types");
+}
+
+void TestXmlSchemaNameLikePrimitiveTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:name-types\" targetNamespace=\"urn:name-types\">"
+        "  <xs:simpleType name=\"AliasType\">"
+        "    <xs:restriction base=\"xs:NCName\">"
+        "      <xs:pattern value=\"[A-Za-z_][A-Za-z0-9_]*\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"TwoWordTokens\">"
+        "    <xs:restriction base=\"xs:NMTOKENS\">"
+        "      <xs:length value=\"2\"/>"
+        "      <xs:pattern value=\"[a-z]+ [a-z]+\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"ApprovedTokenPair\">"
+        "    <xs:restriction base=\"xs:NMTOKENS\">"
+        "      <xs:enumeration value=\"one two\"/>"
+        "      <xs:enumeration value=\"alpha beta\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"catalog\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element name=\"alias\" type=\"tns:AliasType\" minOccurs=\"0\"/>"
+        "        <xs:element name=\"qname\" type=\"xs:QName\" minOccurs=\"0\"/>"
+        "        <xs:element name=\"tokenPair\" type=\"tns:TwoWordTokens\" minOccurs=\"0\"/>"
+        "        <xs:element name=\"approvedTokens\" type=\"tns:ApprovedTokenPair\" minOccurs=\"0\"/>"
+        "      </xs:sequence>"
+        "      <xs:attribute name=\"xmlName\" type=\"xs:Name\" use=\"required\"/>"
+        "      <xs:attribute name=\"ncName\" type=\"xs:NCName\" use=\"required\"/>"
+        "      <xs:attribute name=\"token\" type=\"xs:NMTOKEN\" use=\"required\"/>"
+        "      <xs:attribute name=\"tokens\" type=\"xs:NMTOKENS\" use=\"required\"/>"
+        "      <xs:attribute name=\"qualified\" type=\"xs:QName\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"item_1\" token=\"item-1\" tokens=\"one two.three four-five\" qualified=\"lib:item\">"
+        "  <alias>Alias_1</alias>"
+        "  <qname>lib:entry</qname>"
+        "  <tokenPair>one two</tokenPair>"
+        "  <approvedTokens>alpha beta</approvedTokens>"
+        "</catalog>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidNcName = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"bad:name\" token=\"item-1\" tokens=\"one two\" qualified=\"lib:item\"/>");
+        invalidNcName->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:NCName value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:NCName lexical constraints");
+
+    threw = false;
+    try {
+        const auto invalidName = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"1item\" ncName=\"good\" token=\"item-1\" tokens=\"one two\" qualified=\"lib:item\"/>");
+        invalidName->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:Name value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:Name lexical constraints");
+
+    threw = false;
+    try {
+        const auto invalidToken = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"good\" token=\"bad token\" tokens=\"one two\" qualified=\"lib:item\"/>");
+        invalidToken->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:NMTOKEN value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:NMTOKEN lexical constraints");
+
+    threw = false;
+    try {
+        const auto invalidTokens = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"good\" token=\"item-1\" tokens=\"one bad/token\" qualified=\"lib:item\"/>");
+        invalidTokens->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("list item 2") != std::string::npos
+            && std::string(exception.what()).find("xs:NMTOKEN") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:NMTOKENS item lexical constraints");
+
+    threw = false;
+    try {
+        const auto invalidQNameAttribute = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlName=\"lib:item\" ncName=\"good\" token=\"item-1\" tokens=\"one two\" qualified=\"lib:item\"/>");
+        invalidQNameAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:QName value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should require xs:QName prefixes to be declared in scope");
+
+    threw = false;
+    try {
+        const auto invalidQNameElement = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"good\" token=\"item-1\" tokens=\"one two\" qualified=\"lib:item\">"
+            "  <qname>missing:entry</qname>"
+            "</catalog>");
+        invalidQNameElement->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:QName value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:QName namespace bindings for element text");
+
+    threw = false;
+    try {
+        const auto invalidDerivedAlias = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"good\" token=\"item-1\" tokens=\"one two\" qualified=\"lib:item\">"
+            "  <alias>bad-name</alias>"
+            "</catalog>");
+        invalidDerivedAlias->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'alias'") != std::string::npos
+            && std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support restriction-derived xs:NCName simple types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedBuiltinListPattern = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"item_1\" token=\"item-1\" tokens=\"one two.three four-five\" qualified=\"lib:item\">"
+            "  <tokenPair>One two</tokenPair>"
+            "</catalog>");
+        invalidRestrictedBuiltinListPattern->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not match the declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce pattern facets on restriction-derived xs:NMTOKENS types");
+
+    threw = false;
+    try {
+        const auto invalidRestrictedBuiltinListEnumeration = XmlDocument::Parse(
+            "<catalog xmlns=\"urn:name-types\" xmlns:lib=\"urn:lib\" xmlName=\"lib:item\" ncName=\"item_1\" token=\"item-1\" tokens=\"one two.three four-five\" qualified=\"lib:item\">"
+            "  <approvedTokens>one three</approvedTokens>"
+            "</catalog>");
+        invalidRestrictedBuiltinListEnumeration->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be one of the declared enumeration values") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce enumeration facets on restriction-derived xs:NMTOKENS types");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:name-types-legality\" targetNamespace=\"urn:name-types-legality\">"
+            "  <xs:simpleType name=\"ApprovedTokenPair\">"
+            "    <xs:restriction base=\"xs:NMTOKENS\">"
+            "      <xs:enumeration value=\"one two\"/>"
+            "      <xs:enumeration value=\"alpha beta\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"ExpandedTokenPair\">"
+            "    <xs:restriction base=\"tns:ApprovedTokenPair\">"
+            "      <xs:enumeration value=\"one two\"/>"
+            "      <xs:enumeration value=\"gamma delta\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot add enumeration values outside the base simpleType") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should reject restriction-derived xs:NMTOKENS types that expand base enumeration values");
+}
+
+void TestXmlSchemaCommonStringDerivedTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:common-string-types\" targetNamespace=\"urn:common-string-types\">"
+        "  <xs:simpleType name=\"NormalizedPair\">"
+        "    <xs:restriction base=\"xs:normalizedString\">"
+        "      <xs:pattern value=\"alpha beta\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"TokenPair\">"
+        "    <xs:restriction base=\"xs:token\">"
+        "      <xs:pattern value=\"alpha beta\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"entry\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"normalized\" type=\"tns:NormalizedPair\" use=\"required\"/>"
+        "      <xs:attribute name=\"token\" type=\"tns:TokenPair\" use=\"required\"/>"
+        "      <xs:attribute name=\"language\" type=\"xs:language\" use=\"required\"/>"
+        "      <xs:attribute name=\"href\" type=\"xs:anyURI\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<entry xmlns=\"urn:common-string-types\" normalized=\"alpha&#10;beta\" token=\"  alpha   beta  \" language=\"en-US\" href=\"https://example.com/a?b=c\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidNormalized = XmlDocument::Parse(
+            "<entry xmlns=\"urn:common-string-types\" normalized=\"alpha&#10;beta&#10;gamma\" token=\"alpha beta\" language=\"en-US\" href=\"https://example.com/a?b=c\"/>");
+        invalidNormalized->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'normalized'") != std::string::npos
+            && std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply xs:normalizedString replace semantics before restriction facets");
+
+    threw = false;
+    try {
+        const auto invalidToken = XmlDocument::Parse(
+            "<entry xmlns=\"urn:common-string-types\" normalized=\"alpha beta\" token=\"alpha   beta   gamma\" language=\"en-US\" href=\"https://example.com/a?b=c\"/>");
+        invalidToken->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'token'") != std::string::npos
+            && std::string(exception.what()).find("pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply xs:token collapse semantics before restriction facets");
+
+    threw = false;
+    try {
+        const auto invalidLanguage = XmlDocument::Parse(
+            "<entry xmlns=\"urn:common-string-types\" normalized=\"alpha beta\" token=\"alpha beta\" language=\"en_US\" href=\"https://example.com/a?b=c\"/>");
+        invalidLanguage->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:language value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce practical xs:language lexical constraints");
+
+    threw = false;
+    try {
+        const auto invalidUri = XmlDocument::Parse(
+            "<entry xmlns=\"urn:common-string-types\" normalized=\"alpha beta\" token=\"alpha beta\" language=\"en-US\" href=\"https://example.com/a path\"/>");
+        invalidUri->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:anyURI value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject xs:anyURI values with whitespace in their lexical form");
+}
+
+void TestXmlSchemaTemporalTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:temporal-types\" targetNamespace=\"urn:temporal-types\">"
+        "  <xs:simpleType name=\"MarchDate\">"
+        "    <xs:restriction base=\"xs:date\">"
+        "      <xs:minInclusive value=\"2026-03-01\"/>"
+        "      <xs:maxInclusive value=\"2026-03-31\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"BusinessTime\">"
+        "    <xs:restriction base=\"xs:time\">"
+        "      <xs:minInclusive value=\"09:00:00\"/>"
+        "      <xs:maxExclusive value=\"18:00:00\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"ReleaseStamp\">"
+        "    <xs:restriction base=\"xs:dateTime\">"
+        "      <xs:minInclusive value=\"2026-03-20T09:00:00Z\"/>"
+        "      <xs:maxInclusive value=\"2026-03-20T12:00:00Z\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"event\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"day\" type=\"tns:MarchDate\" use=\"required\"/>"
+        "      <xs:attribute name=\"time\" type=\"tns:BusinessTime\" use=\"required\"/>"
+        "      <xs:attribute name=\"stamp\" type=\"tns:ReleaseStamp\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<event xmlns=\"urn:temporal-types\" day=\"2026-03-20\" time=\"09:30:00\" stamp=\"2026-03-20T11:00:00+02:00\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidDateLexical = XmlDocument::Parse(
+            "<event xmlns=\"urn:temporal-types\" day=\"2026-02-30\" time=\"09:30:00\" stamp=\"2026-03-20T11:00:00+02:00\"/>");
+        invalidDateLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:date value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:date lexical values");
+
+    threw = false;
+    try {
+        const auto invalidDateRange = XmlDocument::Parse(
+            "<event xmlns=\"urn:temporal-types\" day=\"2026-04-01\" time=\"09:30:00\" stamp=\"2026-03-20T11:00:00+02:00\"/>");
+        invalidDateRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'day'") != std::string::npos
+            && std::string(exception.what()).find("<= 2026-03-31") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:date min/max facets");
+
+    threw = false;
+    try {
+        const auto invalidTimeLexical = XmlDocument::Parse(
+            "<event xmlns=\"urn:temporal-types\" day=\"2026-03-20\" time=\"25:00:00\" stamp=\"2026-03-20T11:00:00+02:00\"/>");
+        invalidTimeLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:time value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:time lexical values");
+
+    threw = false;
+    try {
+        const auto invalidTimeRange = XmlDocument::Parse(
+            "<event xmlns=\"urn:temporal-types\" day=\"2026-03-20\" time=\"18:00:00\" stamp=\"2026-03-20T11:00:00+02:00\"/>");
+        invalidTimeRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'time'") != std::string::npos
+            && std::string(exception.what()).find("< 18:00:00") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:time min/max facets");
+
+    threw = false;
+    try {
+        const auto invalidDateTimeLexical = XmlDocument::Parse(
+            "<event xmlns=\"urn:temporal-types\" day=\"2026-03-20\" time=\"09:30:00\" stamp=\"2026-03-20 09:30:00\"/>");
+        invalidDateTimeLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:dateTime value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:dateTime lexical values");
+
+    threw = false;
+    try {
+        const auto invalidDateTimeRange = XmlDocument::Parse(
+            "<event xmlns=\"urn:temporal-types\" day=\"2026-03-20\" time=\"09:30:00\" stamp=\"2026-03-20T08:59:59Z\"/>");
+        invalidDateTimeRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'stamp'") != std::string::npos
+            && std::string(exception.what()).find(">= 2026-03-20T09:00:00Z") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:dateTime min/max facets with timezone-aware practical comparisons");
+}
+
+void TestXmlSchemaDurationType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:duration-types\" targetNamespace=\"urn:duration-types\">"
+        "  <xs:simpleType name=\"WorkWindow\">"
+        "    <xs:restriction base=\"xs:duration\">"
+        "      <xs:minInclusive value=\"PT30M\"/>"
+        "      <xs:maxExclusive value=\"PT9H\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"task\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"span\" type=\"tns:WorkWindow\" use=\"required\"/>"
+        "      <xs:attribute name=\"lag\" type=\"xs:duration\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<task xmlns=\"urn:duration-types\" span=\"PT2H30M\" lag=\"-PT45S\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidLexical = XmlDocument::Parse(
+            "<task xmlns=\"urn:duration-types\" span=\"P1M\" lag=\"PT10S\"/>");
+        invalidLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:duration value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject unsupported xs:duration lexical forms outside the practical subset");
+
+    threw = false;
+    try {
+        const auto invalidRange = XmlDocument::Parse(
+            "<task xmlns=\"urn:duration-types\" span=\"PT12H\" lag=\"PT10S\"/>");
+        invalidRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'span'") != std::string::npos
+            && std::string(exception.what()).find("< PT9H") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:duration facet comparisons in the practical subset");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:duration-types-invalid\" targetNamespace=\"urn:duration-types-invalid\">"
+            "  <xs:simpleType name=\"BaseDuration\">"
+            "    <xs:restriction base=\"xs:duration\">"
+            "      <xs:maxInclusive value=\"PT4H\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidDuration\">"
+            "    <xs:restriction base=\"tns:BaseDuration\">"
+            "      <xs:maxInclusive value=\"PT5H\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxInclusive facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should enforce xs:duration restriction legality for numeric-like facets");
+}
+
+void TestXmlSchemaBinaryTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:binary-types\" targetNamespace=\"urn:binary-types\">"
+        "  <xs:simpleType name=\"BlobType\">"
+        "    <xs:restriction base=\"xs:base64Binary\">"
+        "      <xs:length value=\"2\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"KeyType\">"
+        "    <xs:restriction base=\"xs:hexBinary\">"
+        "      <xs:minLength value=\"2\"/>"
+        "      <xs:maxLength value=\"4\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"payload\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"blob\" type=\"tns:BlobType\" use=\"required\"/>"
+        "      <xs:attribute name=\"key\" type=\"tns:KeyType\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<payload xmlns=\"urn:binary-types\" blob=\"SGk=\" key=\"0A0B0C\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidBase64Lexical = XmlDocument::Parse(
+            "<payload xmlns=\"urn:binary-types\" blob=\"SG@=\" key=\"0A0B0C\"/>");
+        invalidBase64Lexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:base64Binary value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:base64Binary lexical values");
+
+    threw = false;
+    try {
+        const auto invalidBase64Length = XmlDocument::Parse(
+            "<payload xmlns=\"urn:binary-types\" blob=\"SGkh\" key=\"0A0B0C\"/>");
+        invalidBase64Length->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'blob'") != std::string::npos
+            && std::string(exception.what()).find("must have length 2") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should count xs:base64Binary length facets in decoded bytes");
+
+    threw = false;
+    try {
+        const auto invalidHexLexical = XmlDocument::Parse(
+            "<payload xmlns=\"urn:binary-types\" blob=\"SGk=\" key=\"0A0X\"/>");
+        invalidHexLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:hexBinary value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:hexBinary lexical values");
+
+    threw = false;
+    try {
+        const auto invalidHexLength = XmlDocument::Parse(
+            "<payload xmlns=\"urn:binary-types\" blob=\"SGk=\" key=\"0A\"/>");
+        invalidHexLength->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'key'") != std::string::npos
+            && std::string(exception.what()).find("must have length >= 2") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should count xs:hexBinary length facets in decoded bytes");
+}
+
+void TestXmlSchemaIntegerDerivedTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:integer-derived-types\" targetNamespace=\"urn:integer-derived-types\">"
+        "  <xs:simpleType name=\"TinyCounter\">"
+        "    <xs:restriction base=\"xs:unsignedByte\">"
+        "      <xs:maxInclusive value=\"10\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"BatchId\">"
+        "    <xs:restriction base=\"xs:unsignedLong\">"
+        "      <xs:minInclusive value=\"4294967296\"/>"
+        "      <xs:maxInclusive value=\"4294967298\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"Delta\">"
+        "    <xs:restriction base=\"xs:short\">"
+        "      <xs:minInclusive value=\"-10\"/>"
+        "      <xs:maxInclusive value=\"10\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"number\" type=\"xs:integer\" abstract=\"true\"/>"
+        "  <xs:element name=\"smallNumber\" substitutionGroup=\"tns:number\" type=\"xs:unsignedByte\"/>"
+        "  <xs:element name=\"record\">"
+        "    <xs:complexType>"
+        "      <xs:sequence>"
+        "        <xs:element ref=\"tns:number\"/>"
+        "      </xs:sequence>"
+        "      <xs:attribute name=\"tiny\" type=\"tns:TinyCounter\" use=\"required\"/>"
+        "      <xs:attribute name=\"batch\" type=\"tns:BatchId\" use=\"required\"/>"
+        "      <xs:attribute name=\"delta\" type=\"tns:Delta\" use=\"required\"/>"
+        "      <xs:attribute name=\"count\" type=\"xs:positiveInteger\" use=\"required\"/>"
+        "      <xs:attribute name=\"debt\" type=\"xs:negativeInteger\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<record xmlns=\"urn:integer-derived-types\" tiny=\"10\" batch=\"4294967297\" delta=\"-5\" count=\"3\" debt=\"-1\"><smallNumber>255</smallNumber></record>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidUnsignedByte = XmlDocument::Parse(
+            "<record xmlns=\"urn:integer-derived-types\" tiny=\"256\" batch=\"4294967297\" delta=\"-5\" count=\"3\" debt=\"-1\"><smallNumber>255</smallNumber></record>");
+        invalidUnsignedByte->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:unsignedByte value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:unsignedByte lexical and range bounds");
+
+    threw = false;
+    try {
+        const auto invalidUnsignedLongLexical = XmlDocument::Parse(
+            "<record xmlns=\"urn:integer-derived-types\" tiny=\"10\" batch=\"18446744073709551616\" delta=\"-5\" count=\"3\" debt=\"-1\"><smallNumber>255</smallNumber></record>");
+        invalidUnsignedLongLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:unsignedLong value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject xs:unsignedLong values outside the practical range");
+
+    threw = false;
+    try {
+        const auto invalidUnsignedLongFacet = XmlDocument::Parse(
+            "<record xmlns=\"urn:integer-derived-types\" tiny=\"10\" batch=\"4294967299\" delta=\"-5\" count=\"3\" debt=\"-1\"><smallNumber>255</smallNumber></record>");
+        invalidUnsignedLongFacet->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'batch'") != std::string::npos
+            && std::string(exception.what()).find("<= 4294967298") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should compare xs:unsignedLong facets exactly");
+
+    threw = false;
+    try {
+        const auto invalidShort = XmlDocument::Parse(
+            "<record xmlns=\"urn:integer-derived-types\" tiny=\"10\" batch=\"4294967297\" delta=\"-40000\" count=\"3\" debt=\"-1\"><smallNumber>255</smallNumber></record>");
+        invalidShort->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:short value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:short range bounds");
+
+    threw = false;
+    try {
+        const auto invalidPositive = XmlDocument::Parse(
+            "<record xmlns=\"urn:integer-derived-types\" tiny=\"10\" batch=\"4294967297\" delta=\"-5\" count=\"0\" debt=\"-1\"><smallNumber>255</smallNumber></record>");
+        invalidPositive->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:positiveInteger value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:positiveInteger builtin bounds");
+
+    threw = false;
+    try {
+        const auto invalidNegative = XmlDocument::Parse(
+            "<record xmlns=\"urn:integer-derived-types\" tiny=\"10\" batch=\"4294967297\" delta=\"-5\" count=\"3\" debt=\"0\"><smallNumber>255</smallNumber></record>");
+        invalidNegative->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:negativeInteger value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:negativeInteger builtin bounds");
+}
+
+void TestXmlSchemaFloatType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:float-types\" targetNamespace=\"urn:float-types\">"
+        "  <xs:simpleType name=\"UnitFloat\">"
+        "    <xs:restriction base=\"xs:float\">"
+        "      <xs:minInclusive value=\"0.0\"/>"
+        "      <xs:maxExclusive value=\"1.0\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"sample\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"ratio\" type=\"tns:UnitFloat\" use=\"required\"/>"
+        "      <xs:attribute name=\"peak\" type=\"xs:float\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<sample xmlns=\"urn:float-types\" ratio=\"0.5\" peak=\"INF\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidLexical = XmlDocument::Parse(
+            "<sample xmlns=\"urn:float-types\" ratio=\"abc\" peak=\"1.0\"/>");
+        invalidLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:float value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:float lexical values");
+
+    threw = false;
+    try {
+        const auto invalidRange = XmlDocument::Parse(
+            "<sample xmlns=\"urn:float-types\" ratio=\"1.0\" peak=\"1.0\"/>");
+        invalidRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'ratio'") != std::string::npos
+            && std::string(exception.what()).find("< 1.0") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:float restriction facets");
+
+    threw = false;
+    try {
+        const auto invalidUnderflow = XmlDocument::Parse(
+            "<sample xmlns=\"urn:float-types\" ratio=\"0.5\" peak=\"1e1000\"/>");
+        invalidUnderflow->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'peak'") != std::string(exception.what()).npos
+            && std::string(exception.what()).find("must be a valid xs:float value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject xs:float values outside Single range");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:float-types-invalid\" targetNamespace=\"urn:float-types-invalid\">"
+            "  <xs:simpleType name=\"WideFloat\">"
+            "    <xs:restriction base=\"xs:float\">"
+            "      <xs:maxInclusive value=\"2.0\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidFloat\">"
+            "    <xs:restriction base=\"tns:WideFloat\">"
+            "      <xs:maxInclusive value=\"3.0\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxInclusive facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should enforce xs:float restriction legality for numeric facets");
+}
+
+void TestXmlSchemaDecimalType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:decimal-types\" targetNamespace=\"urn:decimal-types\">"
+        "  <xs:simpleType name=\"HugeDecimal\">"
+        "    <xs:restriction base=\"xs:decimal\">"
+        "      <xs:minInclusive value=\"9007199254740993\"/>"
+        "      <xs:maxExclusive value=\"9007199254740995\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"sample\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"amount\" type=\"tns:HugeDecimal\" use=\"required\"/>"
+        "      <xs:attribute name=\"raw\" type=\"xs:decimal\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<sample xmlns=\"urn:decimal-types\" amount=\" 9007199254740993.0 \" raw=\"+12.3400\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidLexical = XmlDocument::Parse(
+            "<sample xmlns=\"urn:decimal-types\" amount=\"9007199254740993\" raw=\"1e2\"/>");
+        invalidLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:decimal value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject scientific notation for xs:decimal");
+
+    threw = false;
+    try {
+        const auto invalidRange = XmlDocument::Parse(
+            "<sample xmlns=\"urn:decimal-types\" amount=\"9007199254740992\" raw=\"12.34\"/>");
+        invalidRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'amount'") != std::string::npos
+            && std::string(exception.what()).find(">= 9007199254740993") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should compare xs:decimal facets without double rounding");
+
+    threw = false;
+    try {
+        const auto invalidInfinity = XmlDocument::Parse(
+            "<sample xmlns=\"urn:decimal-types\" amount=\"9007199254740993\" raw=\"INF\"/>");
+        invalidInfinity->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:decimal value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject INF lexical values for xs:decimal");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:decimal-types-invalid\" targetNamespace=\"urn:decimal-types-invalid\">"
+            "  <xs:simpleType name=\"BaseDecimal\">"
+            "    <xs:restriction base=\"xs:decimal\">"
+            "      <xs:minInclusive value=\"9007199254740993\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidDecimal\">"
+            "    <xs:restriction base=\"tns:BaseDecimal\">"
+            "      <xs:minInclusive value=\"9007199254740992\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base minInclusive facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should enforce xs:decimal restriction legality without double rounding");
+}
+
+void TestXmlSchemaDoubleType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:double-types\" targetNamespace=\"urn:double-types\">"
+        "  <xs:simpleType name=\"UnitDouble\">"
+        "    <xs:restriction base=\"xs:double\">"
+        "      <xs:minInclusive value=\"-1.0\"/>"
+        "      <xs:maxExclusive value=\"1.0\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"sample\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"ratio\" type=\"tns:UnitDouble\" use=\"required\"/>"
+        "      <xs:attribute name=\"peak\" type=\"xs:double\" use=\"required\"/>"
+        "      <xs:attribute name=\"enabled\" type=\"xs:boolean\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+     "<sample xmlns=\"urn:double-types\" ratio=\" 0.5 \" peak=\" INF \" enabled=\" true \"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidLexical = XmlDocument::Parse(
+            "<sample xmlns=\"urn:double-types\" ratio=\"abc\" peak=\"1.0\" enabled=\"true\"/>");
+        invalidLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:double value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:double lexical values");
+
+    threw = false;
+    try {
+        const auto invalidRange = XmlDocument::Parse(
+            "<sample xmlns=\"urn:double-types\" ratio=\"1.0\" peak=\"1.0\" enabled=\"true\"/>");
+        invalidRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'ratio'") != std::string::npos
+            && std::string(exception.what()).find("< 1.0") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:double restriction facets");
+
+    threw = false;
+    try {
+        const auto invalidOverflow = XmlDocument::Parse(
+            "<sample xmlns=\"urn:double-types\" ratio=\"0.5\" peak=\"1e10000\" enabled=\"true\"/>");
+        invalidOverflow->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'peak'") != std::string::npos
+            && std::string(exception.what()).find("must be a valid xs:double value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject xs:double values outside Double range");
+
+    threw = false;
+    try {
+        const auto invalidBoolean = XmlDocument::Parse(
+            "<sample xmlns=\"urn:double-types\" ratio=\"0.5\" peak=\"1.0\" enabled=\" maybe \"/>");
+        invalidBoolean->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:boolean value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should still enforce boolean lexical rules after numeric whiteSpace collapse");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:double-types-invalid\" targetNamespace=\"urn:double-types-invalid\">"
+            "  <xs:simpleType name=\"WideDouble\">"
+            "    <xs:restriction base=\"xs:double\">"
+            "      <xs:maxInclusive value=\"2.0\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidDouble\">"
+            "    <xs:restriction base=\"tns:WideDouble\">"
+            "      <xs:maxInclusive value=\"3.0\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxInclusive facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should enforce xs:double restriction legality for numeric facets");
+}
+
+void TestXmlSchemaAnySimpleType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:any-simple-type\" targetNamespace=\"urn:any-simple-type\">"
+        "  <xs:simpleType name=\"CodeFromAny\">"
+        "    <xs:restriction base=\"xs:anySimpleType\">"
+        "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"sample\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"raw\" type=\"xs:anySimpleType\" use=\"required\"/>"
+        "      <xs:attribute name=\"code\" type=\"tns:CodeFromAny\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<sample xmlns=\"urn:any-simple-type\" raw=\"  any lexical value  \" code=\"AB12\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidPattern = XmlDocument::Parse(
+            "<sample xmlns=\"urn:any-simple-type\" raw=\"anything\" code=\"bad\"/>");
+        invalidPattern->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("declared pattern") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should allow restriction-derived xs:anySimpleType values to apply facets");
+
+    const std::string derivedSchemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:any-simple-type-derived\" targetNamespace=\"urn:any-simple-type-derived\">"
+        "  <xs:simpleType name=\"BaseAny\">"
+        "    <xs:restriction base=\"xs:anySimpleType\">"
+        "      <xs:maxLength value=\"4\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"DerivedAny\">"
+        "    <xs:restriction base=\"tns:BaseAny\">"
+        "      <xs:maxLength value=\"3\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"derived\" type=\"tns:DerivedAny\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet derivedSchemas;
+    derivedSchemas.AddXml(derivedSchemaXml);
+
+    const auto derivedValid = XmlDocument::Parse(
+        "<derived xmlns=\"urn:any-simple-type-derived\">abc</derived>");
+    derivedValid->Validate(derivedSchemas);
+
+    threw = false;
+    try {
+        const auto derivedInvalid = XmlDocument::Parse(
+            "<derived xmlns=\"urn:any-simple-type-derived\">abcd</derived>");
+        derivedInvalid->Validate(derivedSchemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("length <= 3") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support named restriction chains rooted at xs:anySimpleType");
+}
+
+void TestXmlSchemaAnyType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:any-type\" targetNamespace=\"urn:any-type\">"
+        "  <xs:element name=\"declaredChild\" type=\"xs:int\"/>"
+        "  <xs:complexType name=\"PayloadType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"xs:anyType\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"value\" type=\"xs:string\"/>"
+        "        </xs:sequence>"
+        "        <xs:attribute name=\"code\" type=\"xs:token\" use=\"required\"/>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"anyRoot\" type=\"xs:anyType\"/>"
+        "  <xs:element name=\"typedRoot\" type=\"tns:PayloadType\"/>"
+        "  <xs:element name=\"dynamicRoot\" type=\"xs:anyType\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto directValid = XmlDocument::Parse(
+        "<anyRoot xmlns=\"urn:any-type\" xmlns:ext=\"urn:ext\" extra=\"1\">"
+        "  free text"
+        "  <ext:unknown/>"
+        "  <declaredChild>7</declaredChild>"
+        "</anyRoot>");
+    directValid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto directInvalid = XmlDocument::Parse(
+            "<anyRoot xmlns=\"urn:any-type\">"
+            "  <declaredChild>bad</declaredChild>"
+            "</anyRoot>");
+        directInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:int value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should still validate declared children that appear under xs:anyType");
+
+    const auto typedValid = XmlDocument::Parse(
+        "<typedRoot xmlns=\"urn:any-type\" xmlns:ext=\"urn:ext\" code=\"A1\">"
+        "  <ext:unknown/>"
+        "  <value>ok</value>"
+        "</typedRoot>");
+    typedValid->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto typedInvalid = XmlDocument::Parse(
+            "<typedRoot xmlns=\"urn:any-type\" code=\"A1\"/>");
+        typedInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos
+            || std::string(exception.what()).find("expected child element") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support complexContent extension bases rooted at xs:anyType");
+
+    const auto dynamicValid = XmlDocument::Parse(
+        "<dynamicRoot xmlns=\"urn:any-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:PayloadType\" xmlns:tns=\"urn:any-type\" code=\"B2\">"
+        "  <value>runtime</value>"
+        "</dynamicRoot>");
+    dynamicValid->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto dynamicInvalid = XmlDocument::Parse(
+            "<dynamicRoot xmlns=\"urn:any-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:PayloadType\" xmlns:tns=\"urn:any-type\">"
+            "  <value>runtime</value>"
+            "</dynamicRoot>");
+        dynamicInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'code'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should allow xsi:type to refine xs:anyType into a derived complexType");
+}
+
+void TestXmlSchemaAnyTypeRestriction() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:any-type-restriction\" targetNamespace=\"urn:any-type-restriction\">"
+        "  <xs:complexType name=\"RestrictedAnyType\">"
+        "    <xs:complexContent>"
+        "      <xs:restriction base=\"xs:anyType\">"
+        "        <xs:sequence>"
+        "          <xs:element name=\"value\" type=\"xs:token\"/>"
+        "        </xs:sequence>"
+        "        <xs:attribute name=\"code\" type=\"xs:int\" use=\"required\"/>"
+        "      </xs:restriction>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"root\" type=\"tns:RestrictedAnyType\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<root xmlns=\"urn:any-type-restriction\" code=\"7\">"
+        "  <value>ok</value>"
+        "</root>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto missingAttribute = XmlDocument::Parse(
+            "<root xmlns=\"urn:any-type-restriction\">"
+            "  <value>ok</value>"
+            "</root>");
+        missingAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'code'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce attributes introduced by xs:anyType restriction");
+
+    threw = false;
+    try {
+        const auto invalidChild = XmlDocument::Parse(
+            "<root xmlns=\"urn:any-type-restriction\" code=\"7\">"
+            "  <other/>"
+            "</root>");
+        invalidChild->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("does not satisfy the declared content model") != std::string::npos
+            || std::string(exception.what()).find("expected child element") != std::string::npos
+            || std::string(exception.what()).find("unexpected child element") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support complexContent restriction bases rooted at xs:anyType");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:any-type-restriction-invalid\" targetNamespace=\"urn:any-type-restriction-invalid\">"
+            "  <xs:complexType name=\"InvalidRestrictedAnyType\">"
+            "    <xs:complexContent>"
+            "      <xs:restriction base=\"xs:anyType\">"
+            "        <xs:any namespace=\"##any\" processContents=\"skip\"/>"
+            "      </xs:restriction>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot weaken the base wildcard processContents") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should still enforce wildcard restriction legality when restricting xs:anyType");
+}
+
+void TestXmlSchemaDirectAnyParticles() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:direct-any-particles\" targetNamespace=\"urn:direct-any-particles\">"
+        "  <xs:element name=\"knownChild\" type=\"xs:int\"/>"
+        "  <xs:complexType name=\"DirectAnyType\">"
+        "    <xs:any namespace=\"##targetNamespace\" processContents=\"lax\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"BaseWithHead\">"
+        "    <xs:sequence>"
+        "      <xs:element name=\"head\" type=\"xs:token\"/>"
+        "    </xs:sequence>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"ExtendedWithDirectAny\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:BaseWithHead\">"
+        "        <xs:any namespace=\"##targetNamespace\" processContents=\"lax\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"directRoot\" type=\"tns:DirectAnyType\"/>"
+        "  <xs:element name=\"extendedRoot\" type=\"tns:ExtendedWithDirectAny\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto directValid = XmlDocument::Parse(
+        "<directRoot xmlns=\"urn:direct-any-particles\">"
+        "  <unknownChild/>"
+        "</directRoot>");
+    directValid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto directInvalid = XmlDocument::Parse(
+            "<directRoot xmlns=\"urn:direct-any-particles\">"
+            "  <knownChild>bad</knownChild>"
+            "</directRoot>");
+        directInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:int value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support a complexType whose direct content particle is xs:any");
+
+    const auto extendedValid = XmlDocument::Parse(
+        "<extendedRoot xmlns=\"urn:direct-any-particles\">"
+        "  <head>ok</head>"
+        "  <unknownChild/>"
+        "</extendedRoot>");
+    extendedValid->Validate(schemas);
+
+    threw = false;
+    try {
+        const auto extendedInvalid = XmlDocument::Parse(
+            "<extendedRoot xmlns=\"urn:direct-any-particles\">"
+            "  <head>ok</head>"
+            "  <knownChild>bad</knownChild>"
+            "</extendedRoot>");
+        extendedInvalid->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:int value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should support direct xs:any particles inside complexContent extension");
+}
+
+void TestXmlSchemaGYearTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:gyear-types\" targetNamespace=\"urn:gyear-types\">"
+        "  <xs:simpleType name=\"LaunchYear\">"
+        "    <xs:restriction base=\"xs:gYear\">"
+        "      <xs:minInclusive value=\"2020\"/>"
+        "      <xs:maxInclusive value=\"2026Z\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"ReleaseWindow\">"
+        "    <xs:restriction base=\"xs:gYearMonth\">"
+        "      <xs:minInclusive value=\"2026-03Z\"/>"
+        "      <xs:maxExclusive value=\"2026-07Z\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"product\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"year\" type=\"tns:LaunchYear\" use=\"required\"/>"
+        "      <xs:attribute name=\"window\" type=\"tns:ReleaseWindow\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<product xmlns=\"urn:gyear-types\" year=\"2026\" window=\"2026-03Z\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidYearLexical = XmlDocument::Parse(
+            "<product xmlns=\"urn:gyear-types\" year=\"20A6\" window=\"2026-03Z\"/>");
+        invalidYearLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:gYear value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:gYear lexical values");
+
+    threw = false;
+    try {
+        const auto invalidYearRange = XmlDocument::Parse(
+            "<product xmlns=\"urn:gyear-types\" year=\"2027\" window=\"2026-03Z\"/>");
+        invalidYearRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'year'") != std::string::npos
+            && std::string(exception.what()).find("<= 2026Z") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:gYear facets");
+
+    threw = false;
+    try {
+        const auto invalidYearMonthLexical = XmlDocument::Parse(
+            "<product xmlns=\"urn:gyear-types\" year=\"2026\" window=\"2026-13\"/>");
+        invalidYearMonthLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:gYearMonth value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:gYearMonth lexical values");
+
+    threw = false;
+    try {
+        const auto invalidYearMonthRange = XmlDocument::Parse(
+            "<product xmlns=\"urn:gyear-types\" year=\"2026\" window=\"2026-07Z\"/>");
+        invalidYearMonthRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'window'") != std::string::npos
+            && std::string(exception.what()).find("< 2026-07Z") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:gYearMonth facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:gyear-types-invalid\" targetNamespace=\"urn:gyear-types-invalid\">"
+            "  <xs:simpleType name=\"BaseWindow\">"
+            "    <xs:restriction base=\"xs:gYearMonth\">"
+            "      <xs:maxInclusive value=\"2026-06Z\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidWindow\">"
+            "    <xs:restriction base=\"tns:BaseWindow\">"
+            "      <xs:maxInclusive value=\"2026-07Z\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxInclusive facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should enforce temporal restriction legality for xs:gYearMonth facets");
+}
+
+void TestXmlSchemaGMonthTypes() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:gmonth-types\" targetNamespace=\"urn:gmonth-types\">"
+        "  <xs:simpleType name=\"SpringMonth\">"
+        "    <xs:restriction base=\"xs:gMonth\">"
+        "      <xs:minInclusive value=\"--03Z\"/>"
+        "      <xs:maxInclusive value=\"--05Z\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:simpleType name=\"MonthDayWindow\">"
+        "    <xs:restriction base=\"xs:gMonthDay\">"
+        "      <xs:minInclusive value=\"--03-15Z\"/>"
+        "      <xs:maxExclusive value=\"--04-01Z\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:element name=\"season\">"
+        "    <xs:complexType>"
+        "      <xs:attribute name=\"month\" type=\"tns:SpringMonth\" use=\"required\"/>"
+        "      <xs:attribute name=\"day\" type=\"xs:gDay\" use=\"required\"/>"
+        "      <xs:attribute name=\"marker\" type=\"tns:MonthDayWindow\" use=\"required\"/>"
+        "    </xs:complexType>"
+        "  </xs:element>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto valid = XmlDocument::Parse(
+        "<season xmlns=\"urn:gmonth-types\" month=\"--04Z\" day=\"---20\" marker=\"--03-20Z\"/>");
+    valid->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidMonthLexical = XmlDocument::Parse(
+            "<season xmlns=\"urn:gmonth-types\" month=\"--13\" day=\"---20\" marker=\"--03-20Z\"/>");
+        invalidMonthLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:gMonth value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:gMonth lexical values");
+
+    threw = false;
+    try {
+        const auto invalidMonthRange = XmlDocument::Parse(
+            "<season xmlns=\"urn:gmonth-types\" month=\"--06Z\" day=\"---20\" marker=\"--03-20Z\"/>");
+        invalidMonthRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'month'") != std::string::npos
+            && std::string(exception.what()).find("<= --05Z") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:gMonth facets");
+
+    threw = false;
+    try {
+        const auto invalidDayLexical = XmlDocument::Parse(
+            "<season xmlns=\"urn:gmonth-types\" month=\"--04Z\" day=\"---32\" marker=\"--03-20Z\"/>");
+        invalidDayLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:gDay value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:gDay lexical values");
+
+    threw = false;
+    try {
+        const auto invalidMonthDayLexical = XmlDocument::Parse(
+            "<season xmlns=\"urn:gmonth-types\" month=\"--04Z\" day=\"---20\" marker=\"--02-30Z\"/>");
+        invalidMonthDayLexical->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:gMonthDay value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject invalid xs:gMonthDay lexical values");
+
+    threw = false;
+    try {
+        const auto invalidMonthDayRange = XmlDocument::Parse(
+            "<season xmlns=\"urn:gmonth-types\" month=\"--04Z\" day=\"---20\" marker=\"--04-01Z\"/>");
+        invalidMonthDayRange->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("attribute 'marker'") != std::string::npos
+            && std::string(exception.what()).find("< --04-01Z") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should enforce xs:gMonthDay facets");
+
+    threw = false;
+    try {
+        XmlSchemaSet invalidSchemas;
+        invalidSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:gmonth-types-invalid\" targetNamespace=\"urn:gmonth-types-invalid\">"
+            "  <xs:simpleType name=\"BaseMarker\">"
+            "    <xs:restriction base=\"xs:gMonthDay\">"
+            "      <xs:maxInclusive value=\"--03-31Z\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"InvalidMarker\">"
+            "    <xs:restriction base=\"tns:BaseMarker\">"
+            "      <xs:maxInclusive value=\"--04-01Z\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "</xs:schema>");
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("cannot relax the base maxInclusive facet") != std::string::npos;
+    }
+    Assert(threw, "Schema loading should enforce temporal restriction legality for xs:gMonthDay facets");
+}
+
+void TestXmlSchemaXsiType() {
+    const std::string schemaXml =
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:xsi-type\" targetNamespace=\"urn:xsi-type\">"
+        "  <xs:simpleType name=\"TinyCode\">"
+        "    <xs:restriction base=\"xs:unsignedByte\">"
+        "      <xs:maxInclusive value=\"12\"/>"
+        "    </xs:restriction>"
+        "  </xs:simpleType>"
+        "  <xs:complexType name=\"AnimalType\">"
+        "    <xs:attribute name=\"name\" type=\"xs:token\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"DogType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:AnimalType\">"
+        "        <xs:attribute name=\"breed\" type=\"xs:token\" use=\"required\"/>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"CatType\">"
+        "    <xs:complexContent>"
+        "      <xs:restriction base=\"tns:AnimalType\">"
+        "        <xs:attribute name=\"name\" type=\"xs:token\" use=\"required\"/>"
+        "      </xs:restriction>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"RestrictedAnimalType\" block=\"extension\">"
+        "    <xs:attribute name=\"name\" type=\"xs:token\" use=\"required\"/>"
+        "  </xs:complexType>"
+        "  <xs:complexType name=\"RestrictedDogType\">"
+        "    <xs:complexContent>"
+        "      <xs:extension base=\"tns:RestrictedAnimalType\">"
+        "        <xs:attribute name=\"breed\" type=\"xs:token\" use=\"required\"/>"
+        "      </xs:extension>"
+        "    </xs:complexContent>"
+        "  </xs:complexType>"
+        "  <xs:element name=\"code\" type=\"xs:integer\"/>"
+        "  <xs:element name=\"blockedCode\" type=\"xs:integer\" block=\"restriction\"/>"
+        "  <xs:element name=\"pet\" type=\"tns:AnimalType\"/>"
+        "  <xs:element name=\"strictPet\" type=\"tns:AnimalType\" block=\"extension\"/>"
+        "  <xs:element name=\"baseBlockedPet\" type=\"tns:RestrictedAnimalType\"/>"
+        "</xs:schema>";
+
+    XmlSchemaSet schemas;
+    schemas.AddXml(schemaXml);
+
+    const auto validSimple = XmlDocument::Parse(
+        "<code xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:TinyCode\">12</code>");
+    validSimple->Validate(schemas);
+
+    const auto validComplex = XmlDocument::Parse(
+        "<pet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DogType\" name=\"Fido\" breed=\"collie\"/>");
+    validComplex->Validate(schemas);
+
+    bool threw = false;
+    try {
+        const auto invalidSimpleValue = XmlDocument::Parse(
+            "<code xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:TinyCode\">99</code>");
+        invalidSimpleValue->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("text content of element 'code'") != std::string::npos
+            && std::string(exception.what()).find("<= 12") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply xsi:type simpleType facets to element text");
+
+    threw = false;
+    try {
+        const auto incompatibleType = XmlDocument::Parse(
+            "<code xmlns=\"urn:xsi-type\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xs:string\">12</code>");
+        incompatibleType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must name a type derived from the declared element type") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should reject xsi:type values that are not derived from the declared simple type");
+
+    threw = false;
+    try {
+        const auto blockedRestriction = XmlDocument::Parse(
+            "<blockedCode xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:TinyCode\">7</blockedCode>");
+        blockedRestriction->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("uses blocked restriction derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should honor element block=restriction for xsi:type simpleType derivation");
+
+    threw = false;
+    try {
+        const auto missingDerivedAttribute = XmlDocument::Parse(
+            "<pet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DogType\" name=\"Fido\"/>");
+        missingDerivedAttribute->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("required attribute 'breed'") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should apply xsi:type complexType attribute requirements");
+
+    threw = false;
+    try {
+        const auto blockedExtension = XmlDocument::Parse(
+            "<strictPet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DogType\" name=\"Fido\" breed=\"collie\"/>");
+        blockedExtension->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("uses blocked type derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should honor element block=extension for xsi:type complexType derivation");
+
+    threw = false;
+    try {
+        const auto blockedByComplexType = XmlDocument::Parse(
+            "<baseBlockedPet xmlns=\"urn:xsi-type\" xmlns:tns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:RestrictedDogType\" name=\"Fido\" breed=\"collie\"/>");
+        blockedByComplexType->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("uses blocked type derivation") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should honor complexType@block for xsi:type complexType derivation");
+
+    threw = false;
+    try {
+        const auto invalidTypeQName = XmlDocument::Parse(
+            "<pet xmlns=\"urn:xsi-type\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"bad:DogType\" name=\"Fido\"/>");
+        invalidTypeQName->Validate(schemas);
+    } catch (const XmlException& exception) {
+        threw = std::string(exception.what()).find("must be a valid xs:QName value") != std::string::npos;
+    }
+    Assert(threw, "Schema validation should validate xsi:type as xs:QName");
+
+    {
+        XmlSchemaSet blockDefaultSchemas;
+        blockDefaultSchemas.AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:xsi-type-block-default\" targetNamespace=\"urn:xsi-type-block-default\" blockDefault=\"extension\">"
+            "  <xs:complexType name=\"AnimalType\">"
+            "    <xs:attribute name=\"name\" type=\"xs:token\" use=\"required\"/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"DogType\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:AnimalType\">"
+            "        <xs:attribute name=\"breed\" type=\"xs:token\" use=\"required\"/>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"pet\" type=\"tns:AnimalType\"/>"
+            "</xs:schema>");
+
+        threw = false;
+        try {
+            const auto blockedByDefault = XmlDocument::Parse(
+                "<pet xmlns=\"urn:xsi-type-block-default\" xmlns:tns=\"urn:xsi-type-block-default\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DogType\" name=\"Fido\" breed=\"collie\"/>");
+            blockedByDefault->Validate(blockDefaultSchemas);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("uses blocked type derivation") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should apply schema blockDefault to complexType xsi:type derivation");
+    }
+}
+
+void TestXmlExceptionLineInfo() {
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("</root>");
+        },
+        "Unexpected closing tag: </root>",
+        1,
+        7,
+        "XmlDocument top-level unexpected closing tags should report the same detailed error as XmlReader");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("</root>");
+            while (reader.Read()) {
+            }
+        },
+        "Unexpected closing tag: </root>",
+        1,
+        7,
+        "XmlReader top-level unexpected closing tags should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root>\n  <child>\n</root>");
+        },
+        "Mismatched closing tag. Expected </child> but found </root>",
+        3,
+        7,
+        "XmlDocument mismatched closing tag should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root>\n  <child>\n</root>");
+            while (reader.Read()) {
+            }
+        },
+        "Mismatched closing tag. Expected </child> but found </root>",
+        3,
+        7,
+        "XmlReader mismatched closing tag should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root>\n  &bogus;\n</root>");
+        },
+        "Unknown entity reference: &bogus;",
+        2,
+        10,
+        "XmlDocument unknown entity references should report exact line and column");
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root>\n  &bogus;\n</root>");
+            while (reader.Read()) {
+            }
+        },
+        "Unknown entity reference: &bogus;",
+        2,
+        10,
+        "XmlReader unknown entity references should report exact line and column");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root>\n  <child>");
+        },
+        "Unexpected end of input inside element <child>",
+        2,
+        10,
+        "XmlDocument unexpected end-of-input errors should not include formatting noise");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<?xml version \"1.0\"?><root/>");
+        },
+        "Expected '=' in XML declaration",
+        1,
+        16,
+        "XmlDocument XML declaration parse errors should align with XmlReader messaging and location");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<?xml version \"1.0\"?><root/>");
+            while (reader.Read()) {
+            }
+        },
+        "Expected '=' in XML declaration",
+        1,
+        16,
+        "XmlReader XML declaration parse errors should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root attr \"1\"/>");
+        },
+        "Expected '=' after attribute name",
+        1,
+        13,
+        "XmlDocument attribute parse errors should align with XmlReader messaging and location");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root attr \"1\"/>");
+            while (reader.Read()) {
+            }
+        },
+        "Expected '=' after attribute name",
+        1,
+        13,
+        "XmlReader attribute parse errors should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root></root trailing>");
+        },
+        "Expected '>' after closing tag",
+        1,
+        15,
+        "XmlDocument malformed closing tags should align with XmlReader messaging and location");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root></root trailing>");
+            while (reader.Read()) {
+            }
+        },
+        "Expected '>' after closing tag",
+        1,
+        15,
+        "XmlReader malformed closing tags should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root><?xml version=\"1.0\"?></root>");
+        },
+        "XML declaration is only allowed at the beginning of the document",
+        1,
+        12,
+        "XmlDocument should reject XML declarations that appear inside elements");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root><?xml version=\"1.0\"?></root>");
+            while (reader.Read()) {
+            }
+        },
+        "XML declaration is only allowed at the beginning of the document",
+        1,
+        12,
+        "XmlReader should reject XML declarations that appear inside elements with the same detailed error");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<!--");
+        },
+        "Unterminated comment",
+        1,
+        5,
+        "XmlDocument unterminated comments should report a stable location after the opening marker");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<!--");
+            while (reader.Read()) {
+            }
+        },
+        "Unterminated comment",
+        1,
+        5,
+        "XmlReader unterminated comments should align with XmlDocument location reporting");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root><![CDATA[");
+        },
+        "Unterminated CDATA section",
+        1,
+        16,
+        "XmlDocument unterminated CDATA sections inside elements should report a stable location after the opening marker");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root><![CDATA[");
+            while (reader.Read()) {
+            }
+        },
+        "Unterminated CDATA section",
+        1,
+        16,
+        "XmlReader unterminated CDATA sections inside elements should align with XmlDocument location reporting");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<?pi");
+        },
+        "Unterminated processing instruction",
+        1,
+        5,
+        "XmlDocument unterminated processing instructions should report a stable location after the target");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<?pi");
+            while (reader.Read()) {
+            }
+        },
+        "Unterminated processing instruction",
+        1,
+        5,
+        "XmlReader unterminated processing instructions should preserve exact line, column, and message");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<!foo>");
+        },
+        "Unsupported markup declaration",
+        1,
+        1,
+        "XmlDocument should reject unsupported top-level markup declarations with the same stable error as XmlReader");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<!foo>");
+            while (reader.Read()) {
+            }
+        },
+        "Unsupported markup declaration",
+        1,
+        1,
+        "XmlReader should report a stable error for unsupported top-level markup declarations");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root><!foo></root>");
+        },
+        "Unsupported markup declaration",
+        1,
+        7,
+        "XmlDocument should reject unsupported in-element markup declarations with the same stable error as XmlReader");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root><!foo></root>");
+            while (reader.Read()) {
+            }
+        },
+        "Unsupported markup declaration",
+        1,
+        7,
+        "XmlReader should report a stable error for unsupported in-element markup declarations");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<?xml version=\"1.0\" extra=\"1\"?><root/>");
+        },
+        "Unsupported XML declaration attribute: extra",
+        1,
+        30,
+        "XmlDocument should report exact location for unsupported XML declaration attributes");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<?xml version=\"1.0\" extra=\"1\"?><root/>");
+            while (reader.Read()) {
+            }
+        },
+        "Unsupported XML declaration attribute: extra",
+        1,
+        30,
+        "XmlReader should report exact location for unsupported XML declaration attributes");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<1root/>");
+        },
+        "Invalid XML name",
+        1,
+        2,
+        "XmlDocument should report exact location for invalid element names");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<1root/>");
+            while (reader.Read()) {
+            }
+        },
+        "Invalid XML name",
+        1,
+        2,
+        "XmlReader should report exact location for invalid element names");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root attr=>");
+        },
+        "Expected quoted value",
+        1,
+        13,
+        "XmlDocument should report exact location for missing quoted attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root attr=>");
+            while (reader.Read()) {
+            }
+        },
+        "Expected quoted value",
+        1,
+        13,
+        "XmlReader should report exact location for missing quoted attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root/><extra/>");
+        },
+        "Unexpected content after the root element",
+        1,
+        8,
+        "XmlDocument should reject a second top-level root element with a stable post-root content error");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root/><extra/>");
+            while (reader.Read()) {
+            }
+        },
+        "Unexpected content after the root element",
+        1,
+        8,
+        "XmlReader should reject a second top-level root element with the same stable post-root content error");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<root/><!DOCTYPE extra>");
+        },
+        "DOCTYPE must appear before the root element",
+        1,
+        8,
+        "XmlDocument should reject DOCTYPE declarations after the root element with a stable error");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<root/><!DOCTYPE extra>");
+            while (reader.Read()) {
+            }
+        },
+        "DOCTYPE must appear before the root element",
+        1,
+        8,
+        "XmlReader should reject DOCTYPE declarations after the root element with the same stable error");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<!DOCTYPE root><!DOCTYPE root><root/>");
+        },
+        "XML document can only contain a single DOCTYPE declaration",
+        1,
+        16,
+        "XmlDocument should reject duplicate DOCTYPE declarations with a stable error");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<!DOCTYPE root><!DOCTYPE root><root/>");
+            while (reader.Read()) {
+            }
+        },
+        "XML document can only contain a single DOCTYPE declaration",
+        1,
+        16,
+        "XmlReader should reject duplicate DOCTYPE declarations with the same stable error");
+}
+
+void TestDocumentConfiguration() {
+    XmlDocument trimmedDocument;
+    trimmedDocument.LoadXml("<root>  <child/>  </root>");
+    Assert(trimmedDocument.DocumentElement()->ChildNodeList().Count() == 1,
+        "Whitespace-only child nodes should be omitted when PreserveWhitespace is false");
+
+    XmlDocument preservedDocument;
+    preservedDocument.SetPreserveWhitespace(true);
+    preservedDocument.LoadXml("<root>  <child/>  </root>");
+    Assert(preservedDocument.DocumentElement()->ChildNodeList().Count() == 3,
+        "Whitespace-only child nodes should be preserved when PreserveWhitespace is true");
+    Assert(preservedDocument.DocumentElement()->ChildNodeList().Item(0)->NodeType() == XmlNodeType::Whitespace,
+        "Preserved whitespace should materialize as XmlWhitespace nodes");
+    Assert(preservedDocument.DocumentElement()->ChildNodeList().Item(2)->NodeType() == XmlNodeType::Whitespace,
+        "Trailing preserved whitespace should also materialize as XmlWhitespace nodes");
+}
+
+void TestWhitespaceNodes() {
+    XmlDocument document;
+
+    const auto whitespace = document.CreateWhitespace(" \t ");
+    Assert(whitespace->NodeType() == XmlNodeType::Whitespace, "CreateWhitespace should create Whitespace nodes");
+    Assert(whitespace->Name() == "#whitespace", "Whitespace node name mismatch");
+
+    const auto significant = document.CreateSignificantWhitespace("\r\n");
+    Assert(significant->NodeType() == XmlNodeType::SignificantWhitespace,
+        "CreateSignificantWhitespace should create SignificantWhitespace nodes");
+    Assert(significant->Name() == "#significant-whitespace", "SignificantWhitespace node name mismatch");
+
+    auto root = document.CreateElement("root");
+    document.AppendChild(root);
+    root->AppendChild(document.CreateWhitespace("  "));
+    root->AppendChild(document.CreateElement("child"));
+    root->AppendChild(document.CreateSignificantWhitespace("\n"));
+
+    Assert(root->InnerText() == "  \n", "Whitespace nodes should contribute to InnerText");
+    Assert(root->InnerXml() == "  <child/>\n", "Whitespace nodes should be serialized as text content");
+
+    XmlNodeReader reader(*root);
+    Assert(reader.Read(), "XmlNodeReader should read root element before whitespace children");
+    Assert(reader.Read(), "XmlNodeReader should reach leading whitespace child");
+    Assert(reader.NodeType() == XmlNodeType::Whitespace && reader.Value() == "  ",
+        "XmlNodeReader should expose preserved whitespace nodes");
+
+    bool threw = false;
+    try {
+        (void)document.CreateWhitespace("not whitespace");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "CreateWhitespace should reject non-whitespace content");
+
+    threw = false;
+    try {
+        significant->SetValue("x");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "SignificantWhitespace should reject non-whitespace value changes");
+}
+
+void TestGetElementsByTagName() {
+    const auto document = XmlDocument::Parse(
+        "<root><item id=\"1\"/><group><item id=\"2\"/></group><ns:item id=\"3\"/></root>");
+
+    const auto items = document->GetElementsByTagName("item");
+    Assert(items.size() == 3, "GetElementsByTagName should match local names recursively");
+    Assert(items[1]->GetAttribute("id") == "2", "Recursive tag lookup order mismatch");
+}
+
+void TestDomCollections() {
+    const auto document = XmlDocument::Parse(
+        "<root a=\"1\" b=\"2\"><item/><item id=\"x\"/><other/></root>");
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "Collection test root missing");
+
+    const auto childNodes = root->ChildNodeList();
+    Assert(childNodes.Count() == 3, "ChildNodeList count mismatch");
+    Assert(childNodes.Item(1) != nullptr && childNodes.Item(1)->Name() == "item", "ChildNodeList item lookup mismatch");
+    Assert(childNodes.Item(99) == nullptr, "ChildNodeList out-of-range access should return null");
+
+    const auto attributes = root->AttributeNodes();
+    Assert(attributes.Count() == 2, "Attribute collection count mismatch");
+    Assert(root->HasAttributes(), "HasAttributes should report true when attributes exist");
+    Assert(attributes.Item(0) != nullptr && attributes.Item(0)->Name() == "a", "Attribute collection index lookup mismatch");
+    Assert(attributes.Item("b") != nullptr && attributes.Item("b")->Value() == "2", "Attribute collection name lookup mismatch");
+    Assert(attributes.Item("missing") == nullptr, "Missing named attribute should return null");
+    Assert(attributes.Item("b")->OwnerElement() == root.get(), "Attached attributes should expose their owner element");
+
+    const auto selected = root->SelectNodes("item");
+    Assert(selected.Count() == 2, "SelectNodes should return matching direct child elements");
+    Assert(selected.Item(1) != nullptr && selected.Item(1)->Name() == "item", "SelectNodes ordering mismatch");
+
+    const auto recursive = document->GetElementsByTagNameList("item");
+    Assert(recursive.Count() == 2, "GetElementsByTagNameList should wrap recursive element results");
+}
+
+void TestXPathSelection() {
+    const auto document = XmlDocument::Parse(
+        "<root id=\"r\">"
+        "<group><item id=\"1\"/><item id=\"2\">beta<child/></item></group>"
+        "<group><item/><item id=\"3\"/></group>"
+        "</root>");
+
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "XPath test root missing");
+
+    const auto absolute = document->SelectSingleNode("/root/group/item[@id='2']");
+    Assert(absolute != nullptr && absolute->NodeType() == XmlNodeType::Element,
+        "Absolute XPath should find the requested element");
+    Assert(static_cast<XmlElement*>(absolute.get())->SelectSingleNode("child") != nullptr,
+        "Absolute XPath should return the matching item element");
+
+    const auto descendant = document->SelectNodes("//item");
+    Assert(descendant.Count() == 4, "Descendant XPath should find all matching elements");
+
+    const auto withAttribute = document->SelectNodes("//item[@id]");
+    Assert(withAttribute.Count() == 3, "Attribute-existence predicates should filter matching elements");
+
+    const auto relative = root->SelectNodes("group/item[2]");
+    Assert(relative.Count() == 1, "Relative XPath should honor positional predicates");
+    Assert(relative.Item(0) != nullptr && static_cast<XmlElement*>(relative.Item(0).get())->GetAttribute("id") == "2",
+        "Relative XPath positional result mismatch");
+
+    const auto chained = root->SelectSingleNode("group/item[@id][2]");
+    Assert(chained != nullptr && chained->NodeType() == XmlNodeType::Element,
+        "Chained XPath predicates should be evaluated in order");
+    Assert(static_cast<XmlElement*>(chained.get())->GetAttribute("id") == "2",
+        "Chained XPath predicate result mismatch");
+
+    const auto lastItem = root->SelectSingleNode("group/item[last()]");
+    Assert(lastItem != nullptr && lastItem->NodeType() == XmlNodeType::Element,
+        "last() should select the last node in the current result set");
+    Assert(static_cast<XmlElement*>(lastItem.get())->GetAttribute("id") == "3",
+        "last() result mismatch");
+
+    const auto positioned = root->SelectSingleNode("group/item[position()=2]");
+    Assert(positioned != nullptr && positioned->NodeType() == XmlNodeType::Element,
+        "position()=n should select by 1-based result position");
+    Assert(static_cast<XmlElement*>(positioned.get())->GetAttribute("id") == "2",
+        "position() predicate result mismatch");
+
+    const auto positionedRange = root->SelectNodes("group/item[position()>1]");
+    Assert(positionedRange.Count() == 3,
+        "position() comparisons should support greater-than filters");
+    Assert(positionedRange.Item(0) != nullptr && static_cast<XmlElement*>(positionedRange.Item(0).get())->GetAttribute("id") == "2",
+        "position()>1 first result mismatch");
+
+    const auto arithmeticPositionMatch = root->SelectSingleNode("group/item[position()+2=last()]");
+    Assert(arithmeticPositionMatch != nullptr && arithmeticPositionMatch->NodeType() == XmlNodeType::Element,
+        "last() should participate in arithmetic comparisons");
+    Assert(static_cast<XmlElement*>(arithmeticPositionMatch.get())->GetAttribute("id") == "2",
+        "last()-1 arithmetic predicate result mismatch");
+
+    const auto oddPositions = root->SelectNodes("group/item[position() mod 2 = 1]");
+    Assert(oddPositions.Count() == 2,
+        "position() should participate in modulo expressions");
+    Assert(oddPositions.Item(0) != nullptr && static_cast<XmlElement*>(oddPositions.Item(0).get())->GetAttribute("id") == "1",
+        "position() modulo first result mismatch");
+
+    const auto attribute = document->SelectSingleNode("/root/@id");
+    Assert(attribute != nullptr && attribute->NodeType() == XmlNodeType::Attribute,
+        "Attribute XPath should return attribute nodes");
+    Assert(attribute->Value() == "r", "Attribute XPath value mismatch");
+
+    const auto textNode = document->SelectSingleNode("/root/group/item[@id='2']/text()");
+    Assert(textNode != nullptr && textNode->NodeType() == XmlNodeType::Text,
+        "text() should return text child nodes");
+    Assert(textNode->Value() == "beta", "text() value mismatch");
+
+    const auto textFiltered = document->SelectSingleNode("//item[text()='beta']");
+    Assert(textFiltered != nullptr && textFiltered->NodeType() == XmlNodeType::Element,
+        "text()='value' predicates should match elements by text child content");
+    Assert(static_cast<XmlElement*>(textFiltered.get())->GetAttribute("id") == "2",
+        "text()='value' predicate result mismatch");
+
+    const auto textExists = document->SelectNodes("//item[text()]");
+    Assert(textExists.Count() == 1, "text() predicates should filter to elements with text children");
+
+    const auto childTextDocument = XmlDocument::Parse(
+        "<root><item><title>Alpha</title></item><item id=\"7\"><title>Beta</title></item></root>");
+    const auto childTextMatch = childTextDocument->SelectSingleNode("/root/item[title='Beta']");
+    Assert(childTextMatch != nullptr && childTextMatch->NodeType() == XmlNodeType::Element,
+        "child='value' predicates should match elements by direct child element text");
+    Assert(static_cast<XmlElement*>(childTextMatch.get())->GetAttribute("id") == "7",
+        "child='value' predicate result mismatch");
+
+    const auto nestedChildTextDocument = XmlDocument::Parse(
+        "<root><item><meta><title>Alpha</title></meta></item><item id=\"9\"><meta><title>Beta</title></meta></item></root>");
+    const auto nestedChildMatch = nestedChildTextDocument->SelectSingleNode("/root/item[meta/title='Beta']");
+    Assert(nestedChildMatch != nullptr && nestedChildMatch->NodeType() == XmlNodeType::Element,
+        "child/grand='value' predicates should match elements by nested child path text");
+    Assert(static_cast<XmlElement*>(nestedChildMatch.get())->GetAttribute("id") == "9",
+        "child/grand='value' predicate result mismatch");
+
+    const auto filtered = root->SelectSingleNode("//item[@id='3']");
+    Assert(filtered != nullptr && filtered->NodeType() == XmlNodeType::Element,
+        "Element XPath descendant filter should find matching item");
+
+    const auto compositeAnd = document->SelectSingleNode("//item[@id and starts-with(@id, '2') and contains(text(), 'et')]");
+    Assert(compositeAnd != nullptr && compositeAnd->NodeType() == XmlNodeType::Element,
+        "Composite XPath and-predicates with functions should be supported");
+    Assert(static_cast<XmlElement*>(compositeAnd.get())->GetAttribute("id") == "2",
+        "Composite XPath and-predicate result mismatch");
+
+    const auto compositeOr = document->SelectNodes("//item[@id='1' or @id='3']");
+    Assert(compositeOr.Count() == 2,
+        "Composite XPath or-predicates should preserve all matching branches");
+
+    const auto negated = document->SelectSingleNode("//item[not(@id)]");
+    Assert(negated != nullptr && negated->NodeType() == XmlNodeType::Element,
+        "XPath not() should negate nested predicates");
+    Assert(static_cast<XmlElement*>(negated.get())->GetAttributeNode("id") == nullptr,
+        "XPath not() predicate result mismatch");
+
+    const auto childExistsAndFunction = childTextDocument->SelectSingleNode("/root/item[title and starts-with(title, 'Be')]");
+    Assert(childExistsAndFunction != nullptr && childExistsAndFunction->NodeType() == XmlNodeType::Element,
+        "XPath child existence and string functions should compose inside one predicate");
+    Assert(static_cast<XmlElement*>(childExistsAndFunction.get())->GetAttribute("id") == "7",
+        "XPath child existence/function predicate result mismatch");
+
+    const auto normalizedDocument = XmlDocument::Parse(
+        "<root><item id=\"a\">  spaced   text  </item><item id=\"b\">plain</item></root>");
+    const auto normalizedMatch = normalizedDocument->SelectSingleNode("/root/item[normalize-space(text())='spaced text']");
+    Assert(normalizedMatch != nullptr && normalizedMatch->NodeType() == XmlNodeType::Element,
+        "normalize-space(text()) predicates should compare normalized text content");
+    Assert(static_cast<XmlElement*>(normalizedMatch.get())->GetAttribute("id") == "a",
+        "normalize-space(text()) predicate result mismatch");
+
+    const auto normalizedContains = normalizedDocument->SelectSingleNode("/root/item[contains(normalize-space(.), 'spaced text')]");
+    Assert(normalizedContains != nullptr && normalizedContains->NodeType() == XmlNodeType::Element,
+        "Nested XPath functions should be allowed as contains() arguments");
+    Assert(static_cast<XmlElement*>(normalizedContains.get())->GetAttribute("id") == "a",
+        "Nested function XPath predicate result mismatch");
+
+    const auto lengthMatched = document->SelectNodes("//item[string-length(@id)=1]");
+    Assert(lengthMatched.Count() == 3,
+        "string-length(@attr)=n predicates should match numeric string lengths");
+
+    const auto numericCompared = document->SelectNodes("//item[string-length(@id) > 0 and string-length(@id) <= 1 and @id != '2']");
+    Assert(numericCompared.Count() == 2,
+        "XPath numeric comparisons and != should compose with existing predicates");
+
+    const auto countedRoot = document->SelectSingleNode("/root[count(group)=2 and count(group/item)=4]");
+    Assert(countedRoot != nullptr && countedRoot->NodeType() == XmlNodeType::Element,
+        "count() predicates should support counting child paths");
+
+    const auto substringDocument = XmlDocument::Parse(
+        "<root><item id=\"2\"><title>Beta</title></item><item id=\"31\"><title>Gamma</title></item></root>");
+    const auto substringMatched = substringDocument->SelectSingleNode(
+        "/root/item[substring(@id, 1, 1)='3' and substring-before(title, 'mm')='Ga' and substring-after(title, 'Ga')='mma']");
+    Assert(substringMatched != nullptr && substringMatched->NodeType() == XmlNodeType::Element,
+        "substring(), substring-before(), and substring-after() should be supported in predicates");
+    Assert(static_cast<XmlElement*>(substringMatched.get())->GetAttribute("id") == "31",
+        "substring-family predicate result mismatch");
+}
+
+void TestXPathNamespaces() {
+    const auto document = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\">"
+        "<lib:book meta:id=\"b1\"><lib:title>One</lib:title></lib:book>"
+        "<lib:book meta:id=\"b2\"><lib:title>Two</lib:title></lib:book>"
+        "</lib:catalog>");
+
+    XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("bk", "urn:lib");
+    namespaces.AddNamespace("m", "urn:meta");
+
+    const auto book = document->SelectSingleNode("/bk:catalog/bk:book[@m:id='b2']", namespaces);
+    Assert(book != nullptr && book->NodeType() == XmlNodeType::Element,
+        "Namespace-aware XPath should resolve prefixes through XmlNamespaceManager");
+    Assert(static_cast<XmlElement*>(book.get())->SelectSingleNode("bk:title", namespaces) != nullptr,
+        "Element XPath overload should support namespace-aware child lookup");
+
+    const auto titles = document->SelectNodes("//bk:title", namespaces);
+    Assert(titles.Count() == 2, "Namespace-aware descendant XPath should match by namespace URI");
+
+    Assert(document->SelectSingleNode("//bk:title") == nullptr,
+        "Prefixed XPath names without XmlNamespaceManager should no longer fall back to local-name matching");
+
+    const auto literalPrefixMatch = document->SelectSingleNode("//lib:title");
+    Assert(literalPrefixMatch != nullptr && literalPrefixMatch->NodeType() == XmlNodeType::Element,
+        "Prefixed XPath names without XmlNamespaceManager should still support literal QName matching");
+    Assert(literalPrefixMatch->InnerText() == "One",
+        "Literal QName XPath without XmlNamespaceManager result mismatch");
+
+    const auto literalPrefixWildcard = document->SelectNodes("//lib:*");
+    Assert(literalPrefixWildcard.Count() == 5,
+        "Prefixed wildcard XPath without XmlNamespaceManager should only match nodes with the same literal prefix");
+
+    const auto filteredTitles = document->SelectNodes("//bk:book[@m:id]/bk:title[2]", namespaces);
+    Assert(filteredTitles.Count() == 1, "Namespace-aware chained predicates should be supported");
+    Assert(filteredTitles.Item(0) != nullptr && filteredTitles.Item(0)->InnerText() == "Two",
+        "Namespace-aware chained predicate result mismatch");
+
+    const auto lastTitle = document->SelectSingleNode("//bk:title[last()]", namespaces);
+    Assert(lastTitle != nullptr && lastTitle->InnerText() == "Two",
+        "Namespace-aware last() predicate result mismatch");
+
+    const auto textMatchedTitle = document->SelectSingleNode("//bk:title[text()='Two']", namespaces);
+    Assert(textMatchedTitle != nullptr && textMatchedTitle->NodeType() == XmlNodeType::Element,
+        "Namespace-aware text()='value' predicates should be supported");
+    Assert(textMatchedTitle->InnerText() == "Two", "Namespace-aware text()='value' result mismatch");
+
+    const auto childPredicateBook = document->SelectSingleNode("/bk:catalog/bk:book[bk:title='Two']", namespaces);
+    Assert(childPredicateBook != nullptr && childPredicateBook->NodeType() == XmlNodeType::Element,
+        "Namespace-aware child='value' predicates should be supported");
+    Assert(static_cast<XmlElement*>(childPredicateBook.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(childPredicateBook.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware child='value' predicate result mismatch");
+
+    const auto nestedNamespaceDocument = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\">"
+        "<lib:book meta:id=\"b1\"><lib:meta><lib:title>One</lib:title></lib:meta></lib:book>"
+        "<lib:book meta:id=\"b2\"><lib:meta><lib:title>Two</lib:title></lib:meta></lib:book>"
+        "</lib:catalog>");
+    const auto nestedNamespaceMatch = nestedNamespaceDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[bk:meta/bk:title='Two']",
+        namespaces);
+    Assert(nestedNamespaceMatch != nullptr && nestedNamespaceMatch->NodeType() == XmlNodeType::Element,
+        "Namespace-aware child/grand='value' predicates should be supported");
+    Assert(static_cast<XmlElement*>(nestedNamespaceMatch.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(nestedNamespaceMatch.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware child/grand='value' predicate result mismatch");
+
+    const auto positionedBook = document->SelectSingleNode("/bk:catalog/bk:book[position()=2]", namespaces);
+    Assert(positionedBook != nullptr && positionedBook->NodeType() == XmlNodeType::Element,
+        "Namespace-aware position() predicate should be supported");
+    Assert(static_cast<XmlElement*>(positionedBook.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(positionedBook.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware position() result mismatch");
+
+    const auto positionedNamespaceRange = document->SelectSingleNode("/bk:catalog/bk:book[position()>1]", namespaces);
+    Assert(positionedNamespaceRange != nullptr && positionedNamespaceRange->NodeType() == XmlNodeType::Element,
+        "Namespace-aware position() comparisons should be supported");
+    Assert(static_cast<XmlElement*>(positionedNamespaceRange.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(positionedNamespaceRange.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware position()>1 result mismatch");
+
+    const auto namespaceArithmeticPosition = document->SelectSingleNode("/bk:catalog/bk:book[last()-position()=1]", namespaces);
+    Assert(namespaceArithmeticPosition != nullptr && namespaceArithmeticPosition->NodeType() == XmlNodeType::Element,
+        "Namespace-aware last()/position() arithmetic should be supported");
+    Assert(static_cast<XmlElement*>(namespaceArithmeticPosition.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(namespaceArithmeticPosition.get())->GetAttributeNode("meta:id")->Value() == "b1",
+        "Namespace-aware last()/position() arithmetic result mismatch");
+
+    const auto attribute = document->SelectSingleNode("/bk:catalog/bk:book[1]/@m:id", namespaces);
+    Assert(attribute != nullptr && attribute->NodeType() == XmlNodeType::Attribute,
+        "Namespace-aware XPath should return prefixed attribute nodes");
+    Assert(attribute->Value() == "b1", "Namespace-aware attribute selection mismatch");
+
+    const auto compositeNamespaceBook = document->SelectSingleNode(
+        "/bk:catalog/bk:book[contains(bk:title, 'Tw') and not(@m:id='b1')]",
+        namespaces);
+    Assert(compositeNamespaceBook != nullptr && compositeNamespaceBook->NodeType() == XmlNodeType::Element,
+        "Namespace-aware composite predicates and functions should be supported");
+    Assert(static_cast<XmlElement*>(compositeNamespaceBook.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(compositeNamespaceBook.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware composite predicate result mismatch");
+
+    const auto compositeNamespaceOr = document->SelectNodes(
+        "/bk:catalog/bk:book[@m:id='b1' or starts-with(@m:id, 'b2')]",
+        namespaces);
+    Assert(compositeNamespaceOr.Count() == 2,
+        "Namespace-aware or-predicates should evaluate each branch against prefixed attributes");
+
+    const auto localNameMatch = document->SelectSingleNode("//*[local-name()='title' and namespace-uri()='urn:lib']", namespaces);
+    Assert(localNameMatch != nullptr && localNameMatch->NodeType() == XmlNodeType::Element,
+        "local-name() and namespace-uri() predicates should support wildcard namespace filtering");
+    Assert(localNameMatch->InnerText() == "One",
+        "local-name()/namespace-uri() predicate result mismatch");
+
+    const auto nameMatch = document->SelectSingleNode("//*[name()='lib:title' and string-length(normalize-space(text()))=3]", namespaces);
+    Assert(nameMatch != nullptr && nameMatch->NodeType() == XmlNodeType::Element,
+        "name() and nested string-length(normalize-space()) predicates should be supported");
+    Assert(nameMatch->InnerText() == "One",
+        "name()/string-length(normalize-space()) predicate result mismatch");
+
+    const auto countedNamespaceBook = document->SelectSingleNode(
+        "/bk:catalog[count(bk:book)=2 and count(*)=2]",
+        namespaces);
+    Assert(countedNamespaceBook != nullptr && countedNamespaceBook->NodeType() == XmlNodeType::Element,
+        "count() should work with namespace-qualified child paths and wildcard children");
+
+    const auto substringNamespaceBook = document->SelectSingleNode(
+        "/bk:catalog/bk:book[substring-after(@m:id, 'b')='2' and substring(bk:title, 1, 2)='Tw']",
+        namespaces);
+    Assert(substringNamespaceBook != nullptr && substringNamespaceBook->NodeType() == XmlNodeType::Element,
+        "Namespace-aware substring predicates should be supported");
+    Assert(static_cast<XmlElement*>(substringNamespaceBook.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(substringNamespaceBook.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware substring predicate result mismatch");
+
+    AssertXmlExceptionMessage(
+        [&] {
+            (void)document->SelectNodes("//missing:title", namespaces);
+        },
+        "Undefined XPath namespace prefix: missing",
+        "Undefined XPath namespace prefixes should report a stable XmlException");
+}
+
+void TestXPathBoundaries() {
+    const auto document = XmlDocument::Parse(
+        "<root id=\"r\">"
+        "<group data=\"g1\"><item id=\"1\">alpha<title>A</title></item><item id=\"2\">beta</item></group>"
+        "<group data=\"g2\"><item>gamma</item></group>"
+        "</root>");
+
+    const auto allElements = document->SelectNodes("//*");
+    Assert(allElements.Count() == 7,
+        "Wildcard descendant XPath should return all element nodes below the document root");
+
+    const auto allAttributes = document->SelectNodes("//@*");
+    Assert(allAttributes.Count() == 5,
+        "Descendant attribute wildcard XPath should return all attributes in document order");
+    Assert(allAttributes.Item(0) != nullptr && allAttributes.Item(0)->NodeType() == XmlNodeType::Attribute
+            && allAttributes.Item(0)->Name() == "id" && allAttributes.Item(0)->Value() == "r",
+        "Descendant attribute wildcard XPath first result mismatch");
+
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "XPath boundary root missing");
+
+    const auto self = root->SelectSingleNode(".");
+    Assert(self != nullptr && self->NodeType() == XmlNodeType::Element,
+        "Self XPath should return the current element");
+    Assert(self.get() == root.get(),
+        "Self XPath should preserve the current element identity");
+
+    const auto selfDescendant = root->SelectNodes(".//item");
+    Assert(selfDescendant.Count() == 3,
+        "Self-plus-descendant XPath should search from the current element context");
+
+    const auto absoluteFromElement = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("group/item[@id='2']"));
+    Assert(absoluteFromElement != nullptr,
+        "Relative XPath from an element context should locate matching descendants");
+    const auto absoluteQueryFromElement = absoluteFromElement->SelectSingleNode("/root/group/item[@id='2']");
+    Assert(absoluteQueryFromElement != nullptr && absoluteQueryFromElement->NodeType() == XmlNodeType::Element,
+        "Absolute XPath from an attached element context should evaluate against the owner document");
+    Assert(static_cast<XmlElement*>(absoluteQueryFromElement.get())->GetAttribute("id") == "2",
+        "Absolute XPath from element context result mismatch");
+
+    const auto countedAttributes = document->SelectSingleNode("/root/group[count(@*)=1 and count(item)=2]");
+    Assert(countedAttributes != nullptr && countedAttributes->NodeType() == XmlNodeType::Element,
+        "count(@*) and count(child) predicates should be supported together");
+    Assert(static_cast<XmlElement*>(countedAttributes.get())->GetAttribute("data") == "g1",
+        "count(@*) predicate result mismatch");
+
+    const auto countedText = document->SelectSingleNode("/root/group/item[count(text())=1 and text()='alpha']");
+    Assert(countedText != nullptr && countedText->NodeType() == XmlNodeType::Element,
+        "count(text()) predicates should count text child nodes");
+    Assert(static_cast<XmlElement*>(countedText.get())->GetAttribute("id") == "1",
+        "count(text()) predicate result mismatch");
+
+    const auto normalizedNoArgument = document->SelectSingleNode("/root/group/item[normalize-space()='beta']");
+    Assert(normalizedNoArgument != nullptr && normalizedNoArgument->NodeType() == XmlNodeType::Element,
+        "normalize-space() without arguments should use the context node string value");
+    Assert(static_cast<XmlElement*>(normalizedNoArgument.get())->GetAttribute("id") == "2",
+        "normalize-space() without arguments result mismatch");
+
+    const auto stringLengthNoArgument = document->SelectSingleNode("/root/group/item[string-length()=4 and text()='beta']");
+    Assert(stringLengthNoArgument != nullptr && stringLengthNoArgument->NodeType() == XmlNodeType::Element,
+        "string-length() without arguments should use the context node string value");
+    Assert(static_cast<XmlElement*>(stringLengthNoArgument.get())->GetAttribute("id") == "2",
+        "string-length() without arguments result mismatch");
+
+    const auto namespaceDocument = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\">"
+        "<lib:book meta:id=\"b1\"><lib:title>One</lib:title></lib:book>"
+        "<lib:book meta:id=\"b2\"><lib:title>Two</lib:title></lib:book>"
+        "</lib:catalog>");
+    XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("bk", "urn:lib");
+    namespaces.AddNamespace("m", "urn:meta");
+
+    const auto namespaceWildcard = namespaceDocument->SelectNodes("//bk:*", namespaces);
+    Assert(namespaceWildcard.Count() == 5,
+        "Namespace wildcard XPath should match all elements in the resolved namespace");
+
+    const auto namespaceAttributeWildcard = namespaceDocument->SelectNodes("//@m:*", namespaces);
+    Assert(namespaceAttributeWildcard.Count() == 2,
+        "Namespace wildcard attribute XPath should match all attributes in the resolved namespace");
+
+    const auto defaultNamespaceDocument = XmlDocument::Parse(
+        "<catalog xmlns=\"urn:catalog\" id=\"root\">"
+        "<book id=\"b1\"><title>One</title></book>"
+        "<book id=\"b2\"><title>Two</title></book>"
+        "</catalog>");
+    XmlNamespaceManager defaultNamespaces;
+    defaultNamespaces.AddNamespace("d", "urn:catalog");
+
+    Assert(defaultNamespaceDocument->SelectSingleNode("/catalog/book", defaultNamespaces) == nullptr,
+        "Unprefixed XPath names should not match elements in the default namespace when a namespace manager is provided");
+
+    const auto defaultNamespaceBook = defaultNamespaceDocument->SelectSingleNode("/d:catalog/d:book[@id='b2']", defaultNamespaces);
+    Assert(defaultNamespaceBook != nullptr && defaultNamespaceBook->NodeType() == XmlNodeType::Element,
+        "Prefixed XPath names should resolve against the default element namespace through XmlNamespaceManager");
+    Assert(static_cast<XmlElement*>(defaultNamespaceBook.get())->GetAttribute("id") == "b2",
+        "Default-namespace XPath result mismatch");
+
+    const auto defaultNamespaceAttribute = defaultNamespaceDocument->SelectSingleNode("/d:catalog/@id", defaultNamespaces);
+    Assert(defaultNamespaceAttribute != nullptr && defaultNamespaceAttribute->NodeType() == XmlNodeType::Attribute,
+        "Unprefixed attribute XPath should still match empty-namespace attributes on default-namespace elements");
+    Assert(defaultNamespaceAttribute->Value() == "root",
+        "Default-namespace attribute XPath value mismatch");
+
+    const auto mixedPrefixDocument = XmlDocument::Parse(
+        "<root xmlns:lib=\"urn:lib\" xmlns:alt=\"urn:lib\">"
+        "<lib:title>One</lib:title>"
+        "<alt:title>Two</alt:title>"
+        "</root>");
+    const auto literalLibWildcard = mixedPrefixDocument->SelectNodes("//lib:*");
+    Assert(literalLibWildcard.Count() == 1,
+        "Prefixed wildcard XPath without XmlNamespaceManager should not match different literal prefixes sharing the same namespace URI");
+}
+
+void TestXPathHighFrequencyFunctions() {
+    const auto document = XmlDocument::Parse(
+        "<root flag=\"1\" xml:lang=\"en-US\">"
+        "<item id=\"2\" price=\"10\"><title>Alpha</title><code>A-2</code><amount>10</amount></item>"
+        "<item id=\"7\" price=\"20\" xml:lang=\"fr\"><title>Beta</title><code>B-7</code><amount>20</amount></item>"
+        "<item id=\"0\" price=\"0\"><title></title><code>Z-0</code><amount>0</amount></item>"
+        "<empty/>"
+        "</root>");
+
+    const auto trueMatch = document->SelectNodes("/root/item[true()]");
+    Assert(trueMatch.Count() == 3,
+        "true() should keep all matching nodes in predicate context");
+
+    const auto falseMatch = document->SelectSingleNode("/root/item[false()]");
+    Assert(falseMatch == nullptr,
+        "false() should filter out all nodes in predicate context");
+
+    const auto booleanMatch = document->SelectNodes("/root/item[boolean(@id)]");
+    Assert(booleanMatch.Count() == 3,
+        "boolean(@id) should treat a non-empty attribute node-set as true");
+
+    const auto booleanNumericFalse = document->SelectSingleNode("/root/item[boolean(number(@price)) and @id='0']");
+    Assert(booleanNumericFalse == nullptr,
+        "boolean(number(@price)) should treat numeric zero as false");
+
+    const auto stringMatch = document->SelectSingleNode("/root/item[string(title)='Beta']");
+    Assert(stringMatch != nullptr && stringMatch->NodeType() == XmlNodeType::Element,
+        "string(title) should coerce the child node-set to its string value");
+    Assert(static_cast<XmlElement*>(stringMatch.get())->GetAttribute("id") == "7",
+        "string(title) predicate result mismatch");
+
+    const auto numberMatch = document->SelectSingleNode("/root/item[number(@price) >= 20]");
+    Assert(numberMatch != nullptr && numberMatch->NodeType() == XmlNodeType::Element,
+        "number(@price) should support numeric comparisons");
+    Assert(static_cast<XmlElement*>(numberMatch.get())->GetAttribute("id") == "7",
+        "number(@price) predicate result mismatch");
+
+    const auto langInheritedMatch = document->SelectSingleNode("/root/item[lang('en') and @id='2']");
+    Assert(langInheritedMatch != nullptr && langInheritedMatch->NodeType() == XmlNodeType::Element,
+        "lang() should inherit xml:lang from ancestors");
+    Assert(static_cast<XmlElement*>(langInheritedMatch.get())->GetAttribute("id") == "2",
+        "lang() inherited predicate result mismatch");
+
+    const auto langLocalMatch = document->SelectSingleNode("/root/item[lang('fr')]");
+    Assert(langLocalMatch != nullptr && langLocalMatch->NodeType() == XmlNodeType::Element,
+        "lang() should match element-local xml:lang values");
+    Assert(static_cast<XmlElement*>(langLocalMatch.get())->GetAttribute("id") == "7",
+        "lang() local predicate result mismatch");
+
+    const auto concatMatch = document->SelectSingleNode("/root/item[concat(@id, '-', title)='2-Alpha']");
+    Assert(concatMatch != nullptr && concatMatch->NodeType() == XmlNodeType::Element,
+        "concat(@id, '-', title) should be supported inside predicates");
+    Assert(static_cast<XmlElement*>(concatMatch.get())->GetAttribute("id") == "2",
+        "concat() predicate result mismatch");
+
+    const auto sumMatch = document->SelectSingleNode("/root[sum(item/amount)=30]");
+    Assert(sumMatch != nullptr && sumMatch->NodeType() == XmlNodeType::Element,
+        "sum(item/amount) should aggregate child element numeric values");
+
+    const auto translateMatch = document->SelectSingleNode("/root/item[translate(code, 'ABZ', 'abz')='a-2']");
+    Assert(translateMatch != nullptr && translateMatch->NodeType() == XmlNodeType::Element,
+        "translate() should support character remapping inside predicates");
+    Assert(static_cast<XmlElement*>(translateMatch.get())->GetAttribute("id") == "2",
+        "translate() predicate result mismatch");
+
+    const auto floorMatch = document->SelectSingleNode("/root/item[floor('2.9') = number(@id)]");
+    Assert(floorMatch != nullptr && floorMatch->NodeType() == XmlNodeType::Element,
+        "floor() should support numeric coercion inside predicates");
+    Assert(static_cast<XmlElement*>(floorMatch.get())->GetAttribute("id") == "2",
+        "floor() predicate result mismatch");
+
+    const auto ceilingMatch = document->SelectSingleNode("/root/item[ceiling('6.1') = number(@id)]");
+    Assert(ceilingMatch != nullptr && ceilingMatch->NodeType() == XmlNodeType::Element,
+        "ceiling() should support numeric coercion inside predicates");
+    Assert(static_cast<XmlElement*>(ceilingMatch.get())->GetAttribute("id") == "7",
+        "ceiling() predicate result mismatch");
+
+    const auto roundMatch = document->SelectSingleNode("/root/item[round('6.5') = number(@id)]");
+    Assert(roundMatch != nullptr && roundMatch->NodeType() == XmlNodeType::Element,
+        "round() should support XPath-style half-up numeric coercion inside predicates");
+    Assert(static_cast<XmlElement*>(roundMatch.get())->GetAttribute("id") == "7",
+        "round() predicate result mismatch");
+
+    const auto negativeHalfRoundMatch = document->SelectSingleNode("/root/item[round('-0.5') = number(@id)]");
+    Assert(negativeHalfRoundMatch != nullptr && negativeHalfRoundMatch->NodeType() == XmlNodeType::Element,
+        "round() should round negative halves toward positive infinity per XPath semantics");
+    Assert(static_cast<XmlElement*>(negativeHalfRoundMatch.get())->GetAttribute("id") == "0",
+        "round() negative-half predicate result mismatch");
+
+    const auto additiveMatch = document->SelectSingleNode("/root/item[number(@price) + 10 = 30]");
+    Assert(additiveMatch != nullptr && additiveMatch->NodeType() == XmlNodeType::Element,
+        "Addition expressions should participate in numeric comparisons");
+    Assert(static_cast<XmlElement*>(additiveMatch.get())->GetAttribute("id") == "7",
+        "Addition expression predicate result mismatch");
+
+    const auto subtractMatch = document->SelectSingleNode("/root/item[number(@price) - 8 = number(@id)]");
+    Assert(subtractMatch != nullptr && subtractMatch->NodeType() == XmlNodeType::Element,
+        "Subtraction expressions should participate in numeric comparisons");
+    Assert(static_cast<XmlElement*>(subtractMatch.get())->GetAttribute("id") == "2",
+        "Subtraction expression predicate result mismatch");
+
+    const auto multiplyMatch = document->SelectSingleNode("/root/item[number(@id) * 5 = number(@price)]");
+    Assert(multiplyMatch != nullptr && multiplyMatch->NodeType() == XmlNodeType::Element,
+        "Multiplication expressions should participate in numeric comparisons");
+    Assert(static_cast<XmlElement*>(multiplyMatch.get())->GetAttribute("id") == "2",
+        "Multiplication expression predicate result mismatch");
+
+    const auto divideMatch = document->SelectSingleNode("/root/item[number(@price) div 10 = 2]");
+    Assert(divideMatch != nullptr && divideMatch->NodeType() == XmlNodeType::Element,
+        "div expressions should participate in numeric comparisons");
+    Assert(static_cast<XmlElement*>(divideMatch.get())->GetAttribute("id") == "7",
+        "div expression predicate result mismatch");
+
+    const auto moduloMatch = document->SelectSingleNode("/root/item[number(@price) mod 10 = 0 and @id='7']");
+    Assert(moduloMatch != nullptr && moduloMatch->NodeType() == XmlNodeType::Element,
+        "mod expressions should participate in numeric comparisons and boolean combinations");
+    Assert(static_cast<XmlElement*>(moduloMatch.get())->GetAttribute("id") == "7",
+        "mod expression predicate result mismatch");
+
+    const auto nodeSetStringComparison = document->SelectSingleNode("/root/item[code = concat(substring(title, 1, 1), '-', string(@id))]");
+    Assert(nodeSetStringComparison != nullptr && nodeSetStringComparison->NodeType() == XmlNodeType::Element,
+        "Node-set and string expression comparisons should be supported");
+    Assert(static_cast<XmlElement*>(nodeSetStringComparison.get())->GetAttribute("id") == "2",
+        "Node-set/string comparison result mismatch");
+
+    const auto nodeSetNumberComparison = document->SelectSingleNode("/root/item[@price = number(concat('2', '0'))]");
+    Assert(nodeSetNumberComparison != nullptr && nodeSetNumberComparison->NodeType() == XmlNodeType::Element,
+        "Node-set and numeric expression comparisons should be supported");
+    Assert(static_cast<XmlElement*>(nodeSetNumberComparison.get())->GetAttribute("id") == "7",
+        "Node-set/number comparison result mismatch");
+
+    const auto booleanStringContext = document->SelectSingleNode("/root/item[string(title)]");
+    Assert(booleanStringContext != nullptr && booleanStringContext->NodeType() == XmlNodeType::Element,
+        "string(title) should participate in boolean predicate context");
+    Assert(static_cast<XmlElement*>(booleanStringContext.get())->GetAttribute("id") == "2",
+        "string(title) boolean context result mismatch");
+
+    const auto pathArgumentDocument = XmlDocument::Parse(
+        "<root>"
+        "<item><meta id=\"m1\">Alpha</meta></item>"
+        "<item id=\"7\"><meta id=\"m2\">Beta</meta></item>"
+        "</root>");
+    const auto pathArgumentMatch = pathArgumentDocument->SelectSingleNode("/root/item[meta/@id='m2' and meta/text()='Beta' and count(.)=1]");
+    Assert(pathArgumentMatch != nullptr && pathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Function and predicate arguments should support terminal attribute/text() paths plus count(.)");
+    Assert(static_cast<XmlElement*>(pathArgumentMatch.get())->GetAttribute("id") == "7",
+        "Predicate path terminal attribute/text() result mismatch");
+
+    const auto namespacedDocument = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\" xml:lang=\"en\">"
+        "<lib:book meta:id=\"b1\" meta:rank=\"1\"><lib:title>One</lib:title><lib:code>O-b1</lib:code><lib:amount>1</lib:amount></lib:book>"
+        "<lib:book meta:id=\"b2\" meta:rank=\"2\" xml:lang=\"fr-CA\"><lib:title>Two</lib:title><lib:code>T-b2</lib:code><lib:amount>2</lib:amount></lib:book>"
+        "</lib:catalog>");
+    XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("bk", "urn:lib");
+    namespaces.AddNamespace("m", "urn:meta");
+
+    const auto namespacedBoolean = namespacedDocument->SelectSingleNode("/bk:catalog/bk:book[boolean(@m:id) and number(@m:rank)=2]", namespaces);
+    Assert(namespacedBoolean != nullptr && namespacedBoolean->NodeType() == XmlNodeType::Element,
+        "boolean() and number() should compose in namespace-aware predicates");
+    Assert(static_cast<XmlElement*>(namespacedBoolean.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware boolean()/number() predicate result mismatch");
+
+    const auto namespacedConcat = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[contains(concat(string(bk:title), '-', string(@m:id)), 'Two-b2')]",
+        namespaces);
+    Assert(namespacedConcat != nullptr && namespacedConcat->NodeType() == XmlNodeType::Element,
+        "concat() should compose with contains() in namespace-aware predicates");
+    Assert(static_cast<XmlElement*>(namespacedConcat.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware concat()/contains() predicate result mismatch");
+
+    const auto namespacedComparison = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[bk:code = concat(substring(bk:title, 1, 1), '-', string(@m:id))]",
+        namespaces);
+    Assert(namespacedComparison != nullptr && namespacedComparison->NodeType() == XmlNodeType::Element,
+        "Node-set and string expression comparisons should work in namespace-aware predicates");
+    Assert(static_cast<XmlElement*>(namespacedComparison.get())->GetAttribute("meta:id") == "b1",
+        "Namespace-aware node-set/string comparison result mismatch");
+
+    const auto namespacedSum = namespacedDocument->SelectSingleNode(
+        "/bk:catalog[sum(bk:book/bk:amount)=3]",
+        namespaces);
+    Assert(namespacedSum != nullptr && namespacedSum->NodeType() == XmlNodeType::Element,
+        "sum() should work with namespace-aware child paths");
+
+    const auto namespacedTranslate = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[contains(translate(string(bk:title), 'Two', 'two'), 'two') and round(@m:rank)=2]",
+        namespaces);
+    Assert(namespacedTranslate != nullptr && namespacedTranslate->NodeType() == XmlNodeType::Element,
+        "translate() and round() should compose inside namespace-aware predicates");
+    Assert(static_cast<XmlElement*>(namespacedTranslate.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware translate()/round() predicate result mismatch");
+
+    const auto namespacedFloorCeiling = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[floor('1.8') = 1 and ceiling('1.2') = 2 and @m:id='b1']",
+        namespaces);
+    Assert(namespacedFloorCeiling != nullptr && namespacedFloorCeiling->NodeType() == XmlNodeType::Element,
+        "floor() and ceiling() should participate in namespace-aware combination predicates");
+    Assert(static_cast<XmlElement*>(namespacedFloorCeiling.get())->GetAttribute("meta:id") == "b1",
+        "Namespace-aware floor()/ceiling() predicate result mismatch");
+
+    const auto namespacedLang = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[lang('fr') and true() and number(@m:rank) + 1 = 3]",
+        namespaces);
+    Assert(namespacedLang != nullptr && namespacedLang->NodeType() == XmlNodeType::Element,
+        "lang(), true(), and additive expressions should compose in namespace-aware predicates");
+    Assert(static_cast<XmlElement*>(namespacedLang.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware lang()/additive predicate result mismatch");
+
+    const auto namespacedArithmetic = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[number(@m:rank) * 2 = 2 and false() = false() and @m:id='b1']",
+        namespaces);
+    Assert(namespacedArithmetic != nullptr && namespacedArithmetic->NodeType() == XmlNodeType::Element,
+        "Arithmetic expressions and boolean constants should work in namespace-aware comparisons");
+    Assert(static_cast<XmlElement*>(namespacedArithmetic.get())->GetAttribute("meta:id") == "b1",
+        "Namespace-aware arithmetic/boolean-constant predicate result mismatch");
+
+    const auto namespacedPathArgumentDocument = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\">"
+        "<lib:book meta:id=\"b1\"><lib:meta meta:slot=\"s1\"><lib:title>One</lib:title></lib:meta></lib:book>"
+        "<lib:book meta:id=\"b2\"><lib:meta meta:slot=\"s2\"><lib:title>Two</lib:title></lib:meta></lib:book>"
+        "</lib:catalog>");
+    const auto namespacedPathArgument = namespacedPathArgumentDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[bk:meta/@m:slot='s2' and bk:meta/bk:title/text()='Two' and count(.)=1]",
+        namespaces);
+    Assert(namespacedPathArgument != nullptr && namespacedPathArgument->NodeType() == XmlNodeType::Element,
+        "Namespace-aware predicate paths should support terminal attribute/text() segments plus count(.)");
+    Assert(static_cast<XmlElement*>(namespacedPathArgument.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware predicate path terminal attribute/text() result mismatch");
+}
+
+void TestInvalidXPathInputs() {
+    const auto document = XmlDocument::Parse("<root><item id=\"1\">alpha</item><item id=\"2\">beta</item></root>");
+
+    auto expectXPathExceptionMessage = [&](const std::string& xpath, const std::string& expectedMessage, const std::string& label) {
+        AssertXmlExceptionMessage(
+            [&] {
+                (void)document->SelectNodes(xpath);
+            },
+            expectedMessage,
+            label);
+    };
+
+    expectXPathExceptionMessage(
+        {},
+        "XPath expression cannot be empty",
+        "Empty XPath expressions should throw a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[",
+        "Invalid XPath predicate: item[",
+        "Unterminated XPath predicates should throw a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[contains(text())]",
+        "Unsupported XPath feature: predicate [contains(text())]",
+        "XPath functions with missing arguments should throw a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[boolean(@id, @id)]",
+        "Unsupported XPath feature: predicate [boolean(@id, @id)]",
+        "XPath functions with too many arguments should throw a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[substring('abc')='a']",
+        "Unsupported XPath feature: predicate [substring('abc')]",
+        "XPath functions with too few required arguments should throw a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[contains('a', 'b', 'c')]",
+        "Unsupported XPath feature: predicate [contains('a', 'b', 'c')]",
+        "XPath predicate functions should reject extra arguments with a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[meta/../id='x']",
+        "Unsupported XPath feature: predicate path [meta/../id]",
+        "Unsupported parent-axis style predicate paths should throw a stable XmlException");
+
+    expectXPathExceptionMessage(
+        "/root/item[meta/text()/id='x']",
+        "Unsupported XPath feature: predicate path [meta/text()/id]",
+        "Unsupported predicate paths with non-terminal text() should throw a stable XmlException");
+}
+
+void TestXPathErrorBoundaries() {
+    const auto document = XmlDocument::Parse("<root><item id=\"1\">alpha</item></root>");
+
+    AssertXmlExceptionMessage(
+        [&] {
+            (void)document->SelectNodes("/root/item[");
+        },
+        "Invalid XPath predicate: item[",
+        "XPath predicate parse failures should report the invalid-predicate category");
+
+    AssertXmlExceptionMessage(
+        [&] {
+            (void)document->SelectNodes("/root/item[contains(text())]");
+        },
+        "Unsupported XPath feature: predicate [contains(text())]",
+        "Unsupported XPath predicate operators should report the unsupported-feature category");
+
+    AssertXmlExceptionMessage(
+        [&] {
+            (void)document->SelectNodes("/root/item[boolean(@id, @id)]");
+        },
+        "Unsupported XPath feature: predicate [boolean(@id, @id)]",
+        "Unsupported XPath function arity should report the unsupported-feature category");
+
+    AssertXmlExceptionMessage(
+        [&] {
+            (void)document->SelectNodes("/root/item[meta/text()/id='x']");
+        },
+        "Unsupported XPath feature: predicate path [meta/text()/id]",
+        "Unsupported XPath path shapes should report the unsupported-feature category");
+
+    XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("ok", "urn:ok");
+    AssertXmlExceptionMessage(
+        [&] {
+            (void)document->SelectNodes("//missing:item", namespaces);
+        },
+        "Undefined XPath namespace prefix: missing",
+        "Undefined XPath prefixes should report the namespace-prefix category");
+}
+
+void TestDomEditing() {
+    XmlDocument document;
+    auto root = document.CreateElement("root");
+    auto first = document.CreateElement("first");
+    auto second = document.CreateElement("second");
+    auto third = document.CreateElement("third");
+    root->AppendChild(first);
+    root->AppendChild(third);
+    root->InsertAfter(second, first);
+    document.AppendChild(root);
+
+    Assert(first->NextSibling() == second, "NextSibling should return the following node");
+    Assert(second->PreviousSibling() == first, "PreviousSibling should return the preceding node");
+    Assert(second->NextSibling() == third, "Inserted node should be linked into sibling chain");
+
+    auto replacement = document.CreateElement("replacement");
+    const auto replaced = root->ReplaceChild(replacement, second);
+    Assert(replaced == second, "ReplaceChild should return the replaced node");
+    Assert(second->ParentNode() == nullptr, "Replaced node should be detached");
+    Assert(replacement->PreviousSibling() == first, "Replacement should preserve sibling position");
+
+    const auto removed = root->RemoveChild(first);
+    Assert(removed == first, "RemoveChild should return the removed node");
+    Assert(first->ParentNode() == nullptr, "Removed child should be detached");
+    Assert(root->FirstChild() == replacement, "Remaining first child mismatch after removal");
+
+    root->InsertBefore(document.CreateElement("head"), root->FirstChild());
+    Assert(root->FirstChild()->Name() == "head", "InsertBefore should place node ahead of reference child");
+
+    root->SetAttribute("a", "1");
+    root->SetAttribute("b", "2");
+    Assert(root->RemoveAttribute("a"), "RemoveAttribute should report success for existing attribute");
+    Assert(!root->HasAttribute("a"), "Removed attribute should disappear from the element");
+    const auto removedAttribute = root->RemoveAttributeNode(root->GetAttributeNode("b"));
+    Assert(removedAttribute != nullptr && removedAttribute->Name() == "b", "RemoveAttributeNode should return removed attribute");
+    Assert(removedAttribute != nullptr && removedAttribute->OwnerElement() == nullptr,
+        "Removed attributes should detach from their owner element");
+    root->SetAttribute("c", "3");
+    root->SetAttribute("d", "4");
+    root->RemoveAllAttributes();
+    Assert(!root->HasAttributes(), "HasAttributes should report false after clearing attributes");
+    Assert(root->AttributeNodes().Empty(), "RemoveAllAttributes should clear all attributes");
+
+    auto replacementAttribute = document.CreateAttribute("slot", "1");
+    Assert(root->SetAttributeNode(replacementAttribute) == nullptr,
+        "SetAttributeNode should return null when no attribute is replaced");
+    Assert(replacementAttribute->OwnerElement() == root.get(),
+        "SetAttributeNode should attach detached attributes to the element");
+
+    auto secondAttribute = document.CreateAttribute("slot", "2");
+    const auto replacedAttribute = root->SetAttributeNode(secondAttribute);
+    Assert(replacedAttribute == replacementAttribute,
+        "SetAttributeNode should return the replaced attribute with the same name");
+    Assert(replacedAttribute->OwnerElement() == nullptr,
+        "Replaced attributes should be detached from the element");
+    Assert(root->GetAttributeNode("slot") == secondAttribute,
+        "SetAttributeNode should replace the live attribute node");
+
+    bool attributeAttachThrew = false;
+    XmlDocument otherDocument;
+    auto foreignAttribute = otherDocument.CreateAttribute("foreign", "x");
+    try {
+        (void)root->SetAttributeNode(foreignAttribute);
+    } catch (const XmlException&) {
+        attributeAttachThrew = true;
+    }
+    Assert(attributeAttachThrew, "SetAttributeNode should reject attributes from another document");
+
+    auto fragment = document.CreateDocumentFragment();
+    fragment->SetInnerXml("<frag-a/>before<frag-b/><!--tail-->");
+    root->AppendChild(fragment);
+    Assert(fragment->ChildNodeList().Empty(), "Appending a document fragment should consume its children");
+    Assert(root->LastChild() != nullptr && root->LastChild()->Name() == "#comment",
+        "Appending a parsed document fragment should preserve trailing nodes");
+    Assert(root->ChildNodeList().Item(root->ChildNodeList().Count() - 4) != nullptr
+            && root->ChildNodeList().Item(root->ChildNodeList().Count() - 4)->Name() == "frag-a",
+        "Appending a parsed document fragment should preserve child order");
+    Assert(root->ChildNodeList().Item(root->ChildNodeList().Count() - 3) != nullptr
+            && root->ChildNodeList().Item(root->ChildNodeList().Count() - 3)->Name() == "#text",
+        "Appending a parsed document fragment should preserve text nodes");
+    Assert(root->ChildNodeList().Item(root->ChildNodeList().Count() - 2) != nullptr
+            && root->ChildNodeList().Item(root->ChildNodeList().Count() - 2)->Name() == "frag-b",
+        "Appending a parsed document fragment should preserve second element order");
+    Assert(root->ChildNodeList().Item(root->ChildNodeList().Count() - 1) != nullptr
+            && root->ChildNodeList().Item(root->ChildNodeList().Count() - 1)->Name() == "#comment",
+        "Appending a document fragment should append its children in order");
+
+    auto replacementFragment = document.CreateDocumentFragment();
+    replacementFragment->AppendChild(document.CreateElement("mid-a"));
+    replacementFragment->AppendChild(document.CreateElement("mid-b"));
+    const auto replacedNode = root->ReplaceChild(replacementFragment, replacement);
+    Assert(replacedNode == replacement, "Replacing with a fragment should return the original child");
+    Assert(root->ChildNodeList().Count() >= 3, "Replacing with a fragment should expand to multiple nodes");
+    Assert(root->ChildNodeList().Item(1) != nullptr && root->ChildNodeList().Item(1)->Name() == "mid-a",
+        "Fragment replacement should preserve insertion position");
+    Assert(root->ChildNodeList().Item(2) != nullptr && root->ChildNodeList().Item(2)->Name() == "mid-b",
+        "Fragment replacement should preserve fragment child order");
+
+    root->SetInnerXml("<inner/>text<!--tail-->");
+    Assert(root->ChildNodeList().Count() == 3, "SetInnerXml should replace existing child nodes");
+    Assert(root->FirstChild() != nullptr && root->FirstChild()->Name() == "inner",
+        "SetInnerXml should insert parsed element children");
+    Assert(root->ChildNodeList().Item(1) != nullptr && root->ChildNodeList().Item(1)->Name() == "#text",
+        "SetInnerXml should preserve text children");
+    Assert(root->LastChild() != nullptr && root->LastChild()->Name() == "#comment",
+        "SetInnerXml should preserve comment children");
+    Assert(root->InnerText() == "text", "SetInnerXml text content mismatch");
+
+    bool threw = false;
+    try {
+        auto invalidFragment = document.CreateDocumentFragment();
+        invalidFragment->SetInnerXml("<?xml version=\"1.0\"?><x/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Document fragments should reject embedded XML declarations");
+
+    threw = false;
+    try {
+        root->SetInnerXml("<?xml version=\"1.0\"?><x/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Elements should reject embedded XML declarations in SetInnerXml");
+
+    root->SetAttribute("keep", "1");
+    root->AppendChild(document.CreateElement("tail"));
+    root->RemoveAll();
+    Assert(root->AttributeNodes().Empty(), "RemoveAll should clear element attributes");
+    Assert(!root->HasChildNodes(), "RemoveAll should clear element child nodes");
+}
+
+void TestDocumentEditingConstraints() {
+    XmlDocument document;
+    document.AppendChild(document.CreateElement("root"));
+
+    bool threw = false;
+    try {
+        document.InsertAfter(document.CreateElement("other"), nullptr);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Document should reject insertion of a second root element");
+
+    XmlDocument fragmentDocument;
+    auto validFragment = fragmentDocument.CreateDocumentFragment();
+    validFragment->AppendChild(fragmentDocument.CreateComment("head"));
+    validFragment->AppendChild(fragmentDocument.CreateElement("root"));
+    fragmentDocument.AppendChild(validFragment);
+    Assert(fragmentDocument.DocumentElement() != nullptr && fragmentDocument.DocumentElement()->Name() == "root",
+        "Document should accept a fragment with a single root element");
+
+    XmlDocument invalidDocument;
+    auto invalidFragment = invalidDocument.CreateDocumentFragment();
+    invalidFragment->AppendChild(invalidDocument.CreateElement("a"));
+    invalidFragment->AppendChild(invalidDocument.CreateElement("b"));
+
+    threw = false;
+    try {
+        invalidDocument.AppendChild(invalidFragment);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Document should reject fragments that expand to multiple root elements");
+
+    XmlDocument clearDocument;
+    clearDocument.AppendChild(clearDocument.CreateXmlDeclaration("1.0", "utf-8", {}));
+    clearDocument.AppendChild(clearDocument.CreateElement("root"));
+    clearDocument.RemoveAll();
+    Assert(clearDocument.ChildNodeList().Empty(), "Document RemoveAll should clear all top-level nodes");
+}
+
+void TestImportNode() {
+    const auto source = XmlDocument::Parse(
+        "<src attr=\"1\"><child>text</child><!--tail--></src>");
+    XmlDocument target;
+
+    const auto sourceRoot = source->DocumentElement();
+    Assert(sourceRoot != nullptr, "ImportNode source root missing");
+
+    const auto shallow = target.ImportNode(*sourceRoot, false);
+    Assert(shallow != nullptr && shallow->NodeType() == XmlNodeType::Element,
+        "ImportNode should clone element nodes");
+    Assert(shallow->OwnerDocument() == &target, "Imported nodes should belong to target document");
+    Assert(shallow->ParentNode() == nullptr, "Imported nodes should be detached before insertion");
+
+    const auto shallowElement = std::static_pointer_cast<XmlElement>(shallow);
+    Assert(shallowElement->GetAttribute("attr") == "1", "Shallow ImportNode should copy attributes");
+    Assert(!shallowElement->HasChildNodes(), "Shallow ImportNode should omit child nodes for elements");
+
+    const auto deep = target.ImportNode(*sourceRoot, true);
+    const auto deepElement = std::static_pointer_cast<XmlElement>(deep);
+    Assert(deepElement->HasChildNodes(), "Deep ImportNode should copy child nodes");
+    Assert(deepElement->ChildNodeList().Count() == 2, "Deep ImportNode child count mismatch");
+    Assert(deepElement->FirstChild() != nullptr && deepElement->FirstChild()->OwnerDocument() == &target,
+        "Deep ImportNode should retarget descendants to the destination document");
+    Assert(deepElement->OuterXml() == "<src attr=\"1\"><child>text</child><!--tail--></src>",
+        "Deep ImportNode should preserve serialized content");
+
+    const auto importedAttribute = target.ImportNode(*sourceRoot->GetAttributeNode("attr"), true);
+    Assert(importedAttribute != nullptr && importedAttribute->NodeType() == XmlNodeType::Attribute,
+        "ImportNode should clone attribute nodes");
+    Assert(importedAttribute->OwnerDocument() == &target, "Imported attributes should belong to target document");
+    Assert(importedAttribute->Value() == "1", "Imported attribute value mismatch");
+
+    XmlDocument fragmentSource;
+    auto fragment = fragmentSource.CreateDocumentFragment();
+    fragment->AppendChild(fragmentSource.CreateElement("a"));
+    fragment->AppendChild(fragmentSource.CreateTextNode("mid"));
+    auto importedFragment = std::static_pointer_cast<XmlDocumentFragment>(target.ImportNode(*fragment, true));
+    Assert(importedFragment->ChildNodeList().Count() == 2, "ImportNode should deep-clone document fragments");
+    Assert(importedFragment->ChildNodeList().Item(0)->OwnerDocument() == &target,
+        "Imported fragment descendants should belong to target document");
+
+    XmlDocument entitySource;
+    auto entityRoot = entitySource.CreateElement("root");
+    entityRoot->AppendChild(entitySource.CreateEntityReference("amp"));
+    const auto importedEntityRoot = std::static_pointer_cast<XmlElement>(target.ImportNode(*entityRoot, true));
+    Assert(importedEntityRoot->FirstChild() != nullptr
+            && importedEntityRoot->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+        "ImportNode should preserve entity reference nodes");
+    Assert(importedEntityRoot->InnerText() == "&", "Imported entity references should preserve resolved text");
+
+    bool threw = false;
+    try {
+        target.ImportNode(*source, true);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "ImportNode should reject document nodes");
+}
+
+void TestCloneNode() {
+    const auto document = XmlDocument::Parse(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><root attr=\"1\"><child>text</child><!--tail--></root>");
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "CloneNode root missing");
+
+    const auto shallow = root->CloneNode(false);
+    Assert(shallow != nullptr && shallow->NodeType() == XmlNodeType::Element,
+        "CloneNode should clone element nodes");
+    Assert(shallow->OwnerDocument() == document.get(), "CloneNode should preserve owner document for element clones");
+    Assert(shallow->ParentNode() == nullptr, "Cloned elements should be detached");
+
+    const auto shallowElement = std::static_pointer_cast<XmlElement>(shallow);
+    Assert(shallowElement->GetAttribute("attr") == "1", "Shallow CloneNode should preserve attributes");
+    Assert(!shallowElement->HasChildNodes(), "Shallow CloneNode should omit children");
+
+    const auto deep = root->CloneNode(true);
+    const auto deepElement = std::static_pointer_cast<XmlElement>(deep);
+    Assert(deepElement->ChildNodeList().Count() == 2, "Deep CloneNode should preserve child count");
+    Assert(deepElement->OuterXml() == "<root attr=\"1\"><child>text</child><!--tail--></root>",
+        "Deep CloneNode should preserve element markup");
+    Assert(deepElement->FirstChild() != nullptr && deepElement->FirstChild()->OwnerDocument() == document.get(),
+        "Deep CloneNode descendants should preserve owner document");
+
+    auto fragment = document->CreateDocumentFragment();
+    fragment->AppendChild(document->CreateElement("a"));
+    fragment->AppendChild(document->CreateWhitespace("  "));
+    const auto clonedFragment = std::static_pointer_cast<XmlDocumentFragment>(fragment->CloneNode(true));
+    Assert(clonedFragment->ChildNodeList().Count() == 2, "CloneNode should deep-clone document fragments");
+    Assert(clonedFragment->ChildNodeList().Item(1)->NodeType() == XmlNodeType::Whitespace,
+        "CloneNode should preserve whitespace descendants in fragments");
+
+    auto entityRoot = document->CreateElement("entity-root");
+    entityRoot->AppendChild(document->CreateEntityReference("amp"));
+    const auto clonedEntityRoot = std::static_pointer_cast<XmlElement>(entityRoot->CloneNode(true));
+    Assert(clonedEntityRoot->FirstChild() != nullptr
+            && clonedEntityRoot->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+        "CloneNode should preserve entity reference child nodes");
+    Assert(clonedEntityRoot->OuterXml() == "<entity-root>&amp;</entity-root>",
+        "CloneNode should preserve entity reference serialization");
+
+    const auto clonedDocument = std::static_pointer_cast<XmlDocument>(document->CloneNode(true));
+    Assert(clonedDocument.get() != document.get(), "CloneNode should create a distinct document instance");
+    Assert(clonedDocument->Declaration() != nullptr && clonedDocument->Declaration()->Encoding() == "utf-8",
+        "CloneNode should preserve XML declaration on documents");
+    Assert(clonedDocument->DocumentElement() != nullptr && clonedDocument->DocumentElement()->OuterXml() == root->OuterXml(),
+        "CloneNode should deep-clone document children");
+    Assert(clonedDocument->OwnerDocument() == clonedDocument.get(), "Cloned documents should own themselves");
+}
+
+void TestCreateNode() {
+    XmlDocument document;
+
+    const auto element = document.CreateNode(XmlNodeType::Element, "root");
+    Assert(element != nullptr && element->NodeType() == XmlNodeType::Element,
+        "CreateNode should create element nodes");
+    Assert(element->OwnerDocument() == &document, "CreateNode elements should belong to the document");
+
+    const auto attribute = document.CreateNode(XmlNodeType::Attribute, "id", "42");
+    Assert(attribute != nullptr && attribute->NodeType() == XmlNodeType::Attribute,
+        "CreateNode should create attribute nodes");
+    Assert(attribute->Name() == "id" && attribute->Value() == "42", "CreateNode attribute payload mismatch");
+
+    const auto text = document.CreateNode(XmlNodeType::Text, {}, "alpha");
+    Assert(text != nullptr && text->NodeType() == XmlNodeType::Text && text->Value() == "alpha",
+        "CreateNode should create text nodes");
+
+    const auto entityReference = document.CreateNode(XmlNodeType::EntityReference, "amp");
+    Assert(entityReference != nullptr && entityReference->NodeType() == XmlNodeType::EntityReference,
+        "CreateNode should create entity reference nodes");
+    Assert(entityReference->Name() == "amp" && entityReference->Value() == "&",
+        "CreateNode entity reference payload mismatch");
+
+    const auto comment = document.CreateNode(XmlNodeType::Comment, {}, "note");
+    Assert(comment != nullptr && comment->NodeType() == XmlNodeType::Comment && comment->Value() == "note",
+        "CreateNode should create comment nodes");
+
+    const auto instruction = document.CreateNode(XmlNodeType::ProcessingInstruction, "pi", "payload");
+    Assert(instruction != nullptr && instruction->NodeType() == XmlNodeType::ProcessingInstruction,
+        "CreateNode should create processing instruction nodes");
+    Assert(instruction->Name() == "pi" && instruction->Value() == "payload",
+        "CreateNode processing instruction payload mismatch");
+
+    const auto fragment = document.CreateNode(XmlNodeType::DocumentFragment);
+    Assert(fragment != nullptr && fragment->NodeType() == XmlNodeType::DocumentFragment,
+        "CreateNode should create document fragments");
+
+    auto root = document.CreateElement("root");
+    root->AppendChild(document.CreateEntityReference("amp"));
+    root->AppendChild(document.CreateEntityReference("custom"));
+    Assert(root->OuterXml() == "<root>&amp;&custom;</root>",
+        "Entity reference nodes should serialize as entity markers");
+    Assert(root->InnerText() == "&", "Only predefined entity references should contribute resolved InnerText");
+
+    bool threw = false;
+    try {
+        (void)document.CreateNode(XmlNodeType::Element);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "CreateNode should require names for element nodes");
+
+    threw = false;
+    try {
+        (void)document.CreateNode(XmlNodeType::Document);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "CreateNode should reject unsupported document nodes");
+
+    const auto createdDocumentType = document.CreateDocumentType(
+        "catalog",
+        {},
+        {},
+        "<!ENTITY publisher \"North Press\"><!NOTATION bin SYSTEM \"application/octet-stream\">"
+    );
+    Assert(createdDocumentType->Entities().GetNamedItem("publisher") != nullptr,
+        "CreateDocumentType should populate Entities from the internal subset");
+    Assert(createdDocumentType->Notations().GetNamedItem("bin") != nullptr,
+        "CreateDocumentType should populate Notations from the internal subset");
+
+    const auto clonedDocumentType = std::static_pointer_cast<XmlDocumentType>(createdDocumentType->CloneNode(true));
+    Assert(clonedDocumentType->Entities().GetNamedItem("publisher") != nullptr,
+        "CloneNode should preserve DocumentType entity declarations");
+    Assert(clonedDocumentType->Notations().GetNamedItem("bin") != nullptr,
+        "CloneNode should preserve DocumentType notation declarations");
+}
+
+void TestDomNodeBoundaryMatrix() {
+    XmlDocument document;
+
+    const auto attribute = document.CreateAttribute("id", "a<b");
+    const auto text = document.CreateTextNode("a<b");
+    const auto entityReference = document.CreateEntityReference("amp");
+    const auto whitespace = document.CreateWhitespace(" \t ");
+    const auto significantWhitespace = document.CreateSignificantWhitespace("\n");
+    const auto cdata = document.CreateCDataSection("cdata");
+    const auto comment = document.CreateComment("note");
+    const auto instruction = document.CreateProcessingInstruction("pi", "payload");
+    const auto declaration = document.CreateXmlDeclaration("1.0", "utf-8", "yes");
+    const auto documentType = document.CreateDocumentType("root", {}, {}, "<!ENTITY e \"v\">");
+
+    const auto fragment = document.CreateDocumentFragment();
+    fragment->SetInnerXml("<a/>x<!--c-->");
+
+    const auto element = document.CreateElement("root");
+    element->SetAttribute("id", "42");
+    element->AppendChild(document.CreateTextNode("txt"));
+    element->AppendChild(document.CreateCDataSection("cd"));
+
+    document.AppendChild(declaration);
+    document.AppendChild(documentType);
+    document.AppendChild(element);
+
+    const std::vector<NodeBoundaryExpectation> expectations{
+        {std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document", "#document", {}, "txtcd",
+            "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><!DOCTYPE root [<!ENTITY e \"v\">]><root id=\"42\">txt<![CDATA[cd]]></root>",
+            "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><!DOCTYPE root [<!ENTITY e \"v\">]><root id=\"42\">txt<![CDATA[cd]]></root>"},
+        {attribute, "Attribute", "id", "a<b", {}, {}, "id=\"a&lt;b\""},
+        {text, "Text", "#text", "a<b", "a<b", {}, "a&lt;b"},
+        {entityReference, "EntityReference", "amp", "&", "&", {}, "&amp;"},
+        {whitespace, "Whitespace", "#whitespace", " \t ", " \t ", {}, " \t "},
+        {significantWhitespace, "SignificantWhitespace", "#significant-whitespace", "\n", "\n", {}, "\n"},
+        {cdata, "CDATA", "#cdata-section", "cdata", "cdata", {}, "<![CDATA[cdata]]>"},
+        {comment, "Comment", "#comment", "note", "note", {}, "<!--note-->"},
+        {instruction, "ProcessingInstruction", "pi", "payload", "payload", {}, "<?pi payload?>"},
+        {declaration, "XmlDeclaration", "xml", "version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"",
+            "version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"", {},
+            "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>"},
+        {documentType, "DocumentType", "root", {}, {}, {}, "<!DOCTYPE root [<!ENTITY e \"v\">]>"},
+        {fragment, "DocumentFragment", "#document-fragment", {}, "x", "<a/>x<!--c-->", "<a/>x<!--c-->"},
+        {element, "Element", "root", {}, "txtcd", "txt<![CDATA[cd]]>", "<root id=\"42\">txt<![CDATA[cd]]></root>"},
+    };
+
+    for (const auto& expectation : expectations) {
+        AssertNodeBoundaryView(expectation);
+    }
+}
+
+void TestNodeValueMutationBoundaries() {
+    XmlDocument document;
+
+    const auto attribute = document.CreateAttribute("id", "1");
+    attribute->SetValue("a<b");
+    AssertNodeBoundaryView({attribute, "Mutated Attribute", "id", "a<b", {}, {}, "id=\"a&lt;b\""});
+
+    const auto text = document.CreateTextNode("alpha");
+    text->SetValue("beta & <gamma>");
+    AssertNodeBoundaryView({text, "Mutated Text", "#text", "beta & <gamma>", "beta & <gamma>", {}, "beta &amp; &lt;gamma&gt;"});
+
+    const auto comment = document.CreateComment("note");
+    comment->SetValue("tail");
+    AssertNodeBoundaryView({comment, "Mutated Comment", "#comment", "tail", "tail", {}, "<!--tail-->"});
+
+    const auto instruction = document.CreateProcessingInstruction("pi", "payload");
+    instruction->SetValue("next");
+    AssertNodeBoundaryView({instruction, "Mutated ProcessingInstruction", "pi", "next", "next", {}, "<?pi next?>"});
+
+    const auto cdata = document.CreateCDataSection("old");
+    cdata->SetValue("new]]value");
+    AssertNodeBoundaryView({cdata, "Mutated CDATA", "#cdata-section", "new]]value", "new]]value", {}, "<![CDATA[new]]value]]>"});
+
+    const auto whitespace = document.CreateWhitespace("  ");
+    whitespace->SetValue("\t\n");
+    AssertNodeBoundaryView({whitespace, "Mutated Whitespace", "#whitespace", "\t\n", "\t\n", {}, "\t\n"});
+
+    const auto significantWhitespace = document.CreateSignificantWhitespace("\n");
+    significantWhitespace->SetValue("  ");
+    AssertNodeBoundaryView({significantWhitespace, "Mutated SignificantWhitespace", "#significant-whitespace", "  ", "  ", {}, "  "});
+
+    const auto entityReference = document.CreateEntityReference("amp");
+    AssertXmlExceptionMessage(
+        [&] { entityReference->SetValue("mut"); },
+        "Cannot set a value on node type 'EntityReference'.",
+        "EntityReference nodes should reject SetValue");
+    AssertNodeBoundaryView({entityReference, "Unchanged EntityReference", "amp", "&", "&", {}, "&amp;"});
+
+    const auto element = document.CreateElement("root");
+    AssertXmlExceptionMessage(
+        [&] { element->SetValue("mut"); },
+        "Cannot set a value on node type 'Element'.",
+        "Element nodes should reject SetValue");
+    AssertNodeBoundaryView({element, "Unchanged Element", "root", {}, {}, {}, "<root/>"});
+
+    const auto fragment = document.CreateDocumentFragment();
+    fragment->SetInnerXml("<a/>x");
+    AssertXmlExceptionMessage(
+        [&] { fragment->SetValue("mut"); },
+        "Cannot set a value on node type 'DocumentFragment'.",
+        "DocumentFragment nodes should reject SetValue");
+    AssertNodeBoundaryView({fragment, "Unchanged DocumentFragment", "#document-fragment", {}, "x", "<a/>x", "<a/>x"});
+
+    const auto documentType = document.CreateDocumentType("root", {}, {}, "<!ENTITY e \"v\">");
+    AssertXmlExceptionMessage(
+        [&] { documentType->SetValue("mut"); },
+        "Cannot set a value on node type 'DocumentType'.",
+        "DocumentType nodes should reject SetValue");
+    AssertNodeBoundaryView({documentType, "Unchanged DocumentType", "root", {}, {}, {}, "<!DOCTYPE root [<!ENTITY e \"v\">]>"});
+
+    const auto declaration = document.CreateXmlDeclaration("1.0", "utf-8", "yes");
+    AssertXmlExceptionMessage(
+        [&] { declaration->SetValue("mut"); },
+        "Cannot set a value on node type 'XmlDeclaration'.",
+        "XmlDeclaration nodes should reject direct SetValue");
+    AssertNodeBoundaryView({declaration, "Unchanged XmlDeclaration", "xml", "version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"",
+        "version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"", {},
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>"});
+
+    AssertXmlExceptionMessage(
+        [&] { document.SetValue("mut"); },
+        "Cannot set a value on node type 'Document'.",
+        "Document nodes should reject SetValue");
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Unchanged Empty Document", "#document", {}, {}, {}, {}});
+}
+
+void TestNodeStructureMutationMatrix() {
+    XmlDocument document;
+    const auto root = document.CreateElement("root");
+    document.AppendChild(root);
+
+    AssertNodeBoundaryView({root, "Empty Root", "root", {}, {}, {}, "<root/>"});
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document With Empty Root", "#document", {}, {}, "<root/>", "<root/>"});
+
+    const auto leadComment = document.CreateComment("lead");
+    const auto text = document.CreateTextNode("alpha");
+    const auto child = document.CreateElement("child");
+    child->SetAttribute("id", "1");
+
+    root->AppendChild(leadComment);
+    root->AppendChild(text);
+    root->AppendChild(child);
+
+    AssertNodeBoundaryView({root, "Root After Direct Appends", "root", {}, "alpha", "<!--lead-->alpha<child id=\"1\"/>",
+        "<root><!--lead-->alpha<child id=\"1\"/></root>"});
+
+    const auto insertedFragment = document.CreateDocumentFragment();
+    insertedFragment->SetInnerXml("<left/>mid<right/>");
+    root->InsertBefore(insertedFragment, child);
+
+    AssertNodeBoundaryView({insertedFragment, "Consumed Inserted Fragment", "#document-fragment", {}, {}, {}, {}});
+    AssertNodeBoundaryView({root, "Root After Fragment InsertBefore", "root", {}, "alphamid",
+        "<!--lead-->alpha<left/>mid<right/><child id=\"1\"/>",
+        "<root><!--lead-->alpha<left/>mid<right/><child id=\"1\"/></root>"});
+
+    const auto removedComment = root->RemoveChild(leadComment);
+    AssertNodeBoundaryView({removedComment, "Detached Removed Comment", "#comment", "lead", "lead", {}, "<!--lead-->"});
+    Assert(removedComment->ParentNode() == nullptr, "Removed comment should be detached after RemoveChild");
+    AssertNodeBoundaryView({root, "Root After RemoveChild", "root", {}, "alphamid", "alpha<left/>mid<right/><child id=\"1\"/>",
+        "<root>alpha<left/>mid<right/><child id=\"1\"/></root>"});
+
+    const auto replacementFragment = document.CreateDocumentFragment();
+    replacementFragment->AppendChild(document.CreateCDataSection("cd"));
+    replacementFragment->AppendChild(document.CreateElement("tail"));
+    const auto replacedChild = root->ReplaceChild(replacementFragment, child);
+
+    AssertNodeBoundaryView({replacementFragment, "Consumed Replacement Fragment", "#document-fragment", {}, {}, {}, {}});
+    AssertNodeBoundaryView({replacedChild, "Detached Replaced Child", "child", {}, {}, {}, "<child id=\"1\"/>"});
+    Assert(replacedChild->ParentNode() == nullptr, "Replaced child should be detached after ReplaceChild");
+    AssertNodeBoundaryView({root, "Root After ReplaceChild Fragment", "root", {}, "alphamidcd",
+        "alpha<left/>mid<right/><![CDATA[cd]]><tail/>",
+        "<root>alpha<left/>mid<right/><![CDATA[cd]]><tail/></root>"});
+
+    root->RemoveAll();
+    AssertNodeBoundaryView({root, "Root After RemoveAll", "root", {}, {}, {}, "<root/>"});
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After RemoveAll On Root", "#document", {}, {}, "<root/>", "<root/>"});
+}
+
+void TestAttributeStructureMutationMatrix() {
+    XmlDocument document;
+    const auto root = document.CreateElement("root");
+    document.AppendChild(root);
+
+    AssertNodeBoundaryView({root, "Attribute Matrix Empty Root", "root", {}, {}, {}, "<root/>"});
+
+    const auto idAttribute = root->SetAttribute("id", "1");
+    Assert(idAttribute != nullptr, "SetAttribute should return the created attribute node");
+    AssertNodeBoundaryView({idAttribute, "Created id Attribute", "id", "1", {}, {}, "id=\"1\""});
+    AssertNodeBoundaryView({root, "Root After First Attribute", "root", {}, {}, {}, "<root id=\"1\"/>"});
+
+    const auto sameIdAttribute = root->SetAttribute("id", "2");
+    Assert(sameIdAttribute == idAttribute, "SetAttribute should reuse the existing attribute node for the same name");
+    AssertNodeBoundaryView({idAttribute, "Updated id Attribute", "id", "2", {}, {}, "id=\"2\""});
+    AssertNodeBoundaryView({root, "Root After Updating Existing Attribute", "root", {}, {}, {}, "<root id=\"2\"/>"});
+
+    const auto classAttribute = document.CreateAttribute("class", "hero");
+    const auto attachedClassAttribute = root->SetAttributeNode(classAttribute);
+    Assert(attachedClassAttribute == nullptr, "SetAttributeNode should return null when attaching a new attribute name");
+    AssertNodeBoundaryView({classAttribute, "Attached class Attribute", "class", "hero", {}, {}, "class=\"hero\""});
+    AssertNodeBoundaryView({root, "Root After SetAttributeNode Append", "root", {}, {}, {}, "<root id=\"2\" class=\"hero\"/>"});
+
+    const auto replacementClassAttribute = document.CreateAttribute("class", "featured");
+    const auto removedClassAttribute = root->SetAttributeNode(replacementClassAttribute);
+    Assert(removedClassAttribute == classAttribute, "SetAttributeNode should return the replaced attribute node");
+    Assert(removedClassAttribute->OwnerElement() == nullptr, "Replaced attribute should be detached from the element");
+    AssertNodeBoundaryView({removedClassAttribute, "Detached Replaced class Attribute", "class", "hero", {}, {}, "class=\"hero\""});
+    AssertNodeBoundaryView({replacementClassAttribute, "Replacement class Attribute", "class", "featured", {}, {}, "class=\"featured\""});
+    AssertNodeBoundaryView({root, "Root After SetAttributeNode Replace", "root", {}, {}, {}, "<root id=\"2\" class=\"featured\"/>"});
+
+    const auto removedIdAttribute = root->RemoveAttributeNode(idAttribute);
+    Assert(removedIdAttribute == idAttribute, "RemoveAttributeNode should return the removed attribute instance");
+    Assert(removedIdAttribute->OwnerElement() == nullptr, "Removed attribute should be detached from the element");
+    AssertNodeBoundaryView({removedIdAttribute, "Detached Removed id Attribute", "id", "2", {}, {}, "id=\"2\""});
+    AssertNodeBoundaryView({root, "Root After RemoveAttributeNode", "root", {}, {}, {}, "<root class=\"featured\"/>"});
+
+    Assert(root->RemoveAttribute("class"), "RemoveAttribute should report success for existing attributes");
+    AssertNodeBoundaryView({replacementClassAttribute, "Detached Removed class Attribute", "class", "featured", {}, {}, "class=\"featured\""});
+    AssertNodeBoundaryView({root, "Root After RemoveAttribute", "root", {}, {}, {}, "<root/>"});
+
+    const auto aAttribute = root->SetAttribute("a", "1");
+    const auto bAttribute = root->SetAttribute("b", "2");
+    AssertNodeBoundaryView({aAttribute, "Attached a Attribute", "a", "1", {}, {}, "a=\"1\""});
+    AssertNodeBoundaryView({bAttribute, "Attached b Attribute", "b", "2", {}, {}, "b=\"2\""});
+    AssertNodeBoundaryView({root, "Root Before RemoveAllAttributes", "root", {}, {}, {}, "<root a=\"1\" b=\"2\"/>"});
+
+    root->RemoveAllAttributes();
+    Assert(aAttribute->OwnerElement() == nullptr, "RemoveAllAttributes should detach the first attribute");
+    Assert(bAttribute->OwnerElement() == nullptr, "RemoveAllAttributes should detach the second attribute");
+    AssertNodeBoundaryView({aAttribute, "Detached a Attribute After RemoveAllAttributes", "a", "1", {}, {}, "a=\"1\""});
+    AssertNodeBoundaryView({bAttribute, "Detached b Attribute After RemoveAllAttributes", "b", "2", {}, {}, "b=\"2\""});
+    AssertNodeBoundaryView({root, "Root After RemoveAllAttributes", "root", {}, {}, {}, "<root/>"});
+
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After Attribute Mutations", "#document", {}, {}, "<root/>", "<root/>"});
+}
+
+void TestCrossDocumentStructureMutationMatrix() {
+    XmlDocument target;
+    const auto root = target.CreateElement("root");
+    const auto anchor = target.CreateElement("anchor");
+    root->AppendChild(anchor);
+    target.AppendChild(root);
+
+    XmlDocument foreign;
+    const auto detachedForeignElement = foreign.CreateElement("foreign");
+    detachedForeignElement->SetAttribute("id", "x");
+
+    AssertXmlExceptionMessage(
+        [&] { root->AppendChild(detachedForeignElement); },
+        "The node belongs to a different document",
+        "AppendChild should reject detached foreign elements");
+
+    const auto detachedForeignFragment = foreign.CreateDocumentFragment();
+    detachedForeignFragment->SetInnerXml("<left/>mid");
+    AssertXmlExceptionMessage(
+        [&] { root->InsertBefore(detachedForeignFragment, anchor); },
+        "The node belongs to a different document",
+        "InsertBefore should reject foreign document fragments");
+
+    XmlDocument foreignParented;
+    foreignParented.LoadXml("<foreign-parent><child/></foreign-parent>");
+    const auto foreignParentedElement = foreignParented.DocumentElement();
+    Assert(foreignParentedElement != nullptr, "Foreign parented element should exist");
+    AssertXmlExceptionMessage(
+        [&] { root->ReplaceChild(foreignParentedElement, anchor); },
+        "The node belongs to a different document",
+        "ReplaceChild should reject parented foreign elements before parent-state checks");
+
+    const auto importedElement = std::static_pointer_cast<XmlElement>(target.ImportNode(*detachedForeignElement, true));
+    Assert(importedElement->OwnerDocument() == &target, "Imported detached element should target the destination document");
+    Assert(importedElement->ParentNode() == nullptr, "Imported detached element should remain detached before insertion");
+    root->AppendChild(importedElement);
+    Assert(importedElement->ParentNode() == root.get(), "Imported element should attach to the target root");
+    Assert(importedElement->OwnerDocument() == &target, "Imported element should keep the target owner document after insertion");
+    AssertNodeBoundaryView({root, "Root After Appending Imported Element", "root", {}, {}, "<anchor/><foreign id=\"x\"/>",
+        "<root><anchor/><foreign id=\"x\"/></root>"});
+    AssertNodeBoundaryView({detachedForeignElement, "Source Detached Foreign Element Unchanged", "foreign", {}, {}, {}, "<foreign id=\"x\"/>"});
+
+    const auto importedFragment = std::static_pointer_cast<XmlDocumentFragment>(target.ImportNode(*detachedForeignFragment, true));
+    Assert(importedFragment->ChildNodeList().Count() == 2, "Imported foreign fragment should retain its children before insertion");
+    Assert(importedFragment->ChildNodeList().Item(0) != nullptr
+            && importedFragment->ChildNodeList().Item(0)->OwnerDocument() == &target,
+        "Imported foreign fragment descendants should retarget to the destination document");
+    root->InsertBefore(importedFragment, importedElement);
+    AssertNodeBoundaryView({importedFragment, "Consumed Imported Fragment", "#document-fragment", {}, {}, {}, {}});
+    AssertNodeBoundaryView({root, "Root After Inserting Imported Fragment", "root", {}, "mid", "<anchor/><left/>mid<foreign id=\"x\"/>",
+        "<root><anchor/><left/>mid<foreign id=\"x\"/></root>"});
+
+    const auto importedParentedElement = std::static_pointer_cast<XmlElement>(target.ImportNode(*foreignParentedElement, true));
+    const auto replaced = root->ReplaceChild(importedParentedElement, importedElement);
+    Assert(replaced == importedElement, "ReplaceChild should return the previously attached imported element");
+    Assert(replaced->ParentNode() == nullptr, "Replaced imported element should detach from the target tree");
+    AssertNodeBoundaryView({std::static_pointer_cast<XmlElement>(replaced), "Detached Replaced Imported Element", "foreign", {}, {}, {}, "<foreign id=\"x\"/>"});
+    Assert(importedParentedElement->OwnerDocument() == &target, "Imported parented element should target the destination document");
+    Assert(importedParentedElement->FirstChild() != nullptr
+            && importedParentedElement->FirstChild()->OwnerDocument() == &target,
+        "Imported descendants from a parented foreign element should target the destination document");
+    AssertNodeBoundaryView({root, "Root After Replacing With Imported Foreign Tree", "root", {}, "mid", "<anchor/><left/>mid<foreign-parent><child/></foreign-parent>",
+        "<root><anchor/><left/>mid<foreign-parent><child/></foreign-parent></root>"});
+    AssertNodeBoundaryView({foreignParentedElement, "Source Parented Foreign Element Unchanged", "foreign-parent", {}, {}, "<child/>", "<foreign-parent><child/></foreign-parent>"});
+}
+
+void TestDocumentStructureMutationMatrix() {
+    XmlDocument document;
+    Assert(document.Declaration() == nullptr, "Empty documents should not expose an XML declaration");
+    Assert(document.DocumentType() == nullptr, "Empty documents should not expose a DOCTYPE");
+    Assert(document.DocumentElement() == nullptr, "Empty documents should not expose a root element");
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Empty Document Matrix", "#document", {}, {}, {}, {}});
+
+    const auto declaration = document.CreateXmlDeclaration("1.0", "utf-8", "yes");
+    const auto documentType = document.CreateDocumentType("catalog", {}, "catalog.dtd", "<!ENTITY label \"copy\">");
+    const auto root = document.CreateElement("catalog");
+    root->SetAttribute("id", "r1");
+
+    document.AppendChild(declaration);
+    document.AppendChild(documentType);
+    document.AppendChild(root);
+
+    Assert(document.Declaration() == declaration, "Declaration accessor should track the appended declaration node");
+    Assert(document.DocumentType() == documentType, "DocumentType accessor should track the appended DOCTYPE node");
+    Assert(document.DocumentElement() == root, "DocumentElement accessor should track the appended root element");
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After Top-Level Append", "#document", {}, {},
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><!DOCTYPE catalog SYSTEM \"catalog.dtd\" [<!ENTITY label \"copy\">]><catalog id=\"r1\"/>",
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><!DOCTYPE catalog SYSTEM \"catalog.dtd\" [<!ENTITY label \"copy\">]><catalog id=\"r1\"/>"});
+
+    const auto removedDocType = std::static_pointer_cast<XmlDocumentType>(document.RemoveChild(documentType));
+    Assert(document.DocumentType() == nullptr, "DocumentType accessor should clear after removing the DOCTYPE node");
+    AssertNodeBoundaryView({removedDocType, "Detached Removed DocumentType", "catalog", {}, {}, {},
+        "<!DOCTYPE catalog SYSTEM \"catalog.dtd\" [<!ENTITY label \"copy\">]>"});
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After Removing DOCTYPE", "#document", {}, {},
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><catalog id=\"r1\"/>",
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?><catalog id=\"r1\"/>"});
+
+    const auto removedDeclaration = std::static_pointer_cast<XmlDeclaration>(document.RemoveChild(declaration));
+    Assert(document.Declaration() == nullptr, "Declaration accessor should clear after removing the declaration node");
+    AssertNodeBoundaryView({removedDeclaration, "Detached Removed Declaration", "xml", "version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"",
+        "version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"", {},
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>"});
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After Removing Declaration", "#document", {}, {},
+        "<catalog id=\"r1\"/>", "<catalog id=\"r1\"/>"});
+
+    const auto removedRoot = std::static_pointer_cast<XmlElement>(document.RemoveChild(root));
+    Assert(document.DocumentElement() == nullptr, "DocumentElement accessor should clear after removing the root node");
+    AssertNodeBoundaryView({removedRoot, "Detached Removed Root", "catalog", {}, {}, {}, "<catalog id=\"r1\"/>"});
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After Removing Root", "#document", {}, {}, {}, {}});
+
+    XmlDocument source;
+    const auto sourceDeclaration = source.CreateXmlDeclaration("1.0", "utf-16", {});
+    const auto sourceDocumentType = source.CreateDocumentType("catalog", "-//LibXML//DTD Catalog 1.0//EN", "catalog.dtd", {});
+    const auto sourceRoot = source.CreateElement("catalog");
+    sourceRoot->AppendChild(source.CreateComment("payload"));
+    source.AppendChild(sourceDeclaration);
+    source.AppendChild(sourceDocumentType);
+    source.AppendChild(sourceRoot);
+
+    const auto importedDeclaration = std::static_pointer_cast<XmlDeclaration>(document.ImportNode(*sourceDeclaration, true));
+    const auto importedDocumentType = std::static_pointer_cast<XmlDocumentType>(document.ImportNode(*sourceDocumentType, true));
+    const auto importedRoot = std::static_pointer_cast<XmlElement>(document.ImportNode(*sourceRoot, true));
+    Assert(importedDeclaration->OwnerDocument() == &document, "Imported declaration should target the destination document");
+    Assert(importedDocumentType->OwnerDocument() == &document, "Imported DOCTYPE should target the destination document");
+    Assert(importedRoot->OwnerDocument() == &document, "Imported root should target the destination document");
+
+    document.AppendChild(importedDeclaration);
+    document.AppendChild(importedDocumentType);
+    document.AppendChild(importedRoot);
+    Assert(document.Declaration() == importedDeclaration, "Declaration accessor should update after importing a declaration");
+    Assert(document.DocumentType() == importedDocumentType, "DocumentType accessor should update after importing a DOCTYPE");
+    Assert(document.DocumentElement() == importedRoot, "DocumentElement accessor should update after importing a root");
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After Import Rebuild", "#document", {}, {},
+        "<?xml version=\"1.0\" encoding=\"utf-16\"?><!DOCTYPE catalog PUBLIC \"-//LibXML//DTD Catalog 1.0//EN\" \"catalog.dtd\"><catalog><!--payload--></catalog>",
+        "<?xml version=\"1.0\" encoding=\"utf-16\"?><!DOCTYPE catalog PUBLIC \"-//LibXML//DTD Catalog 1.0//EN\" \"catalog.dtd\"><catalog><!--payload--></catalog>"});
+
+    document.RemoveAll();
+    Assert(document.Declaration() == nullptr, "RemoveAll should clear the declaration accessor");
+    Assert(document.DocumentType() == nullptr, "RemoveAll should clear the DOCTYPE accessor");
+    Assert(document.DocumentElement() == nullptr, "RemoveAll should clear the root accessor");
+    AssertNodeBoundaryView({std::shared_ptr<XmlNode>(&document, [](XmlNode*) {}), "Document After RemoveAll", "#document", {}, {}, {}, {}});
+}
+
+void TestNamespaceManager() {
+    XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("app", "urn:app");
+    Assert(namespaces.LookupNamespace("app") == "urn:app", "Namespace lookup should find current scope");
+
+    namespaces.PushScope();
+    namespaces.AddNamespace("item", "urn:item");
+    Assert(namespaces.LookupPrefix("urn:item") == "item", "Reverse namespace lookup should work");
+    Assert(namespaces.PopScope(), "PopScope should succeed for nested scope");
+    Assert(!namespaces.HasNamespace("item"), "Nested scope should be removed after pop");
+}
+
+void TestDomNamespaces() {
+    const auto document = XmlDocument::Parse(
+        "<root xmlns=\"urn:root\" xmlns:app=\"urn:app\" xml:lang=\"zh-CN\">"
+        "<app:item app:id=\"7\" plain=\"1\"/>"
+        "</root>");
+
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "Namespace test root missing");
+    Assert(root->NamespaceURI() == "urn:root", "Default namespace should apply to unprefixed elements");
+
+    const auto item = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("app:item"));
+    Assert(item != nullptr, "Prefixed child element missing");
+    Assert(item->NamespaceURI() == "urn:app", "Prefixed element namespace mismatch");
+    Assert(item->GetAttributeNode("app:id")->NamespaceURI() == "urn:app", "Prefixed attribute namespace mismatch");
+    Assert(item->GetAttributeNode("plain")->NamespaceURI().empty(), "Default namespace must not apply to unprefixed attributes");
+    Assert(root->GetAttributeNode("xml:lang")->NamespaceURI() == "http://www.w3.org/XML/1998/namespace", "xml prefix namespace mismatch");
+    Assert(root->GetNamespaceOfPrefix("app") == "urn:app", "GetNamespaceOfPrefix should resolve in-scope prefixes");
+    Assert(root->GetPrefixOfNamespace("urn:app") == "app", "GetPrefixOfNamespace should resolve prefix for namespace URI");
+}
+
+void TestNamespaceScopeRoundTrip() {
+    const auto assertNamespaceScopeMatrix = [](const std::shared_ptr<XmlDocument>& document, const std::string& label) {
+        const auto root = document->DocumentElement();
+        Assert(root != nullptr, label + " root should exist");
+        Assert(root->NamespaceURI() == "urn:root", label + " root default namespace mismatch");
+
+        const auto childDefault = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("childDefault"));
+        const auto childLeaf = std::static_pointer_cast<XmlElement>(childDefault == nullptr ? nullptr : childDefault->SelectSingleNode("leaf"));
+        const auto childPrefixed = std::static_pointer_cast<XmlElement>(childDefault == nullptr ? nullptr : childDefault->SelectSingleNode("app:item"));
+        const auto sibling = std::static_pointer_cast<XmlElement>(root->SelectSingleNode("sibling"));
+        const auto siblingLeaf = std::static_pointer_cast<XmlElement>(sibling == nullptr ? nullptr : sibling->SelectSingleNode("leaf"));
+        const auto siblingPrefixed = std::static_pointer_cast<XmlElement>(sibling == nullptr ? nullptr : sibling->SelectSingleNode("app:item"));
+
+        Assert(childDefault != nullptr && childDefault->NamespaceURI() == "urn:child-default",
+            label + " child default namespace redefinition mismatch");
+        Assert(childLeaf != nullptr && childLeaf->NamespaceURI() == "urn:child-default",
+            label + " nested default namespace should stay in child scope");
+        Assert(childPrefixed != nullptr && childPrefixed->NamespaceURI() == "urn:app-child",
+            label + " child prefix redefinition mismatch");
+        Assert(childPrefixed->GetAttributeNode("app:id") != nullptr
+                && childPrefixed->GetAttributeNode("app:id")->NamespaceURI() == "urn:app-child",
+            label + " child prefix-redefined attribute namespace mismatch");
+        Assert(sibling != nullptr && sibling->NamespaceURI() == "urn:root",
+            label + " exiting child scope should restore parent default namespace");
+        Assert(siblingLeaf != nullptr && siblingLeaf->NamespaceURI() == "urn:root",
+            label + " sibling descendants should see restored parent default namespace");
+        Assert(siblingPrefixed != nullptr && siblingPrefixed->NamespaceURI() == "urn:app-root",
+            label + " exiting child scope should restore parent prefix binding");
+        Assert(siblingPrefixed->GetAttributeNode("app:id") != nullptr
+                && siblingPrefixed->GetAttributeNode("app:id")->NamespaceURI() == "urn:app-root",
+            label + " sibling prefixed attribute should use restored parent binding");
+
+        XmlNamespaceManager namespaces;
+        namespaces.AddNamespace("r", "urn:root");
+        namespaces.AddNamespace("c", "urn:child-default");
+        namespaces.AddNamespace("ar", "urn:app-root");
+        namespaces.AddNamespace("ac", "urn:app-child");
+
+        Assert(document->SelectSingleNode("/r:root/c:childDefault/c:leaf", namespaces) != nullptr,
+            label + " XPath should see the redefined child default namespace");
+        Assert(document->SelectSingleNode("/r:root/r:sibling/r:leaf", namespaces) != nullptr,
+            label + " XPath should see the restored parent default namespace after leaving child scope");
+        Assert(document->SelectSingleNode("/r:root/r:sibling/c:leaf", namespaces) == nullptr,
+            label + " XPath should not leak the child default namespace into sibling scope");
+        Assert(document->SelectSingleNode("/r:root/c:childDefault/ac:item/@ac:id", namespaces) != nullptr,
+            label + " XPath should see the redefined child prefix binding");
+        Assert(document->SelectSingleNode("/r:root/r:sibling/ar:item/@ar:id", namespaces) != nullptr,
+            label + " XPath should see the restored parent prefix binding after leaving child scope");
+    };
+
+    const std::string xml =
+        "<root xmlns=\"urn:root\" xmlns:app=\"urn:app-root\">"
+        "<childDefault xmlns=\"urn:child-default\">"
+        "<leaf/>"
+        "<app:item xmlns:app=\"urn:app-child\" app:id=\"c\"/>"
+        "</childDefault>"
+        "<sibling>"
+        "<leaf/>"
+        "<app:item app:id=\"p\"/>"
+        "</sibling>"
+        "</root>";
+
+    const auto parsed = XmlDocument::Parse(xml);
+    assertNamespaceScopeMatrix(parsed, "DOM namespace scope");
+
+    XmlReader reader = XmlReader::Create(xml);
+    std::vector<std::pair<std::string, std::string>> elementNamespaces;
+    std::vector<std::pair<std::string, std::string>> attributeNamespaces;
+    while (reader.Read()) {
+        if (reader.NodeType() != XmlNodeType::Element) {
+            continue;
+        }
+
+        elementNamespaces.push_back({reader.Name(), reader.NamespaceURI()});
+        if (reader.Name() == "app:item" && reader.MoveToAttribute("app:id")) {
+            attributeNamespaces.push_back({reader.Name(), reader.NamespaceURI()});
+            Assert(reader.MoveToElement(), "Namespace scope reader should restore the element cursor after reading app:id");
+        }
+    }
+
+    Assert(elementNamespaces.size() == 7, "Namespace scope reader should see the expected element count");
+    Assert(elementNamespaces[0] == std::make_pair(std::string("root"), std::string("urn:root")),
+        "Reader should expose the parent default namespace on root");
+    Assert(elementNamespaces[1] == std::make_pair(std::string("childDefault"), std::string("urn:child-default")),
+        "Reader should expose the redefined child default namespace");
+    Assert(elementNamespaces[2] == std::make_pair(std::string("leaf"), std::string("urn:child-default")),
+        "Reader should keep the child default namespace within the nested subtree");
+    Assert(elementNamespaces[3] == std::make_pair(std::string("app:item"), std::string("urn:app-child")),
+        "Reader should expose the redefined child prefix binding");
+    Assert(elementNamespaces[4] == std::make_pair(std::string("sibling"), std::string("urn:root")),
+        "Reader should restore the parent default namespace after the child scope closes");
+    Assert(elementNamespaces[5] == std::make_pair(std::string("leaf"), std::string("urn:root")),
+        "Reader should expose the restored parent default namespace on sibling descendants");
+    Assert(elementNamespaces[6] == std::make_pair(std::string("app:item"), std::string("urn:app-root")),
+        "Reader should expose the restored parent prefix binding after the child scope closes");
+    Assert(attributeNamespaces.size() == 2,
+        "Reader should expose both prefixed attributes across namespace scope rebindings");
+    Assert(attributeNamespaces[0] == std::make_pair(std::string("app:id"), std::string("urn:app-child")),
+        "Reader should expose the redefined child attribute prefix binding");
+    Assert(attributeNamespaces[1] == std::make_pair(std::string("app:id"), std::string("urn:app-root")),
+        "Reader should restore the parent attribute prefix binding after the child scope closes");
+
+    XmlWriter writer;
+    writer.WriteStartElement("", "root", "urn:root");
+    writer.WriteStartElement("", "childDefault", "urn:child-default");
+    writer.WriteStartElement("", "leaf", "urn:child-default");
+    writer.WriteEndElement();
+    writer.WriteStartElement("app", "item", "urn:app-child");
+    writer.WriteAttributeString("app", "id", "urn:app-child", "c");
+    writer.WriteEndElement();
+    writer.WriteEndElement();
+    writer.WriteStartElement("", "sibling", "urn:root");
+    writer.WriteStartElement("", "leaf", "urn:root");
+    writer.WriteEndElement();
+    writer.WriteStartElement("app", "item", "urn:app-root");
+    writer.WriteAttributeString("app", "id", "urn:app-root", "p");
+    writer.WriteEndElement();
+    writer.WriteEndElement();
+    writer.WriteEndElement();
+
+    const auto writerRoundTrip = XmlDocument::Parse(writer.GetString());
+    assertNamespaceScopeMatrix(writerRoundTrip, "Writer round-trip namespace scope");
+}
+
+void TestXmlReader() {
+    const std::string xml =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<!DOCTYPE root [<!ENTITY label \"alpha\">]>"
+        "<root id=\"7\" tag=\"&label;\"><child>&label;</child><empty flag=\"1\"/><!--tail--></root>";
+
+    XmlReader reader = XmlReader::Create(xml);
+
+    Assert(reader.Read(), "Reader should move to declaration");
+    Assert(reader.NodeType() == XmlNodeType::XmlDeclaration, "First reader event should be declaration");
+
+    Assert(reader.Read(), "Reader should move to document type");
+    Assert(reader.NodeType() == XmlNodeType::DocumentType, "Second reader event should be document type");
+
+    Assert(reader.Read(), "Reader should move to root element");
+    Assert(reader.NodeType() == XmlNodeType::Element, "Third reader event should be root element");
+    Assert(reader.Name() == "root", "Root element name mismatch");
+    Assert(reader.AttributeCount() == 2, "Root element should expose attributes");
+    Assert(reader.GetAttribute("tag") == "alpha", "Reader should decode declared internal entities in attribute values");
+    Assert(reader.MoveToFirstAttribute(), "Reader should move to first attribute");
+    Assert(reader.NodeType() == XmlNodeType::Attribute, "Attribute navigation should change node type");
+    Assert((reader.Name() == "id" && reader.Value() == "7") || (reader.Name() == "tag" && reader.Value() == "alpha"),
+        "Attribute navigation mismatch");
+    Assert(reader.MoveToElement(), "MoveToElement should restore element cursor");
+
+    Assert(reader.Read(), "Reader should move to child element");
+    Assert(reader.Name() == "child", "Child element mismatch");
+    Assert(reader.Read(), "Reader should move to entity reference node");
+    Assert(reader.NodeType() == XmlNodeType::EntityReference && reader.Name() == "label" && reader.Value() == "alpha",
+        "Reader should expose declared internal entities as EntityReference nodes");
+    Assert(reader.Read(), "Reader should move to expanded entity text");
+    Assert(reader.NodeType() == XmlNodeType::Text && reader.Value() == "alpha" && reader.Depth() == 3,
+        "Expanded entity text should be streamed one level deeper than the containing text position");
+    Assert(reader.Read(), "Reader should move to end-entity node");
+    Assert(reader.NodeType() == XmlNodeType::EndEntity && reader.Name() == "label",
+        "Reader should close declared internal entity scopes with EndEntity");
+    Assert(reader.ReadInnerXml().empty() && reader.ReadOuterXml().empty(),
+        "EndEntity should not expose inner or outer XML");
+    Assert(reader.Read(), "Reader should move to child end element");
+    Assert(reader.NodeType() == XmlNodeType::EndElement && reader.Name() == "child", "End element mismatch");
+    Assert(reader.ReadInnerXml().empty() && reader.ReadOuterXml().empty(),
+        "EndElement should not expose inner or outer XML");
+
+    Assert(reader.Read(), "Reader should move to empty element");
+    Assert(reader.Name() == "empty" && reader.IsEmptyElement(), "Empty element flag mismatch");
+    Assert(reader.GetAttribute("flag") == "1", "Reader GetAttribute should return attribute value");
+    Assert(reader.Read(), "Reader should move to comment");
+    Assert(reader.NodeType() == XmlNodeType::Comment, "Comment event should be preserved");
+
+    XmlReader externalReader = XmlReader::Create(
+        "<!DOCTYPE root [<!ENTITY cover SYSTEM \"cover.txt\">]><root>&cover;</root>");
+    Assert(externalReader.Read(), "External entity reader should move to document type");
+    Assert(externalReader.Read(), "External entity reader should move to root element");
+    Assert(externalReader.Read(), "External entity reader should move to unresolved entity reference");
+    Assert(externalReader.NodeType() == XmlNodeType::EntityReference
+            && externalReader.Name() == "cover"
+            && externalReader.Value().empty(),
+        "Declared external entities should surface as unresolved EntityReference nodes");
+    Assert(externalReader.Read(), "External entity reader should move to end entity");
+    Assert(externalReader.NodeType() == XmlNodeType::EndEntity && externalReader.Name() == "cover",
+        "Declared external entities should still produce EndEntity");
+}
+
+void TestXmlReaderNamespaces() {
+    const std::string xml =
+        "<root xmlns=\"urn:root\" xmlns:app=\"urn:app\">"
+        "<app:item app:id=\"42\" plain=\"1\"></app:item>"
+        "</root>";
+
+    XmlReader reader = XmlReader::Create(xml);
+    Assert(reader.Read(), "Reader should reach root element in namespace test");
+    Assert(reader.NamespaceURI() == "urn:root", "Reader default element namespace mismatch");
+
+    Assert(reader.Read(), "Reader should reach prefixed child element");
+    Assert(reader.Name() == "app:item", "Reader child element name mismatch");
+    Assert(reader.LocalName() == "item", "Reader prefixed element local name mismatch");
+    Assert(reader.Prefix() == "app", "Reader prefixed element prefix mismatch");
+    Assert(reader.NamespaceURI() == "urn:app", "Reader prefixed element namespace mismatch");
+    Assert(reader.MoveToAttribute("app:id"), "Reader should move to prefixed attribute");
+    Assert(reader.LocalName() == "id", "Reader prefixed attribute local name mismatch");
+    Assert(reader.Prefix() == "app", "Reader prefixed attribute prefix mismatch");
+    Assert(reader.NamespaceURI() == "urn:app", "Reader prefixed attribute namespace mismatch");
+    Assert(reader.MoveToElement(), "Reader should move back to element");
+    Assert(reader.MoveToAttribute("plain"), "Reader should move to unprefixed attribute");
+    Assert(reader.NamespaceURI().empty(), "Unprefixed attribute should not inherit default namespace");
+    Assert(reader.MoveToElement(), "Reader should move back to element before reading end tag");
+    Assert(reader.Read(), "Reader should reach prefixed child end element");
+    Assert(reader.NodeType() == XmlNodeType::EndElement, "Reader should expose the child end element");
+    Assert(reader.LocalName() == "item", "Reader prefixed end element local name mismatch");
+    Assert(reader.Prefix() == "app", "Reader prefixed end element prefix mismatch");
+}
+
+void TestXmlReaderNodeReaderParity() {
+    const std::string xml =
+        "<!DOCTYPE root ["
+        "<!ENTITY label \"alpha\">"
+        "<!ENTITY gap \"  \">"
+        "<!ENTITY cover SYSTEM \"cover.txt\">"
+        "]>"
+        "<root><text>lead&label;tail</text><ws>&gap;</ws><ext>&cover;</ext><tail>  </tail></root>";
+
+    XmlDocument document;
+    document.SetPreserveWhitespace(true);
+    document.LoadXml(xml);
+    const auto root = document.DocumentElement();
+    Assert(root != nullptr, "Reader parity root missing");
+
+    XmlReader reader = XmlReader::Create(xml);
+    XmlNodeReader nodeReader(*root);
+
+    const auto readerEvents = CaptureComparableReaderEvents(reader);
+    const auto nodeReaderEvents = CaptureComparableReaderEvents(nodeReader);
+    AssertReaderParity(readerEvents, nodeReaderEvents, "XmlReader/XmlNodeReader parity");
+}
+
+void TestXmlReaderNodeReaderSignificantWhitespaceParity() {
+    XmlDocument document;
+    auto root = document.CreateElement("root");
+    root->SetAttribute("xml:space", "preserve");
+    root->AppendChild(document.CreateSignificantWhitespace("  \n"));
+    document.AppendChild(root);
+
+    const std::string xml = document.ToString();
+    XmlReader reader = XmlReader::Create(xml);
+    XmlNodeReader nodeReader(*root);
+
+    const auto readerEvents = CaptureComparableReaderEvents(reader);
+    const auto nodeReaderEvents = CaptureComparableReaderEvents(nodeReader);
+    AssertReaderParity(readerEvents, nodeReaderEvents, "SignificantWhitespace parity");
+
+    XmlReader ignoreWhitespaceReader = XmlReader::Create(xml, XmlReaderSettings{false, true, false});
+    Assert(ignoreWhitespaceReader.Read(), "IgnoreWhitespace reader should reach root element");
+    Assert(ignoreWhitespaceReader.NodeType() == XmlNodeType::Element && ignoreWhitespaceReader.Name() == "root",
+        "IgnoreWhitespace reader root mismatch");
+    Assert(ignoreWhitespaceReader.Read(), "IgnoreWhitespace reader should skip significant whitespace and reach end element");
+    Assert(ignoreWhitespaceReader.NodeType() == XmlNodeType::EndElement && ignoreWhitespaceReader.Name() == "root",
+        "IgnoreWhitespace should suppress significant whitespace events");
+}
+
+void TestReaderEventSnapshotMatrix() {
+    XmlDocument document;
+    document.AppendChild(document.CreateDocumentType(
+        "root",
+        {},
+        {},
+        "<!ENTITY label \"alpha\"><!ENTITY gap \"  \"><!ENTITY cover SYSTEM \"cover.txt\">"));
+
+    auto root = document.CreateElement("root");
+    root->SetAttribute("id", "r");
+
+    auto mix = document.CreateElement("mix");
+    mix->SetAttribute("a", "1");
+    mix->AppendChild(document.CreateTextNode("pre"));
+    mix->AppendChild(document.CreateEntityReference("label"));
+    mix->AppendChild(document.CreateTextNode("post"));
+    mix->AppendChild(document.CreateCDataSection("<cdata>"));
+    mix->AppendChild(document.CreateComment("tail"));
+    mix->AppendChild(document.CreateProcessingInstruction("pi", "value"));
+    root->AppendChild(mix);
+
+    auto whitespaceByEntity = document.CreateElement("ws");
+    whitespaceByEntity->AppendChild(document.CreateEntityReference("gap"));
+    root->AppendChild(whitespaceByEntity);
+
+    auto significantByEntity = document.CreateElement("sig");
+    significantByEntity->SetAttribute("xml:space", "preserve");
+    significantByEntity->AppendChild(document.CreateEntityReference("gap"));
+    root->AppendChild(significantByEntity);
+
+    auto externalEntity = document.CreateElement("ext");
+    externalEntity->AppendChild(document.CreateEntityReference("cover"));
+    root->AppendChild(externalEntity);
+
+    auto rawWhitespace = document.CreateElement("rawWs");
+    rawWhitespace->AppendChild(document.CreateWhitespace("  "));
+    root->AppendChild(rawWhitespace);
+
+    auto rawSignificantWhitespace = document.CreateElement("rawSig");
+    rawSignificantWhitespace->SetAttribute("xml:space", "preserve");
+    rawSignificantWhitespace->AppendChild(document.CreateSignificantWhitespace("  "));
+    root->AppendChild(rawSignificantWhitespace);
+
+    auto empty = document.CreateElement("empty");
+    empty->SetAttribute("flag", "1");
+    root->AppendChild(empty);
+
+    document.AppendChild(root);
+
+    const std::string xml = document.ToString();
+    const std::string rootInnerXml =
+        "<mix a=\"1\">pre&label;post<![CDATA[<cdata>]]><!--tail--><?pi value?></mix>"
+        "<ws>&gap;</ws>"
+        "<sig xml:space=\"preserve\">&gap;</sig>"
+        "<ext>&cover;</ext>"
+        "<rawWs>  </rawWs>"
+        "<rawSig xml:space=\"preserve\">  </rawSig>"
+        "<empty flag=\"1\"/>";
+
+    const std::vector<ReaderEventSnapshot> expected = {
+        {XmlNodeType::Element, "root", {}, 0, false, false, rootInnerXml, "<root id=\"r\">" + rootInnerXml + "</root>", {{"id", "r"}}},
+        {XmlNodeType::Element, "mix", {}, 1, false, false, "pre&label;post<![CDATA[<cdata>]]><!--tail--><?pi value?>", "<mix a=\"1\">pre&label;post<![CDATA[<cdata>]]><!--tail--><?pi value?></mix>", {{"a", "1"}}},
+        {XmlNodeType::Text, {}, "pre", 2, true, false, {}, "pre", {}},
+        {XmlNodeType::EntityReference, "label", "alpha", 2, true, false, {}, "&label;", {}},
+        {XmlNodeType::Text, {}, "alpha", 3, true, false, {}, "alpha", {}},
+        {XmlNodeType::EndEntity, "label", {}, 2, false, false, {}, {}, {}},
+        {XmlNodeType::Text, {}, "post", 2, true, false, {}, "post", {}},
+        {XmlNodeType::CDATA, {}, "<cdata>", 2, true, false, {}, "<![CDATA[<cdata>]]>", {}},
+        {XmlNodeType::Comment, {}, "tail", 2, true, false, {}, "<!--tail-->", {}},
+        {XmlNodeType::ProcessingInstruction, "pi", "value", 2, true, false, {}, "<?pi value?>", {}},
+        {XmlNodeType::EndElement, "mix", {}, 1, false, false, {}, {}, {}},
+        {XmlNodeType::Element, "ws", {}, 1, false, false, "&gap;", "<ws>&gap;</ws>", {}},
+        {XmlNodeType::EntityReference, "gap", "  ", 2, true, false, {}, "&gap;", {}},
+        {XmlNodeType::Whitespace, {}, "  ", 3, true, false, {}, "  ", {}},
+        {XmlNodeType::EndEntity, "gap", {}, 2, false, false, {}, {}, {}},
+        {XmlNodeType::EndElement, "ws", {}, 1, false, false, {}, {}, {}},
+        {XmlNodeType::Element, "sig", {}, 1, false, false, "&gap;", "<sig xml:space=\"preserve\">&gap;</sig>", {{"xml:space", "preserve"}}},
+        {XmlNodeType::EntityReference, "gap", "  ", 2, true, false, {}, "&gap;", {}},
+        {XmlNodeType::SignificantWhitespace, {}, "  ", 3, true, false, {}, "  ", {}},
+        {XmlNodeType::EndEntity, "gap", {}, 2, false, false, {}, {}, {}},
+        {XmlNodeType::EndElement, "sig", {}, 1, false, false, {}, {}, {}},
+        {XmlNodeType::Element, "ext", {}, 1, false, false, "&cover;", "<ext>&cover;</ext>", {}},
+        {XmlNodeType::EntityReference, "cover", {}, 2, true, false, {}, "&cover;", {}},
+        {XmlNodeType::EndEntity, "cover", {}, 2, false, false, {}, {}, {}},
+        {XmlNodeType::EndElement, "ext", {}, 1, false, false, {}, {}, {}},
+        {XmlNodeType::Element, "rawWs", {}, 1, false, false, "  ", "<rawWs>  </rawWs>", {}},
+        {XmlNodeType::Whitespace, {}, "  ", 2, true, false, {}, "  ", {}},
+        {XmlNodeType::EndElement, "rawWs", {}, 1, false, false, {}, {}, {}},
+        {XmlNodeType::Element, "rawSig", {}, 1, false, false, "  ", "<rawSig xml:space=\"preserve\">  </rawSig>", {{"xml:space", "preserve"}}},
+        {XmlNodeType::SignificantWhitespace, {}, "  ", 2, true, false, {}, "  ", {}},
+        {XmlNodeType::EndElement, "rawSig", {}, 1, false, false, {}, {}, {}},
+        {XmlNodeType::Element, "empty", {}, 1, false, true, {}, "<empty flag=\"1\"/>", {{"flag", "1"}}},
+        {XmlNodeType::EndElement, "root", {}, 0, false, false, {}, {}, {}}
+    };
+
+    auto captureXmlReaderMatrix = [&](const XmlReaderSettings& settings) {
+        XmlReader reader = XmlReader::Create(xml, settings);
+        while (reader.Read()) {
+            if (reader.NodeType() == XmlNodeType::Element && reader.Name() == "root") {
+                return CaptureComparableReaderEvents(reader, true);
+            }
+        }
+        return std::vector<ReaderEventSnapshot>{};
+    };
+
+    auto captureNodeReaderMatrix = [&](const XmlReaderSettings& settings) {
+        XmlNodeReader reader(*root, settings);
+        return CaptureComparableReaderEvents(reader);
+    };
+
+    const auto defaultReaderEvents = captureXmlReaderMatrix({});
+    const auto defaultNodeReaderEvents = captureNodeReaderMatrix({});
+    AssertReaderParity(defaultReaderEvents, expected, "XmlReader default snapshot");
+    AssertReaderParity(defaultNodeReaderEvents, expected, "XmlNodeReader default snapshot");
+    AssertReaderParity(defaultReaderEvents, defaultNodeReaderEvents, "Reader default matrix parity");
+
+    const auto withoutWhitespaceExpected = FilterReaderEventSnapshots(expected, true, false, false);
+    const auto withoutWhitespaceReaderEvents = captureXmlReaderMatrix(XmlReaderSettings{false, true, false});
+    const auto withoutWhitespaceNodeReaderEvents = captureNodeReaderMatrix(XmlReaderSettings{false, true, false});
+    AssertReaderParity(withoutWhitespaceReaderEvents, withoutWhitespaceExpected, "XmlReader IgnoreWhitespace snapshot");
+    AssertReaderParity(withoutWhitespaceNodeReaderEvents, withoutWhitespaceExpected, "XmlNodeReader IgnoreWhitespace snapshot");
+    AssertReaderParity(withoutWhitespaceReaderEvents, withoutWhitespaceNodeReaderEvents, "Reader IgnoreWhitespace matrix parity");
+
+    const auto withoutCommentPiExpected = FilterReaderEventSnapshots(expected, false, true, true);
+    const auto withoutCommentPiReaderEvents = captureXmlReaderMatrix(XmlReaderSettings{true, false, true});
+    const auto withoutCommentPiNodeReaderEvents = captureNodeReaderMatrix(XmlReaderSettings{true, false, true});
+    AssertReaderParity(withoutCommentPiReaderEvents, withoutCommentPiExpected, "XmlReader IgnoreComments/PI snapshot");
+    AssertReaderParity(withoutCommentPiNodeReaderEvents, withoutCommentPiExpected, "XmlNodeReader IgnoreComments/PI snapshot");
+    AssertReaderParity(withoutCommentPiReaderEvents, withoutCommentPiNodeReaderEvents, "Reader IgnoreComments/PI matrix parity");
+}
+
+void TestXmlReaderDocumentBoundaryMatrix() {
+    const std::string xml =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<!DOCTYPE root [<!ENTITY label \"alpha\">]>"
+        "<!--lead-->"
+        "<?pi value?>"
+        "<root id=\"7\"><child/>tail<!--inner--><?inner go?></root>"
+        "<!--tail-->";
+
+    const std::vector<ReaderEventSnapshot> expected = {
+        {XmlNodeType::XmlDeclaration, "xml", "version=\"1.0\" encoding=\"utf-8\"", 0, true, false, {}, "<?xml version=\"1.0\" encoding=\"utf-8\"?>", {}},
+        {XmlNodeType::DocumentType, "root", {}, 0, false, false, {}, "<!DOCTYPE root [<!ENTITY label \"alpha\">]>", {}},
+        {XmlNodeType::Comment, {}, "lead", 0, true, false, {}, "<!--lead-->", {}},
+        {XmlNodeType::ProcessingInstruction, "pi", "value", 0, true, false, {}, "<?pi value?>", {}},
+        {XmlNodeType::Element, "root", {}, 0, false, false, "<child/>tail<!--inner--><?inner go?>", "<root id=\"7\"><child/>tail<!--inner--><?inner go?></root>", {{"id", "7"}}},
+        {XmlNodeType::Element, "child", {}, 1, false, true, {}, "<child/>", {}},
+        {XmlNodeType::Text, {}, "tail", 1, true, false, {}, "tail", {}},
+        {XmlNodeType::Comment, {}, "inner", 1, true, false, {}, "<!--inner-->", {}},
+        {XmlNodeType::ProcessingInstruction, "inner", "go", 1, true, false, {}, "<?inner go?>", {}},
+        {XmlNodeType::EndElement, "root", {}, 0, false, false, {}, {}, {}},
+        {XmlNodeType::Comment, {}, "tail", 0, true, false, {}, "<!--tail-->", {}}};
+
+    auto captureBoundaryEvents = [](auto& reader) {
+        return CaptureReaderEventsMatching(
+            reader,
+            [](XmlNodeType nodeType) {
+                switch (nodeType) {
+                case XmlNodeType::XmlDeclaration:
+                case XmlNodeType::DocumentType:
+                case XmlNodeType::Element:
+                case XmlNodeType::Text:
+                case XmlNodeType::Comment:
+                case XmlNodeType::ProcessingInstruction:
+                case XmlNodeType::EndElement:
+                    return true;
+                default:
+                    return false;
+                }
+            });
+    };
+
+    XmlReader reader = XmlReader::Create(xml);
+    const auto readerEvents = captureBoundaryEvents(reader);
+    AssertReaderParity(readerEvents, expected, "XmlReader document-level boundary snapshot");
+
+    const auto document = XmlDocument::Parse(xml);
+    XmlNodeReader nodeReader(*document);
+    const auto nodeReaderEvents = captureBoundaryEvents(nodeReader);
+    AssertReaderParity(nodeReaderEvents, expected, "XmlNodeReader document-level boundary snapshot");
+    AssertReaderParity(readerEvents, nodeReaderEvents, "Document-level reader parity");
+
+    const auto withoutCommentPiExpected = FilterReaderEventSnapshots(expected, false, true, true);
+
+    XmlReader filteredReader = XmlReader::Create(xml, XmlReaderSettings{true, false, true});
+    const auto filteredReaderEvents = captureBoundaryEvents(filteredReader);
+    AssertReaderParity(filteredReaderEvents, withoutCommentPiExpected, "XmlReader document-level IgnoreComments/PI snapshot");
+
+    XmlNodeReader filteredNodeReader(*document, XmlReaderSettings{true, false, true});
+    const auto filteredNodeReaderEvents = captureBoundaryEvents(filteredNodeReader);
+    AssertReaderParity(filteredNodeReaderEvents, withoutCommentPiExpected, "XmlNodeReader document-level IgnoreComments/PI snapshot");
+}
+
+void TestXmlNodeReaderRootBoundaryMatrix() {
+    XmlDocument document;
+
+    auto attribute = document.CreateAttribute("id", "a<b");
+    XmlNodeReader attributeReader(*attribute);
+    AssertReaderBoundaryView(
+        attributeReader,
+        {XmlNodeType::Attribute, "id", "a<b", 0, true, false, "a<b", "id=\"a&lt;b\"", 0},
+        "XmlNodeReader attribute root boundary");
+
+    auto comment = document.CreateComment("gap");
+    XmlNodeReader commentReader(*comment);
+    AssertReaderBoundaryView(
+        commentReader,
+        {XmlNodeType::Comment, {}, "gap", 0, true, false, {}, "<!--gap-->", 0},
+        "XmlNodeReader comment root boundary");
+
+    auto instruction = document.CreateProcessingInstruction("pi", "value");
+    XmlNodeReader instructionReader(*instruction);
+    AssertReaderBoundaryView(
+        instructionReader,
+        {XmlNodeType::ProcessingInstruction, "pi", "value", 0, true, false, {}, "<?pi value?>", 0},
+        "XmlNodeReader PI root boundary");
+
+    auto declaration = document.CreateXmlDeclaration("1.0", "utf-8", {});
+    XmlNodeReader declarationReader(*declaration);
+    AssertReaderBoundaryView(
+        declarationReader,
+        {XmlNodeType::XmlDeclaration, "xml", "version=\"1.0\" encoding=\"utf-8\"", 0, true, false, {}, "<?xml version=\"1.0\" encoding=\"utf-8\"?>", 0},
+        "XmlNodeReader declaration root boundary");
+
+    auto documentType = document.CreateDocumentType("root", {}, {}, "<!ENTITY label \"alpha\">");
+    XmlNodeReader documentTypeReader(*documentType);
+    AssertReaderBoundaryView(
+        documentTypeReader,
+        {XmlNodeType::DocumentType, "root", {}, 0, false, false, {}, "<!DOCTYPE root [<!ENTITY label \"alpha\">]>", 0},
+        "XmlNodeReader DOCTYPE root boundary");
+
+    auto fragment = document.CreateDocumentFragment();
+    fragment->SetInnerXml("<a/>mid<b/>");
+    const std::vector<ReaderEventSnapshot> expectedFragmentEvents = {
+        {XmlNodeType::Element, "a", {}, 0, false, true, {}, "<a/>", {}},
+        {XmlNodeType::Text, {}, "mid", 0, true, false, {}, "mid", {}},
+        {XmlNodeType::Element, "b", {}, 0, false, true, {}, "<b/>", {}}};
+    XmlNodeReader fragmentReader(*fragment);
+    AssertReaderParity(
+        CaptureComparableReaderEvents(fragmentReader),
+        expectedFragmentEvents,
+        "XmlNodeReader fragment root boundary snapshot");
+}
+
+void TestXmlWriterInstance() {
+    XmlWriter writer(XmlWriterSettings{true, false, "  ", "\n"});
+    writer.WriteStartDocument("1.0", "utf-8", {});
+    writer.WriteDocType("app", {}, "app.dtd", {});
+    writer.WriteStartElement("app", "root", "urn:app");
+    writer.WriteAttributeString("id", "42");
+    writer.WriteElementString("title", "Hello");
+    writer.WriteStartElement("entityHost");
+    writer.WriteCharEntity('<');
+    writer.WriteEntityRef("amp");
+    writer.WriteEntityRef("custom");
+    writer.WriteEndElement();
+    writer.WriteStartElement("empty");
+    writer.WriteFullEndElement();
+    writer.WriteComment("done");
+    writer.WriteEndElement();
+
+    const std::string xml = writer.GetString();
+    Assert(xml.find("xmlns:app=\"urn:app\"") != std::string::npos, "Writer should emit namespace declaration");
+    Assert(xml.find("<empty></empty>") != std::string::npos, "WriteFullEndElement should force explicit closing tag");
+    Assert(xml.find("<title>Hello</title>") != std::string::npos, "WriteElementString should write nested text content");
+    Assert(xml.find("<entityHost>&#x3C;&amp;&custom;</entityHost>") != std::string::npos,
+        "WriteCharEntity and WriteEntityRef should preserve character and named entity references in serialized element content");
+
+    XmlWriter defaultNamespaceWriter;
+    defaultNamespaceWriter.WriteStartElement("", "root", "urn:default");
+    defaultNamespaceWriter.WriteEndElement();
+    Assert(defaultNamespaceWriter.GetString().find("<root xmlns=\"urn:default\"/>") != std::string::npos,
+        "Writer should emit default xmlns declaration for empty prefix elements");
+}
+
+void TestXmlWriterStateMachine() {
+    bool threw = false;
+    try {
+        XmlWriter incompleteWriter;
+        incompleteWriter.WriteStartElement("root");
+        (void)incompleteWriter.GetString();
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Writer should reject output while elements are still open");
+
+    XmlWriter writer;
+    writer.WriteStartDocument();
+    writer.WriteStartElement("root");
+    writer.WriteStartElement("child");
+    writer.WriteString("x");
+    writer.WriteEndDocument();
+    const std::string xml = writer.GetString();
+    Assert(xml.find("<root><child>x</child></root>") != std::string::npos,
+        "WriteEndDocument should auto-close open elements");
+
+    threw = false;
+    try {
+        writer.WriteComment("after-close");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Writer should reject writes after the document has been closed");
+
+    threw = false;
+    try {
+        XmlWriter lateDeclarationWriter;
+        lateDeclarationWriter.WriteStartElement("root");
+        lateDeclarationWriter.WriteEndElement();
+        lateDeclarationWriter.WriteStartDocument();
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Writer should require the XML declaration to be written before other nodes");
+
+    threw = false;
+    try {
+        XmlWriter entityWriter;
+        entityWriter.WriteEntityRef("amp");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteEntityRef should reject calls outside of an element");
+
+    threw = false;
+    try {
+        XmlWriter charEntityWriter;
+        charEntityWriter.WriteStartElement("root");
+        charEntityWriter.WriteCharEntity(0x110000);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteCharEntity should reject invalid Unicode scalar values");
+
+    threw = false;
+    try {
+        XmlWriter duplicateRootWriter;
+        duplicateRootWriter.WriteStartElement("root");
+        duplicateRootWriter.WriteEndElement();
+        duplicateRootWriter.WriteRaw("<extra/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should reject a second document-level root element");
+
+    threw = false;
+    try {
+        XmlWriter duplicateNodeWriter;
+        duplicateNodeWriter.WriteStartElement("root");
+        duplicateNodeWriter.WriteEndElement();
+
+        XmlDocument extraDocument;
+        extraDocument.AppendChild(extraDocument.CreateElement("extra"));
+        duplicateNodeWriter.WriteNode(*extraDocument.DocumentElement());
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should reject importing a second document-level root element");
+
+    threw = false;
+    try {
+        XmlWriter duplicateDocTypeWriter;
+        duplicateDocTypeWriter.WriteDocType("root", {}, "root.dtd", {});
+        XmlDocument otherDocument;
+        otherDocument.AppendChild(otherDocument.CreateDocumentType("root", {}, "other.dtd", {}));
+        duplicateDocTypeWriter.WriteNode(*otherDocument.DocumentType());
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should reject importing a second DOCTYPE declaration");
+
+    threw = false;
+    try {
+        XmlWriter declarationOrderWriter;
+        declarationOrderWriter.WriteComment("lead");
+
+        XmlDocument declarationDocument;
+        declarationDocument.AppendChild(declarationDocument.CreateXmlDeclaration("1.0", "utf-8", {}));
+        declarationOrderWriter.WriteNode(*declarationDocument.Declaration());
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should require XML declarations to remain the first document-level node");
+
+    threw = false;
+    try {
+        XmlWriter docTypeOrderWriter;
+        docTypeOrderWriter.WriteStartElement("root");
+        docTypeOrderWriter.WriteEndElement();
+
+        XmlDocument docTypeDocument;
+        docTypeDocument.AppendChild(docTypeDocument.CreateDocumentType("root", {}, "root.dtd", {}));
+        docTypeOrderWriter.WriteNode(*docTypeDocument.DocumentType());
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should require DOCTYPE declarations to remain before the root element");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteEndElement();
+        },
+        "Cannot close an element outside of an element",
+        "WriteEndElement should report a stable outside-element error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteFullEndElement();
+        },
+        "Cannot close an element outside of an element",
+        "WriteFullEndElement should report a stable outside-element error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteEndDocument();
+            writer.WriteEndElement();
+        },
+        "Cannot close an element after the XML document has been closed",
+        "WriteEndElement after WriteEndDocument should report a stable closed-document error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteEndDocument();
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the XML document has been closed",
+        "WriteAttributeString after WriteEndDocument should report a stable closed-document error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteString("x");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteString should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteElementString("child", "x");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteElementString should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlDocument document;
+            const auto child = document.CreateElement("child");
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteNode(*child);
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteNode should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteRaw("<child/>");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteRaw should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteWhitespace(" ");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteWhitespace should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteComment("note");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteComment should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteCData("note");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteCData should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteEntityRef("amp");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "WriteAttributeString after WriteEntityRef should report a stable start-tag-closed error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteEndDocument();
+            writer.WriteEndDocument();
+        },
+        "Cannot end the document after the XML document has been closed",
+        "WriteEndDocument should reject repeated close attempts with a stable error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            (void)writer.GetString();
+        },
+        "Cannot produce XML output while elements are still open",
+        "GetString should report a stable error while elements remain open");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteComment("lead");
+            (void)writer.GetString();
+        },
+        "Cannot produce XML output without a root element",
+        "GetString should report a stable error when no root element exists");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteStartDocument();
+        },
+        "Cannot write XML declaration inside an element",
+        "WriteStartDocument should report a stable inside-element error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteComment("lead");
+            writer.WriteStartDocument();
+        },
+        "XML declaration must be the first node in the document",
+        "WriteStartDocument should report a stable first-node ordering error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteDocType("root", {}, "root.dtd", {});
+        },
+        "Cannot write DOCTYPE inside an element",
+        "WriteDocType should report a stable inside-element error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteEndElement();
+            writer.WriteDocType("root", {}, "root.dtd", {});
+        },
+        "DOCTYPE must appear before the root element",
+        "WriteDocType should report a stable post-root ordering error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteEndElement();
+            writer.WriteStartElement("extra");
+        },
+        "The XML document already has a root element",
+        "WriteStartElement should report a stable duplicate-root error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            XmlDocument document;
+            writer.WriteStartElement("root");
+            writer.WriteNode(*document.CreateDocumentType("root", {}, "root.dtd", {}));
+        },
+        "Cannot write document-level nodes inside an element",
+        "WriteNode should report a stable inside-element error for document-level nodes");
+}
+
+void TestXmlWriterConfiguration() {
+    XmlWriter writer(XmlWriterSettings{false, false, "  ", "\n", XmlNewLineHandling::Replace});
+    writer.WriteStartElement("root");
+    writer.WriteAttributeString("text", "a\r\nb");
+    writer.WriteString("x\r\ny");
+    writer.WriteEndElement();
+    const std::string xml = writer.GetString();
+
+    Assert(xml.find("text=\"a\nb\"") != std::string::npos,
+        "Writer should normalize attribute newlines when NewLineHandling is Replace");
+    Assert(xml.find(">x\ny<") != std::string::npos,
+        "Writer should normalize text newlines when NewLineHandling is Replace");
+
+    XmlWriter customNewLineWriter(XmlWriterSettings{false, false, "  ", "|", XmlNewLineHandling::Replace});
+    customNewLineWriter.WriteStartElement("root");
+    customNewLineWriter.WriteAttributeString("text", "a\r\nb");
+    customNewLineWriter.WriteString("x\ny");
+    customNewLineWriter.WriteEndElement();
+    const std::string customNewLineXml = customNewLineWriter.GetString();
+    Assert(customNewLineXml.find("text=\"a|b\"") != std::string::npos,
+        "Writer should honor custom NewLineChars when normalizing attribute newlines");
+    Assert(customNewLineXml.find(">x|y<") != std::string::npos,
+        "Writer should honor custom NewLineChars when normalizing text newlines");
+
+    XmlWriter encodedWriter(XmlWriterSettings{false, false, "  ", "\n", XmlNewLineHandling::None, "utf-16"});
+    encodedWriter.WriteStartDocument();
+    encodedWriter.WriteStartElement("root");
+    encodedWriter.WriteEndElement();
+    Assert(encodedWriter.GetString().find("encoding=\"utf-16\"") != std::string::npos,
+        "Writer should default XML declaration encoding from settings");
+
+    XmlWriterSettings fragmentSettings;
+    fragmentSettings.Conformance = ConformanceLevel::Fragment;
+    XmlWriter fragmentWriter(fragmentSettings);
+    fragmentWriter.WriteComment("lead");
+    fragmentWriter.WriteStartElement("a");
+    fragmentWriter.WriteEndElement();
+    fragmentWriter.WriteStartElement("b");
+    fragmentWriter.WriteEndElement();
+    Assert(fragmentWriter.GetString() == "<!--lead--><a/><b/>",
+        "Fragment writer should allow multiple top-level nodes without a synthetic root");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriterSettings settings;
+            settings.Conformance = ConformanceLevel::Fragment;
+            XmlWriter writer(settings);
+            writer.WriteStartDocument();
+        },
+        "XML declaration is only allowed in document conformance mode",
+        "Fragment writer should reject XML declarations");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriterSettings settings;
+            settings.Conformance = ConformanceLevel::Fragment;
+            XmlWriter writer(settings);
+            writer.WriteDocType("root");
+        },
+        "DOCTYPE is only allowed in document conformance mode",
+        "Fragment writer should reject DOCTYPE declarations");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteComment("lead");
+            (void)writer.GetString();
+        },
+        "Cannot produce XML output without a root element",
+        "Document writer should still require a root element before output");
+}
+
+void TestXmlWriterWhitespace() {
+    XmlWriter writer;
+    writer.WriteStartElement("root");
+    writer.WriteWhitespace("  ");
+    writer.WriteElementString("child", "x");
+    writer.WriteSignificantWhitespace("\n");
+    writer.WriteEndElement();
+
+    Assert(writer.GetString() == "<root>  <child>x</child>\n</root>",
+        "Writer should preserve explicit whitespace and significant whitespace nodes");
+
+    bool threw = false;
+    try {
+        XmlWriter invalidWhitespaceWriter;
+        invalidWhitespaceWriter.WriteWhitespace("not whitespace");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteWhitespace should reject non-whitespace content");
+
+    threw = false;
+    try {
+        XmlWriter invalidSignificantWriter;
+        invalidSignificantWriter.WriteSignificantWhitespace("x");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteSignificantWhitespace should reject non-whitespace content");
+}
+
+void TestXmlWriterWriteNode() {
+    XmlDocument source;
+    source.AppendChild(source.CreateDocumentType("catalog", {}, {}, "<!ENTITY label \"copy\">"));
+    auto payload = source.CreateElement("payload");
+    payload->SetAttribute("id", "42");
+    payload->AppendChild(source.CreateEntityReference("amp"));
+    payload->AppendChild(source.CreateTextNode("tail"));
+    source.AppendChild(payload);
+
+    XmlWriter writer;
+    writer.WriteNode(*source.DocumentType());
+    writer.WriteNode(*payload);
+    const std::string xml = writer.GetString();
+    Assert(xml.find("<!DOCTYPE catalog [<!ENTITY label \"copy\">]>") != std::string::npos,
+        "WriteNode should preserve document type declarations when writing document-level nodes");
+    Assert(xml.find("<payload id=\"42\">&amp;tail</payload>") != std::string::npos,
+        "WriteNode should preserve imported entity references and child content");
+
+    auto fragment = source.CreateDocumentFragment();
+    fragment->AppendChild(source.CreateElement("a"));
+    fragment->AppendChild(source.CreateTextNode("mid"));
+    fragment->AppendChild(source.CreateElement("b"));
+
+    XmlWriter fragmentWriter;
+    fragmentWriter.WriteStartElement("root");
+    fragmentWriter.WriteNode(*fragment);
+    fragmentWriter.WriteEndElement();
+    Assert(fragmentWriter.GetString() == "<root><a/>mid<b/></root>",
+        "WriteNode should inline document fragment children inside the current element");
+
+    bool threw = false;
+    try {
+        XmlWriter invalidWriter;
+        invalidWriter.WriteStartElement("root");
+        invalidWriter.WriteNode(*source.DocumentType());
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should reject document-level nodes inside elements");
+
+    threw = false;
+    try {
+        XmlWriter attributeWriter;
+        XmlDocument attributeDocument;
+        const auto attribute = attributeDocument.CreateAttribute("id", "42");
+        attributeWriter.WriteNode(*attribute);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should reject attribute nodes when no element is open");
+}
+
+void TestXmlWriterWriteRaw() {
+    XmlWriter writer;
+    writer.WriteStartElement("root");
+    writer.WriteRaw("<child a=\"1\"/>mid<!--tail-->");
+    writer.WriteEndElement();
+    Assert(writer.GetString() == "<root><child a=\"1\"/>mid<!--tail--></root>",
+        "WriteRaw should inject parsed raw markup into the current element");
+
+    XmlWriter documentWriter;
+    documentWriter.WriteRaw("<!--lead--><root/>");
+    Assert(documentWriter.GetString() == "<!--lead--><root/>",
+        "WriteRaw should support document-level raw markup fragments");
+
+    XmlWriter fullDocumentWriter;
+    fullDocumentWriter.WriteRaw(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<!DOCTYPE root [<!ENTITY label \"value\">]>"
+        "<root>&label;</root>");
+    const std::string fullDocumentXml = fullDocumentWriter.GetString();
+    Assert(fullDocumentXml.find("<?xml version=\"1.0\" encoding=\"utf-8\"?>") != std::string::npos,
+        "WriteRaw should support document-level XML declarations when parsing full documents");
+    Assert(fullDocumentXml.find("<!DOCTYPE root [<!ENTITY label \"value\">]>") != std::string::npos,
+        "WriteRaw should preserve document-level DOCTYPE declarations when parsing full documents");
+    Assert(fullDocumentXml.find("<root>&label;</root>") != std::string::npos,
+        "WriteRaw should preserve parsed entity references from full-document input");
+
+    XmlWriter stagedDocumentWriter;
+    stagedDocumentWriter.WriteRaw("<!--lead-->");
+    stagedDocumentWriter.WriteRaw("<root/>");
+    Assert(stagedDocumentWriter.GetString() == "<!--lead--><root/>",
+        "WriteRaw should still allow staging document-level fragments before the root element exists");
+
+    bool threw = false;
+    try {
+        XmlWriter invalidWriter;
+        invalidWriter.WriteStartElement("root");
+        invalidWriter.WriteRaw("<?xml version=\"1.0\"?><child/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should reject embedded XML declarations inside element content");
+
+    threw = false;
+    try {
+        XmlWriter secondRootWriter;
+        secondRootWriter.WriteRaw("<root/>");
+        secondRootWriter.WriteRaw("<extra/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should reject a second root element after document-level output has started");
+
+    threw = false;
+    try {
+        XmlWriter secondDocTypeWriter;
+        secondDocTypeWriter.WriteRaw("<!DOCTYPE root SYSTEM \"root.dtd\"><root/>");
+        secondDocTypeWriter.WriteRaw("<!DOCTYPE root SYSTEM \"other.dtd\">");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should reject a second document-level DOCTYPE declaration");
+
+    threw = false;
+    try {
+        XmlWriter declarationOrderWriter;
+        declarationOrderWriter.WriteRaw("<!--lead-->");
+        declarationOrderWriter.WriteRaw("<?xml version=\"1.0\" encoding=\"utf-8\"?><root/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should reject XML declarations that are no longer the first document-level node");
+
+    threw = false;
+    try {
+        XmlWriter docTypeOrderWriter;
+        docTypeOrderWriter.WriteRaw("<root/>");
+        docTypeOrderWriter.WriteRaw("<!DOCTYPE root SYSTEM \"root.dtd\">");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should reject DOCTYPE declarations that appear after the root element");
+}
+
+void TestXmlWriterFormattingBoundaries() {
+    XmlWriter writer(XmlWriterSettings{true, false, "  ", "\n"});
+    writer.WriteStartDocument("1.0", "utf-8", {});
+    writer.WriteDocType("root", {}, "root.dtd", {});
+    writer.WriteComment("lead");
+    writer.WriteProcessingInstruction("pi", "value");
+    writer.WriteStartElement("root");
+    writer.WriteElementString("child", "x");
+    writer.WriteEndElement();
+    writer.WriteComment("tail");
+
+    Assert(
+        writer.GetString()
+            == "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE root SYSTEM \"root.dtd\">\n<!--lead-->\n<?pi value?>\n<root>\n  <child>x</child>\n</root>\n<!--tail-->",
+        "Writer should preserve exact top-level formatting order for declaration, DOCTYPE, comments, PI, root, and trailing comments");
+
+    XmlDocument document;
+    document.AppendChild(document.CreateXmlDeclaration("1.0", "utf-8", {}));
+    document.AppendChild(document.CreateDocumentType("root", {}, "root.dtd", {}));
+    document.AppendChild(document.CreateElement("root"));
+
+    XmlWriterSettings omitDeclarationSettings;
+    omitDeclarationSettings.Indent = true;
+    omitDeclarationSettings.NewLineChars = "\n";
+    omitDeclarationSettings.OmitXmlDeclaration = true;
+    Assert(
+        document.ToString(omitDeclarationSettings) == "<!DOCTYPE root SYSTEM \"root.dtd\">\n<root/>",
+        "OmitXmlDeclaration should suppress the declaration without leaving a leading blank line");
+
+    XmlDocument mixedDocument;
+    auto mixedRoot = mixedDocument.CreateElement("root");
+    auto mixed = mixedDocument.CreateElement("mix");
+    mixed->AppendChild(mixedDocument.CreateTextNode("a"));
+    mixed->AppendChild(mixedDocument.CreateComment("gap"));
+    mixed->AppendChild(mixedDocument.CreateElement("inner"));
+    mixed->AppendChild(mixedDocument.CreateTextNode("b"));
+    mixedRoot->AppendChild(mixed);
+    mixedDocument.AppendChild(mixedRoot);
+
+    XmlWriterSettings mixedSettings;
+    mixedSettings.Indent = true;
+    mixedSettings.NewLineChars = "\n";
+    Assert(
+        mixedDocument.ToString(mixedSettings) == "<root>\n  <mix>a<!--gap--><inner/>b</mix>\n</root>",
+        "Indent mode should not inject extra whitespace into mixed-content elements");
+
+    XmlDocument fragmentDocument;
+    auto fragment = fragmentDocument.CreateDocumentFragment();
+    fragment->AppendChild(fragmentDocument.CreateElement("a"));
+    fragment->AppendChild(fragmentDocument.CreateComment("gap"));
+    fragment->AppendChild(fragmentDocument.CreateElement("b"));
+
+    Assert(
+        XmlWriter::WriteToString(*fragment, XmlWriterSettings{true, false, "  ", "\n"}) == "<a/>\n<!--gap-->\n<b/>",
+        "Indented DocumentFragment serialization should separate top-level children with configured newlines");
+}
+
+void TestXmlWriterHighFrequencyApis() {
+    XmlWriter writer;
+    writer.WriteStartElement("app", "root", "urn:app");
+    writer.WriteStartAttribute("id");
+    writer.WriteValue(42);
+    writer.WriteEndAttribute();
+    writer.WriteStartAttribute("app", "name", "urn:app");
+    writer.WriteQualifiedName("root", "urn:app");
+    writer.WriteEndAttribute();
+
+    XmlDocument attributeSourceDocument;
+    auto attributeSource = attributeSourceDocument.CreateElement("source");
+    attributeSource->SetAttribute("copied", "yes");
+    attributeSource->SetAttribute("xmlns:meta", "urn:meta");
+    attributeSource->SetAttribute("meta:flag", "1");
+    writer.WriteAttributes(*attributeSource);
+    writer.WriteString("prefix:");
+    writer.WriteName("leaf");
+    writer.WriteRaw("<raw/>");
+
+    XmlDocument importedDocument;
+    auto imported = importedDocument.CreateElement("imported");
+    imported->SetAttribute("kind", "node");
+    writer.WriteNode(*imported);
+
+    writer.WriteStartElement("holder");
+    writer.WriteEntityRef("amp");
+    writer.WriteEndElement();
+    writer.Flush();
+    writer.WriteEndElement();
+
+    const std::string xml = writer.GetString();
+    Assert(xml.find("<app:root xmlns:app=\"urn:app\" id=\"42\" app:name=\"app:root\" copied=\"yes\" xmlns:meta=\"urn:meta\" meta:flag=\"1\">") != std::string::npos,
+        "WriteStartAttribute/WriteEndAttribute/WriteValue/WriteAttributes should serialize attributes in the current start tag");
+    Assert(xml.find("prefix:leaf<raw/><imported kind=\"node\"/><holder>&amp;</holder>") != std::string::npos,
+        "WriteName/WriteRaw/WriteNode/WriteEntityRef should remain compatible with the new Writer APIs");
+
+    XmlWriter collectionWriter;
+    collectionWriter.WriteStartElement("root");
+    collectionWriter.WriteAttributes(attributeSource->AttributeNodes());
+    collectionWriter.WriteEndElement();
+    Assert(collectionWriter.GetString().find("<root copied=\"yes\" xmlns:meta=\"urn:meta\" meta:flag=\"1\"/>") != std::string::npos,
+        "WriteAttributes(XmlAttributeCollection) should copy attribute collections onto the current element");
+
+    XmlWriter closeWriter;
+    closeWriter.WriteStartElement("root");
+    closeWriter.WriteElementString("child", "x");
+    closeWriter.Close();
+    Assert(closeWriter.GetString() == "<root><child>x</child></root>",
+        "Close should finalize the in-memory writer and preserve output");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteEndAttribute();
+        },
+        "Cannot end an attribute when no attribute is open",
+        "WriteEndAttribute should report a stable no-open-attribute error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteStartAttribute("id");
+            writer.WriteRaw("<child/>");
+        },
+        "Cannot write raw XML while an attribute is still open",
+        "WriteRaw should reject calls while an attribute is still open");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            XmlDocument document;
+            const auto node = document.CreateElement("child");
+            writer.WriteStartElement("root");
+            writer.WriteStartAttribute("id");
+            writer.WriteNode(*node);
+        },
+        "Cannot write a node while an attribute is still open",
+        "WriteNode should reject calls while an attribute is still open");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteStartAttribute("id");
+            writer.WriteEntityRef("amp");
+        },
+        "Cannot write an entity reference while an attribute is still open",
+        "WriteEntityRef should reject calls while an attribute is still open");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteStartAttribute("id");
+            (void)writer.GetString();
+        },
+        "Cannot produce XML output while an attribute is still open",
+        "GetString should reject output while an attribute is still open");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteStartAttribute("id");
+            writer.Flush();
+        },
+        "Cannot flush the writer while an attribute is still open",
+        "Flush should reject calls while an attribute is still open");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteName("1bad");
+        },
+        "WriteName requires a valid XML name",
+        "WriteName should reject invalid XML names with a stable error");
+
+    AssertXmlExceptionMessage(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteQualifiedName("value", "urn:missing");
+        },
+        "WriteQualifiedName requires a namespace prefix bound to URI: urn:missing",
+        "WriteQualifiedName should reject unresolved namespace URIs with a stable error");
+}
+
+void TestXmlExceptionClassification() {
+    const auto document = XmlDocument::Parse("<root><item id=\"1\">alpha</item></root>");
+
+    auto expectXmlExceptionContaining = [](auto action, const std::string& expectedFragment, const std::string& label) {
+        bool threw = false;
+        try {
+            action();
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find(expectedFragment) != std::string::npos;
+        }
+        Assert(threw, label);
+    };
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("</root>");
+        } catch (const XmlException&) {
+            threw = true;
+        }
+        Assert(threw, "Malformed XML input should stay in the invalid-input XmlException category");
+    }
+
+    expectXmlExceptionContaining(
+        [&] {
+            (void)document->SelectNodes("/root/item[");
+        },
+        "Invalid XPath predicate: item[",
+        "Malformed XPath predicates should stay in the invalid-input XmlException category");
+
+    expectXmlExceptionContaining(
+        [&] {
+            (void)document->SelectNodes("/root/item[contains(text())]");
+        },
+        "Unsupported XPath feature: predicate [contains(text())]",
+        "Unsupported XPath features should stay in the unsupported XmlException category");
+
+    expectXmlExceptionContaining(
+        [&] {
+            (void)document->SelectNodes("/root/item[boolean(@id, @id)]");
+        },
+        "Unsupported XPath feature: predicate [boolean(@id, @id)]",
+        "Unsupported XPath function arity should stay in the unsupported XmlException category");
+
+    expectXmlExceptionContaining(
+        [&] {
+            (void)document->SelectNodes("/root/item[meta/text()/id='x']");
+        },
+        "Unsupported XPath feature: predicate path [meta/text()/id]",
+        "Unsupported XPath path shapes should stay in the unsupported XmlException category");
+
+    expectXmlExceptionContaining(
+        [] {
+            (void)XmlDocument::Parse("<!DOCTYPE root [<!ELEMENT root ANY>]><root/>");
+        },
+        "Unsupported DTD declaration: ELEMENT",
+        "Unsupported DTD declarations should stay in the unsupported XmlException category");
+
+    expectXmlExceptionContaining(
+        [] {
+            XmlWriter writer;
+            writer.WriteStartElement("root");
+            writer.WriteString("x");
+            writer.WriteAttributeString("id", "42");
+        },
+        "Cannot write an attribute after the current element start tag has been closed",
+        "Illegal writer state transitions should stay in the writer-state XmlException category");
+}
+
+void TestXmlReaderStreamingSettings() {
+    const std::string xml = "<root>  <child a=\"1\">x</child><!--comment--></root>";
+    XmlReader reader = XmlReader::Create(xml, XmlReaderSettings{true, true});
+
+    Assert(reader.Read(), "Reader should reach root element");
+    Assert(reader.NodeType() == XmlNodeType::Element && reader.Name() == "root", "Root element mismatch");
+    Assert(reader.ReadInnerXml().find("<child a=\"1\">x</child>") != std::string::npos, "ReadInnerXml should return raw inner markup");
+
+    Assert(reader.Read(), "Reader should reach child element");
+    Assert(reader.Name() == "child", "Child element mismatch");
+    Assert(reader.ReadOuterXml() == "<child a=\"1\">x</child>", "ReadOuterXml should preserve element markup");
+    Assert(reader.GetAttribute("a") == "1", "Attribute lookup on streaming reader failed");
+
+    Assert(reader.Read(), "Reader should reach text node");
+    Assert(reader.NodeType() == XmlNodeType::Text && reader.Value() == "x", "Text node content mismatch");
+    Assert(reader.Read(), "Reader should reach child end element");
+    Assert(reader.NodeType() == XmlNodeType::EndElement && reader.Name() == "child", "End element mismatch after text node");
+    Assert(reader.Read(), "Reader should skip ignored comment and reach root end element");
+    Assert(reader.NodeType() == XmlNodeType::EndElement && reader.Name() == "root", "IgnoreComments should suppress comment nodes");
+    Assert(!reader.Read() && reader.IsEOF(), "Reader should report EOF after the last node");
+
+    {
+        auto outerXmlReader = XmlReader::Create(
+            "<?xml version='1.0' encoding='utf-8'?>"
+            "<!DOCTYPE root [<!ENTITY ent 'v'>]>"
+            "<root><?pi data?><!--comment--><![CDATA[x<y>]]><empty/>&ent;</root>");
+
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::XmlDeclaration,
+            "OuterXml coverage reader should expose the XML declaration first");
+        Assert(outerXmlReader.ReadOuterXml() == "<?xml version='1.0' encoding='utf-8'?>"
+                || outerXmlReader.ReadOuterXml() == "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+            "ReadOuterXml should preserve XML declaration markup");
+
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::DocumentType,
+            "OuterXml coverage reader should expose the DOCTYPE");
+        Assert(outerXmlReader.ReadOuterXml() == "<!DOCTYPE root [<!ENTITY ent 'v'>]>"
+                || outerXmlReader.ReadOuterXml() == "<!DOCTYPE root [<!ENTITY ent \"v\">]>",
+            "ReadOuterXml should preserve DOCTYPE markup");
+
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::Element && outerXmlReader.Name() == "root",
+            "OuterXml coverage reader should expose the root element");
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::ProcessingInstruction,
+            "OuterXml coverage reader should expose PI nodes");
+        Assert(outerXmlReader.ReadOuterXml() == "<?pi data?>",
+            "ReadOuterXml should preserve PI markup");
+
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::Comment,
+            "OuterXml coverage reader should expose comment nodes");
+        Assert(outerXmlReader.ReadOuterXml() == "<!--comment-->",
+            "ReadOuterXml should preserve comment markup");
+
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::CDATA,
+            "OuterXml coverage reader should expose CDATA nodes");
+        Assert(outerXmlReader.ReadOuterXml() == "<![CDATA[x<y>]]>",
+            "ReadOuterXml should preserve CDATA markup");
+
+        Assert(outerXmlReader.Read() && outerXmlReader.NodeType() == XmlNodeType::Element && outerXmlReader.Name() == "empty",
+            "OuterXml coverage reader should expose empty elements");
+        Assert(outerXmlReader.ReadOuterXml() == "<empty/>",
+            "ReadOuterXml should preserve empty-element markup");
+    }
+
+    {
+        auto attributeReader = XmlReader::Create("<root attr='A &amp; B' xml:space='preserve'>  </root>");
+        Assert(attributeReader.Read() && attributeReader.NodeType() == XmlNodeType::Element,
+            "Attribute coverage reader should expose the root element");
+        Assert(attributeReader.GetAttribute("attr") == "A & B",
+            "GetAttribute should decode entity references lazily");
+        Assert(attributeReader.MoveToAttribute("attr") && attributeReader.Value() == "A & B",
+            "Attribute Value should decode entity references lazily");
+        Assert(attributeReader.MoveToElement(),
+            "MoveToElement should succeed after reading a lazy attribute value");
+        Assert(attributeReader.Read() && attributeReader.NodeType() == XmlNodeType::SignificantWhitespace && attributeReader.Value() == "  ",
+            "xml:space should still honor decoded attribute values");
+    }
+}
+
+void TestXmlReaderConfiguration() {
+    const std::string xml = "<root><?pi test?><child/></root>";
+    XmlReader reader = XmlReader::Create(xml, XmlReaderSettings{false, false, true});
+
+    Assert(reader.Read(), "Reader should reach root element with PI filtering enabled");
+    Assert(reader.Read(), "Reader should skip PI and reach child element");
+    Assert(reader.NodeType() == XmlNodeType::Element && reader.Name() == "child",
+        "IgnoreProcessingInstructions should suppress processing instruction nodes");
+
+    {
+        XmlReaderSettings settings;
+        settings.DtdProcessing = DtdProcessing::Prohibit;
+        bool threw = false;
+        try {
+            auto dtdReader = XmlReader::Create("<!DOCTYPE root><root/>", settings);
+            while (dtdReader.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("DTD is prohibited") != std::string::npos;
+        }
+        Assert(threw, "DtdProcessing::Prohibit should reject DOCTYPE");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.DtdProcessing = DtdProcessing::Ignore;
+        auto dtdReader = XmlReader::Create("<!DOCTYPE root><root/>", settings);
+        Assert(dtdReader.Read(), "Reader should skip ignored DOCTYPE and reach root");
+        Assert(dtdReader.NodeType() == XmlNodeType::Element && dtdReader.Name() == "root",
+            "DtdProcessing::Ignore should suppress the DOCTYPE event");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.MaxCharactersInDocument = 5;
+        bool threw = false;
+        try {
+            auto limited = XmlReader::Create("<root>123456</root>", settings);
+            while (limited.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
+        }
+        Assert(threw, "MaxCharactersInDocument should stop oversized input");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.MaxCharactersFromEntities = 2;
+        bool threw = false;
+        try {
+            auto limited = XmlReader::Create("<!DOCTYPE root [<!ENTITY a 'abcd'>]><root>&a;</root>", settings);
+            while (limited.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersFromEntities") != std::string::npos;
+        }
+        Assert(threw, "MaxCharactersFromEntities should stop oversized entity expansion");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Conformance = ConformanceLevel::Fragment;
+        auto fragmentReader = XmlReader::Create("<a/><b/>", settings);
+        Assert(fragmentReader.Read() && fragmentReader.Name() == "a", "Fragment reader should read first top-level element");
+        Assert(fragmentReader.Read() && fragmentReader.Name() == "b", "Fragment reader should read second top-level element");
+    }
+
+    {
+        std::istringstream stream("<root><child/></root>");
+        auto streamReader = XmlReader::Create(stream);
+        Assert(streamReader.Read() && streamReader.Name() == "root", "Reader should support istream input");
+    }
+
+    {
+        std::string payload(100000, 'x');
+        std::string streamXml = "<root>" + payload + "</root>";
+        std::istringstream stream(streamXml);
+        auto streamReader = XmlReader::Create(stream);
+        const auto consumedAfterCreate = stream.tellg();
+        Assert(consumedAfterCreate != std::streampos(-1)
+                && static_cast<std::size_t>(consumedAfterCreate) < streamXml.size(),
+            "Stream-backed reader should not consume the full stream during Create");
+        Assert(streamReader.Read() && streamReader.Name() == "root",
+            "Stream-backed reader should still read the root element after partial prebuffering");
+    }
+
+    {
+        std::string payload(100000, 'x');
+        std::string streamXml = "<?xml version='1.0'?><root>" + payload + "</root>";
+        std::istringstream stream(streamXml);
+        auto streamReader = XmlReader::Create(stream);
+        Assert(streamReader.Read() && streamReader.NodeType() == XmlNodeType::XmlDeclaration,
+            "Stream-backed reader should read the XML declaration first");
+        const auto consumedAfterDeclaration = stream.tellg();
+        Assert(consumedAfterDeclaration != std::streampos(-1)
+                && static_cast<std::size_t>(consumedAfterDeclaration) < streamXml.size(),
+            "Reading an XML declaration from a stream should not force full buffering");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.MaxCharactersInDocument = 5;
+        std::string payload(100000, 'x');
+        std::string streamXml = "<root>" + payload + "</root>";
+        std::istringstream stream(streamXml);
+        bool threw = false;
+        try {
+            auto streamReader = XmlReader::Create(stream, settings);
+            while (streamReader.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
+        }
+        const auto consumedBeforeFailure = stream.tellg();
+        Assert(consumedBeforeFailure != std::streampos(-1)
+                && static_cast<std::size_t>(consumedBeforeFailure) < streamXml.size(),
+            "MaxCharactersInDocument should not force full stream consumption before failing");
+        Assert(threw, "Stream-backed MaxCharactersInDocument should still stop oversized input without fully consuming the stream");
+    }
+
+    {
+        auto subtreeSource = XmlReader::Create("<root><child>42</child><other/></root>");
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "root", "Subtree source should read root");
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "child", "Subtree source should read child");
+        auto subtree = subtreeSource.ReadSubtree();
+        Assert(subtree.Read() && subtree.Name() == "child", "ReadSubtree should start at current element");
+        Assert(subtree.Read() && subtree.NodeType() == XmlNodeType::Text && subtree.Value() == "42",
+            "ReadSubtree should expose descendant content");
+        Assert(subtree.Read() && subtree.NodeType() == XmlNodeType::EndElement && subtree.Name() == "child",
+            "ReadSubtree should close at the subtree root end element");
+        Assert(!subtree.Read(), "ReadSubtree should not expose sibling content outside the subtree");
+        Assert(subtreeSource.ReadInnerXml() == "42",
+            "ReadSubtree should not break subsequent ReadInnerXml on the same source element");
+        Assert(subtreeSource.ReadOuterXml() == "<child>42</child>",
+            "ReadSubtree should not break subsequent ReadOuterXml on the same source element");
+        Assert(subtreeSource.Read() && subtreeSource.NodeType() == XmlNodeType::Text && subtreeSource.Value() == "42",
+            "Original reader should remain positioned independently after ReadSubtree creation");
+        Assert(subtreeSource.Read() && subtreeSource.NodeType() == XmlNodeType::EndElement && subtreeSource.Name() == "child",
+            "Original reader should still read the child end element after subtree creation");
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "other",
+            "Original reader should continue to sibling elements after subtree use");
+    }
+
+    {
+        const std::string payload(4 * 1024 * 1024, 'x');
+        std::istringstream stream("<root><child>" + payload + "</child><other/></root>");
+        auto subtreeSource = XmlReader::Create(stream);
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "root",
+            "Large stream subtree source should read root");
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "child",
+            "Large stream subtree source should read child");
+        auto subtree = subtreeSource.ReadSubtree();
+
+        Assert(subtreeSource.Read() && subtreeSource.NodeType() == XmlNodeType::Text,
+            "Large stream subtree source should read child text");
+        Assert(subtreeSource.Read() && subtreeSource.NodeType() == XmlNodeType::EndElement && subtreeSource.Name() == "child",
+            "Large stream subtree source should read child end element");
+        Assert(subtreeSource.Read() && subtreeSource.Name() == "other",
+            "Large stream subtree source should continue to sibling after large child");
+
+        Assert(subtree.Read() && subtree.Name() == "child",
+            "Large stream subtree should still start at child after parent advances");
+        std::string subtreeText = subtree.ReadElementContentAsString();
+        Assert(subtreeText.size() == payload.size() && subtreeText == payload,
+            "Large stream subtree should still read old text after parent buffer pruning");
+    }
+
+    {
+        auto typed = XmlReader::Create("<root><i>42</i><b>true</b><d>3.5</d><bin>SGk=</bin></root>");
+        Assert(typed.Read() && typed.Name() == "root", "Typed reader should read root");
+        Assert(typed.Read() && typed.Name() == "i", "Typed reader should read int element");
+        Assert(typed.Read() && typed.ReadContentAsInt() == 42, "ReadContentAsInt should parse integer content");
+        Assert(typed.Name() == "b" || typed.Read(), "Typed reader should advance after int content");
+        if (typed.NodeType() != XmlNodeType::Element || typed.Name() != "b") {
+            Assert(typed.Read() && typed.Name() == "b", "Typed reader should reach bool element");
+        }
+        Assert(typed.Read() && typed.ReadContentAsBoolean(), "ReadContentAsBoolean should parse boolean content");
+        if (typed.NodeType() != XmlNodeType::Element || typed.Name() != "d") {
+            Assert(typed.Read() && typed.Name() == "d", "Typed reader should reach double element");
+        }
+        Assert(typed.Read() && std::abs(typed.ReadContentAsDouble() - 3.5) < 1e-9,
+            "ReadContentAsDouble should parse floating-point content");
+        if (typed.NodeType() != XmlNodeType::Element || typed.Name() != "bin") {
+            Assert(typed.Read() && typed.Name() == "bin", "Typed reader should reach base64 element");
+        }
+        Assert(typed.Read(), "Typed reader should move to base64 text");
+        std::vector<unsigned char> bytes;
+        Assert(typed.ReadBase64(bytes) == 2 && bytes.size() == 2 && bytes[0] == 'H' && bytes[1] == 'i',
+            "ReadBase64 should decode base64 text content");
+    }
+
+    {
+        auto splitBase64 = XmlReader::Create("<root><bin>S<![CDATA[G]]>k=</bin></root>");
+        Assert(splitBase64.Read() && splitBase64.Name() == "root", "Split base64 reader should read root");
+        Assert(splitBase64.Read() && splitBase64.Name() == "bin", "Split base64 reader should read bin element");
+        Assert(splitBase64.Read(), "Split base64 reader should move to text content");
+        std::vector<unsigned char> bytes;
+        Assert(splitBase64.ReadBase64(bytes) == 2 && bytes.size() == 2 && bytes[0] == 'H' && bytes[1] == 'i',
+            "ReadBase64 should decode content across adjacent text segments");
+    }
+
+    {
+        auto lineReader = XmlReader::Create("<root>\n  <child/>\n</root>");
+        Assert(lineReader.Read(), "Line info reader should read root");
+        Assert(lineReader.HasLineInfo(), "Reader should report line info availability");
+        Assert(lineReader.LineNumber() >= 1 && lineReader.LinePosition() >= 1, "Reader should expose valid line info");
+        lineReader.Close();
+        Assert(lineReader.GetReadState() == ReadState::Closed, "Close should transition the reader to Closed state");
+        Assert(!lineReader.Read(), "Closed reader should not continue reading");
+    }
+
+    {
+        auto tableReader = XmlReader::Create("<root a='1'><child/></root>");
+        Assert(tableReader.Read(), "NameTable reader should read root");
+        Assert(tableReader.NameTable().Count() >= 2, "Reader NameTable should intern element and attribute names");
+        Assert(tableReader.NameTable().Get("root") != nullptr, "Reader NameTable should contain the current element name");
+    }
+
+    {
+        const auto tempDir = std::filesystem::temp_directory_path();
+        const auto entityPath = tempDir / "libxml-external-entity.txt";
+        const auto xmlPath = tempDir / "libxml-external-entity.xml";
+        {
+            std::ofstream entityStream(entityPath);
+            entityStream << "external-value";
+        }
+        {
+            std::ofstream xmlStream(xmlPath);
+            xmlStream << "<!DOCTYPE root [<!ENTITY ext SYSTEM \"" << entityPath.filename().string() << "\">]><root>&ext;</root>";
+        }
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>();
+        auto externalReader = XmlReader::CreateFromFile(xmlPath.string(), settings);
+        Assert(externalReader.Read() && externalReader.NodeType() == XmlNodeType::DocumentType,
+            "External entity test should see the DOCTYPE first");
+        Assert(externalReader.Read() && externalReader.Name() == "root", "External entity test should read the root element");
+        Assert(externalReader.Read() && externalReader.NodeType() == XmlNodeType::EntityReference,
+            "External entity test should expose the entity reference event");
+        Assert(externalReader.Read() && externalReader.NodeType() == XmlNodeType::Text && externalReader.Value() == "external-value",
+            "Resolver should expand external general entities in element content");
+
+        std::filesystem::remove(entityPath);
+        std::filesystem::remove(xmlPath);
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader\">"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"child\"/>"
+            "      </xs:sequence>"
+            "      <xs:attribute name=\"id\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+        auto validatingReader = XmlReader::Create(
+            "<root xmlns=\"urn:reader\" id=\"7\"><child/></root>",
+            settings);
+        Assert(validatingReader.Read() && validatingReader.Name() == "root",
+            "Schema-valid XmlReader input should still create a working reader");
+
+        const auto qnameSchemas = std::make_shared<XmlSchemaSet>();
+        qnameSchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-qname\">"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"value\" type=\"xs:QName\"/>"
+            "      </xs:sequence>"
+            "      <xs:attribute name=\"target\" type=\"xs:QName\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings qnameSettings;
+        qnameSettings.Validation = ValidationType::Schema;
+        qnameSettings.Schemas = qnameSchemas;
+
+        auto qnameReader = XmlReader::Create(
+            "<root xmlns=\"urn:reader-qname\" xmlns:kind=\"urn:kind\" target=\"kind:item\">"
+            "  <value>kind:item</value>"
+            "</root>",
+            qnameSettings);
+        Assert(qnameReader.Read() && qnameReader.Name() == "root",
+            "Schema-valid xs:QName reader input should still create a working reader without DOM fallback");
+
+        bool threw = false;
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<root xmlns=\"urn:reader-qname\" target=\"missing:item\">"
+                "  <value>missing:item</value>"
+                "</root>",
+                qnameSettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("xs:QName") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid xs:QName reader input should fail during reader creation");
+
+        const auto idSchemas = std::make_shared<XmlSchemaSet>();
+        idSchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-id\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"item\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType><xs:attribute name=\"id\" type=\"xs:ID\" use=\"required\"/></xs:complexType>"
+            "        </xs:element>"
+            "        <xs:element name=\"ref\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType><xs:attribute name=\"target\" type=\"xs:IDREF\" use=\"required\"/></xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings idSettings;
+        idSettings.Validation = ValidationType::Schema;
+        idSettings.Schemas = idSchemas;
+
+        auto idReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-id\">"
+            "  <item id=\"book1\"/>"
+            "  <ref target=\"book1\"/>"
+            "</catalog>",
+            idSettings);
+        Assert(idReader.Read() && idReader.Name() == "catalog",
+            "Schema-valid xs:ID/xs:IDREF reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-id\">"
+                "  <item id=\"book1\"/>"
+                "  <ref target=\"missing\"/>"
+                "</catalog>",
+                idSettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("references unknown xs:ID value 'missing'") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid xs:IDREF reader input should fail during reader creation after streaming validation");
+
+        const auto identitySchemas = std::make_shared<XmlSchemaSet>();
+        identitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity\" targetNamespace=\"urn:reader-identity\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "        </xs:element>"
+            "        <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"bookKey\">"
+            "      <xs:selector xpath=\"tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"bookRef\" refer=\"tns:bookKey\">"
+            "      <xs:selector xpath=\"tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings identitySettings;
+        identitySettings.Validation = ValidationType::Schema;
+        identitySettings.Schemas = identitySchemas;
+
+        auto identityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity\">"
+            "  <book id=\"b1\"/>"
+            "  <reference bookId=\"b1\"/>"
+            "</catalog>",
+            identitySettings);
+        Assert(identityReader.Read() && identityReader.Name() == "catalog",
+            "Schema-valid identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity\">"
+                "  <book id=\"b1\"/>"
+                "  <reference bookId=\"missing\"/>"
+                "</catalog>",
+                identitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("bookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid identity-constraint reader input should fail during reader creation");
+
+        const auto nestedIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        nestedIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-nested\" targetNamespace=\"urn:reader-identity-nested\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType>"
+            "                  <xs:sequence>"
+            "                    <xs:element name=\"meta\">"
+            "                      <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "                    </xs:element>"
+            "                  </xs:sequence>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"nestedBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"tns:meta/@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"nestedBookRef\" refer=\"tns:nestedBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings nestedIdentitySettings;
+        nestedIdentitySettings.Validation = ValidationType::Schema;
+        nestedIdentitySettings.Schemas = nestedIdentitySchemas;
+
+        auto nestedIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-nested\">"
+            "  <section>"
+            "    <book><meta id=\"b1\"/></book>"
+            "    <reference bookId=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            nestedIdentitySettings);
+        Assert(nestedIdentityReader.Read() && nestedIdentityReader.Name() == "catalog",
+            "Schema-valid nested identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-nested\">"
+                "  <section>"
+                "    <book><meta id=\"b1\"/></book>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                nestedIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("nestedBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid nested identity-constraint reader input should fail during reader creation");
+
+        const auto descendantIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        descendantIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-desc\" targetNamespace=\"urn:reader-identity-desc\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"descBookKey\">"
+            "      <xs:selector xpath=\".//tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"descBookRef\" refer=\"tns:descBookKey\">"
+            "      <xs:selector xpath=\".//tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings descendantIdentitySettings;
+        descendantIdentitySettings.Validation = ValidationType::Schema;
+        descendantIdentitySettings.Schemas = descendantIdentitySchemas;
+
+        auto descendantIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-desc\">"
+            "  <section>"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            descendantIdentitySettings);
+        Assert(descendantIdentityReader.Read() && descendantIdentityReader.Name() == "catalog",
+            "Schema-valid descendant identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-desc\">"
+                "  <section>"
+                "    <book id=\"b1\"/>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                descendantIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("descBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid descendant identity-constraint reader input should fail during reader creation");
+
+        const auto leadingDescendantIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        leadingDescendantIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-leading-desc\" targetNamespace=\"urn:reader-identity-leading-desc\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"leadDescBookKey\">"
+            "      <xs:selector xpath=\"//tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"leadDescBookRef\" refer=\"tns:leadDescBookKey\">"
+            "      <xs:selector xpath=\"//tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings leadingDescendantIdentitySettings;
+        leadingDescendantIdentitySettings.Validation = ValidationType::Schema;
+        leadingDescendantIdentitySettings.Schemas = leadingDescendantIdentitySchemas;
+
+        auto leadingDescendantIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-leading-desc\">"
+            "  <section>"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            leadingDescendantIdentitySettings);
+        Assert(leadingDescendantIdentityReader.Read() && leadingDescendantIdentityReader.Name() == "catalog",
+            "Schema-valid leading descendant identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-leading-desc\">"
+                "  <section>"
+                "    <book id=\"b1\"/>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                leadingDescendantIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("leadDescBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid leading descendant identity-constraint reader input should fail during reader creation");
+
+        const auto wildcardChildIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        wildcardChildIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-wildcard-child\" targetNamespace=\"urn:reader-identity-wildcard-child\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"books\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "        <xs:element name=\"refs\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"reference\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"wildBookKey\">"
+            "      <xs:selector xpath=\"tns:books/*\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"wildBookRef\" refer=\"tns:wildBookKey\">"
+            "      <xs:selector xpath=\"tns:refs/*\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings wildcardChildIdentitySettings;
+        wildcardChildIdentitySettings.Validation = ValidationType::Schema;
+        wildcardChildIdentitySettings.Schemas = wildcardChildIdentitySchemas;
+
+        auto wildcardChildIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-wildcard-child\">"
+            "  <books><book id=\"b1\"/></books>"
+            "  <refs><reference bookId=\"b1\"/></refs>"
+            "</catalog>",
+            wildcardChildIdentitySettings);
+        Assert(wildcardChildIdentityReader.Read() && wildcardChildIdentityReader.Name() == "catalog",
+            "Schema-valid child wildcard identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-wildcard-child\">"
+                "  <books><book id=\"b1\"/></books>"
+                "  <refs><reference bookId=\"missing\"/></refs>"
+                "</catalog>",
+                wildcardChildIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("wildBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid child wildcard identity-constraint reader input should fail during reader creation");
+
+        const auto wildcardDescendantIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        wildcardDescendantIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-wildcard-desc\" targetNamespace=\"urn:reader-identity-wildcard-desc\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"books\">"
+            "                <xs:complexType>"
+            "                  <xs:sequence>"
+            "                    <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                      <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "                    </xs:element>"
+            "                  </xs:sequence>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"refs\">"
+            "                <xs:complexType>"
+            "                  <xs:sequence>"
+            "                    <xs:element name=\"reference\" maxOccurs=\"unbounded\">"
+            "                      <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "                    </xs:element>"
+            "                  </xs:sequence>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"wildDescBookKey\">"
+            "      <xs:selector xpath=\".//*/tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"wildDescBookRef\" refer=\"tns:wildDescBookKey\">"
+            "      <xs:selector xpath=\".//*/tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings wildcardDescendantIdentitySettings;
+        wildcardDescendantIdentitySettings.Validation = ValidationType::Schema;
+        wildcardDescendantIdentitySettings.Schemas = wildcardDescendantIdentitySchemas;
+
+        auto wildcardDescendantIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-wildcard-desc\">"
+            "  <section>"
+            "    <books><book id=\"b1\"/></books>"
+            "    <refs><reference bookId=\"b1\"/></refs>"
+            "  </section>"
+            "</catalog>",
+            wildcardDescendantIdentitySettings);
+        Assert(wildcardDescendantIdentityReader.Read() && wildcardDescendantIdentityReader.Name() == "catalog",
+            "Schema-valid descendant wildcard identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-wildcard-desc\">"
+                "  <section>"
+                "    <books><book id=\"b1\"/></books>"
+                "    <refs><reference bookId=\"missing\"/></refs>"
+                "  </section>"
+                "</catalog>",
+                wildcardDescendantIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("wildDescBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid descendant wildcard identity-constraint reader input should fail during reader creation");
+
+        const auto predicateSelectorIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        predicateSelectorIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-selector\" targetNamespace=\"urn:reader-identity-fallback-selector\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "            <xs:attribute name=\"kind\" type=\"xs:string\" use=\"required\"/>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"predSelectorBookKey\">"
+            "      <xs:selector xpath=\"tns:section[@kind='primary']/tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"predSelectorBookRef\" refer=\"tns:predSelectorBookKey\">"
+            "      <xs:selector xpath=\"tns:section[@kind='primary']/tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings predicateSelectorIdentitySettings;
+        predicateSelectorIdentitySettings.Validation = ValidationType::Schema;
+        predicateSelectorIdentitySettings.Schemas = predicateSelectorIdentitySchemas;
+
+        auto predicateSelectorIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-fallback-selector\">"
+            "  <section kind=\"primary\">"
+            "    <book id=\"b1\"/>"
+            "    <reference bookId=\"b1\"/>"
+            "  </section>"
+            "  <section kind=\"secondary\">"
+            "    <book id=\"ignored\"/>"
+            "    <reference bookId=\"ignored\"/>"
+            "  </section>"
+            "</catalog>",
+            predicateSelectorIdentitySettings);
+        Assert(predicateSelectorIdentityReader.Read() && predicateSelectorIdentityReader.Name() == "catalog",
+            "Schema-valid predicate selector identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-fallback-selector\">"
+                "  <section kind=\"primary\">"
+                "    <book id=\"b1\"/>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "  <section kind=\"secondary\">"
+                "    <book id=\"ignored\"/>"
+                "    <reference bookId=\"ignored\"/>"
+                "  </section>"
+                "</catalog>",
+                predicateSelectorIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("predSelectorBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid predicate selector identity-constraint reader input should fail during reader validation");
+
+        const auto predicateFieldIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        predicateFieldIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-field\" targetNamespace=\"urn:reader-identity-fallback-field\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType>"
+            "                  <xs:sequence>"
+            "                    <xs:element name=\"meta\" maxOccurs=\"unbounded\">"
+            "                      <xs:complexType>"
+            "                        <xs:attribute name=\"kind\" type=\"xs:string\" use=\"required\"/>"
+            "                        <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "                      </xs:complexType>"
+            "                    </xs:element>"
+            "                  </xs:sequence>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"predFieldBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"tns:meta[@kind='canonical']/@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"predFieldBookRef\" refer=\"tns:predFieldBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings predicateFieldIdentitySettings;
+        predicateFieldIdentitySettings.Validation = ValidationType::Schema;
+        predicateFieldIdentitySettings.Schemas = predicateFieldIdentitySchemas;
+
+        auto predicateFieldIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-fallback-field\">"
+            "  <section>"
+            "    <book>"
+            "      <meta kind=\"alternate\" id=\"ignored\"/>"
+            "      <meta kind=\"canonical\" id=\"b1\"/>"
+            "    </book>"
+            "    <reference bookId=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            predicateFieldIdentitySettings);
+        Assert(predicateFieldIdentityReader.Read() && predicateFieldIdentityReader.Name() == "catalog",
+            "Schema-valid predicate field identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-fallback-field\">"
+                "  <section>"
+                "    <book>"
+                "      <meta kind=\"alternate\" id=\"ignored\"/>"
+                "      <meta kind=\"canonical\" id=\"b1\"/>"
+                "    </book>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                predicateFieldIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("predFieldBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid predicate field identity-constraint reader input should fail during reader validation");
+
+        const auto namespaceWildcardIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        namespaceWildcardIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-ns-wildcard\" targetNamespace=\"urn:reader-identity-ns-wildcard\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"items\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"magazine\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "        <xs:element name=\"refs\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"reference\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"refId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"nsWildKey\">"
+            "      <xs:selector xpath=\"tns:items/tns:*\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"nsWildRef\" refer=\"tns:nsWildKey\">"
+            "      <xs:selector xpath=\"tns:refs/tns:*\"/>"
+            "      <xs:field xpath=\"@refId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings namespaceWildcardIdentitySettings;
+        namespaceWildcardIdentitySettings.Validation = ValidationType::Schema;
+        namespaceWildcardIdentitySettings.Schemas = namespaceWildcardIdentitySchemas;
+
+        auto namespaceWildcardIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-ns-wildcard\">"
+            "  <items>"
+            "    <book id=\"b1\"/>"
+            "    <magazine id=\"m1\"/>"
+            "  </items>"
+            "  <refs><reference refId=\"m1\"/></refs>"
+            "</catalog>",
+            namespaceWildcardIdentitySettings);
+        Assert(namespaceWildcardIdentityReader.Read() && namespaceWildcardIdentityReader.Name() == "catalog",
+            "Schema-valid namespace-scoped wildcard identity-constraint reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-ns-wildcard\">"
+                "  <items>"
+                "    <book id=\"b1\"/>"
+                "    <magazine id=\"m1\"/>"
+                "  </items>"
+                "  <refs><reference refId=\"missing\"/></refs>"
+                "</catalog>",
+                namespaceWildcardIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("nsWildRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid namespace-scoped wildcard identity-constraint reader input should fail during reader creation");
+
+        const auto namespaceAttributeWildcardIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        namespaceAttributeWildcardIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-attr-ns-wildcard\" targetNamespace=\"urn:reader-identity-attr-ns-wildcard\" attributeFormDefault=\"qualified\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"refId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"nsAttrWildKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"@tns:*\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"nsAttrWildRef\" refer=\"tns:nsAttrWildKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"@tns:*\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings namespaceAttributeWildcardIdentitySettings;
+        namespaceAttributeWildcardIdentitySettings.Validation = ValidationType::Schema;
+        namespaceAttributeWildcardIdentitySettings.Schemas = namespaceAttributeWildcardIdentitySchemas;
+
+        auto namespaceAttributeWildcardIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-attr-ns-wildcard\" xmlns:t=\"urn:reader-identity-attr-ns-wildcard\">"
+            "  <section>"
+            "    <book t:id=\"b1\"/>"
+            "    <reference t:refId=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            namespaceAttributeWildcardIdentitySettings);
+        Assert(namespaceAttributeWildcardIdentityReader.Read() && namespaceAttributeWildcardIdentityReader.Name() == "catalog",
+            "Schema-valid namespace-scoped wildcard attribute-field reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-attr-ns-wildcard\" xmlns:t=\"urn:reader-identity-attr-ns-wildcard\">"
+                "  <section>"
+                "    <book t:id=\"b1\"/>"
+                "    <reference t:refId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                namespaceAttributeWildcardIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("nsAttrWildRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid namespace-scoped wildcard attribute-field reader input should fail during reader creation");
+
+        const auto attributeWildcardIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        attributeWildcardIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-attr-wildcard\" targetNamespace=\"urn:reader-identity-attr-wildcard\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"attrWildKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"@*\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"attrWildRef\" refer=\"tns:attrWildKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"@*\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings attributeWildcardIdentitySettings;
+        attributeWildcardIdentitySettings.Validation = ValidationType::Schema;
+        attributeWildcardIdentitySettings.Schemas = attributeWildcardIdentitySchemas;
+
+        auto attributeWildcardIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-attr-wildcard\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            attributeWildcardIdentitySettings);
+        Assert(attributeWildcardIdentityReader.Read() && attributeWildcardIdentityReader.Name() == "catalog",
+            "Schema-valid wildcard attribute-field reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-attr-wildcard\">"
+                "  <section>"
+                "    <book token=\"b1\"/>"
+                "    <reference tokenRef=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                attributeWildcardIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("attrWildRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid wildcard attribute-field reader input should fail during reader creation");
+
+        const auto positionalSelectorIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        positionalSelectorIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-position\" targetNamespace=\"urn:reader-identity-fallback-position\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"posBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book[position()=2]\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"posBookRef\" refer=\"tns:posBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference[position()=1]\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings positionalSelectorIdentitySettings;
+        positionalSelectorIdentitySettings.Validation = ValidationType::Schema;
+        positionalSelectorIdentitySettings.Schemas = positionalSelectorIdentitySchemas;
+
+        auto positionalSelectorIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-fallback-position\">"
+            "  <section>"
+            "    <book id=\"ignored\"/>"
+            "    <book id=\"b2\"/>"
+            "    <reference bookId=\"b2\"/>"
+            "  </section>"
+            "</catalog>",
+            positionalSelectorIdentitySettings);
+        Assert(positionalSelectorIdentityReader.Read() && positionalSelectorIdentityReader.Name() == "catalog",
+            "Schema-valid positional selector identity-constraint reader input should fall back and still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-fallback-position\">"
+                "  <section>"
+                "    <book id=\"ignored\"/>"
+                "    <book id=\"b2\"/>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                positionalSelectorIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("posBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid positional selector identity-constraint reader input should fail during DOM fallback validation");
+
+        const auto axisFieldIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        axisFieldIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-axis-field\" targetNamespace=\"urn:reader-identity-fallback-axis-field\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"token\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"tokenRef\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"axisFieldKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"self::tns:book/@token\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"axisFieldRef\" refer=\"tns:axisFieldKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"self::tns:reference/@tokenRef\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings axisFieldIdentitySettings;
+        axisFieldIdentitySettings.Validation = ValidationType::Schema;
+        axisFieldIdentitySettings.Schemas = axisFieldIdentitySchemas;
+
+        auto axisFieldIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-fallback-axis-field\">"
+            "  <section>"
+            "    <book token=\"b1\"/>"
+            "    <reference tokenRef=\"b1\"/>"
+            "  </section>"
+            "</catalog>",
+            axisFieldIdentitySettings);
+        Assert(axisFieldIdentityReader.Read() && axisFieldIdentityReader.Name() == "catalog",
+            "Schema-valid axis-based field identity-constraint reader input should fall back and still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-fallback-axis-field\">"
+                "  <section>"
+                "    <book token=\"b1\"/>"
+                "    <reference tokenRef=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                axisFieldIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("axisFieldRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid axis-based field identity-constraint reader input should fail during DOM fallback validation");
+
+        const auto partialFieldFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        partialFieldFallbackIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-partial-field\" targetNamespace=\"urn:reader-identity-fallback-partial-field\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType>"
+            "                  <xs:sequence>"
+            "                    <xs:element name=\"meta\" maxOccurs=\"unbounded\">"
+            "                      <xs:complexType>"
+            "                        <xs:attribute name=\"kind\" type=\"xs:string\" use=\"required\"/>"
+            "                        <xs:attribute name=\"code\" type=\"xs:string\" use=\"required\"/>"
+            "                      </xs:complexType>"
+            "                    </xs:element>"
+            "                  </xs:sequence>"
+            "                  <xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType>"
+            "                  <xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/>"
+            "                  <xs:attribute name=\"bookCode\" type=\"xs:string\" use=\"required\"/>"
+            "                </xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"partialFieldKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "      <xs:field xpath=\"tns:meta[@kind='canonical']/@code\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"partialFieldRef\" refer=\"tns:partialFieldKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "      <xs:field xpath=\"@bookCode\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings partialFieldFallbackIdentitySettings;
+        partialFieldFallbackIdentitySettings.Validation = ValidationType::Schema;
+        partialFieldFallbackIdentitySettings.Schemas = partialFieldFallbackIdentitySchemas;
+
+        auto partialFieldFallbackIdentityReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-identity-fallback-partial-field\">"
+            "  <section>"
+            "    <book id=\"b1\">"
+            "      <meta kind=\"alternate\" code=\"ignored\"/>"
+            "      <meta kind=\"canonical\" code=\"c1\"/>"
+            "    </book>"
+            "    <reference bookId=\"b1\" bookCode=\"c1\"/>"
+            "  </section>"
+            "</catalog>",
+            partialFieldFallbackIdentitySettings);
+        Assert(partialFieldFallbackIdentityReader.Read() && partialFieldFallbackIdentityReader.Name() == "catalog",
+            "Schema-valid partially compiled multi-field identity-constraint reader input should fall back and still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-identity-fallback-partial-field\">"
+                "  <section>"
+                "    <book id=\"b1\">"
+                "      <meta kind=\"alternate\" code=\"ignored\"/>"
+                "      <meta kind=\"canonical\" code=\"c1\"/>"
+                "    </book>"
+                "    <reference bookId=\"b1\" bookCode=\"missing\"/>"
+                "  </section>"
+                "</catalog>",
+                partialFieldFallbackIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("partialFieldRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid partially compiled multi-field identity-constraint reader input should fail during DOM fallback validation");
+
+        const auto positionedFallbackSchemas = std::make_shared<XmlSchemaSet>();
+        positionedFallbackSchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-positioned-fallback\" targetNamespace=\"urn:reader-positioned-fallback\">"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"posBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book[position()=2]\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"posBookRef\" refer=\"tns:posBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference[position()=1]\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings positionedFallbackSettings;
+        positionedFallbackSettings.Validation = ValidationType::Schema;
+        positionedFallbackSettings.Schemas = positionedFallbackSchemas;
+
+        auto positionedFallbackReader = XmlReader::Create(
+            "<catalog xmlns=\"urn:reader-positioned-fallback\">"
+            "  <section>"
+            "    <book id=\"ignored\"/>"
+            "    <book id=\"b2\"/>"
+            "    <reference bookId=\"b2\"/>"
+            "  </section>"
+            "</catalog>");
+        Assert(positionedFallbackReader.Read() && positionedFallbackReader.Name() == "catalog",
+            "Positioned fallback setup reader should reach the root element before validation");
+        ValidateXmlReaderInputAgainstSchemas(positionedFallbackReader, positionedFallbackSettings);
+
+        threw = false;
+        try {
+            auto invalidPositionedFallbackReader = XmlReader::Create(
+                "<catalog xmlns=\"urn:reader-positioned-fallback\">"
+                "  <section>"
+                "    <book id=\"ignored\"/>"
+                "    <book id=\"b2\"/>"
+                "    <reference bookId=\"missing\"/>"
+                "  </section>"
+                "</catalog>");
+            Assert(invalidPositionedFallbackReader.Read() && invalidPositionedFallbackReader.Name() == "catalog",
+                "Invalid positioned fallback setup reader should reach the root element before validation");
+            ValidateXmlReaderInputAgainstSchemas(invalidPositionedFallbackReader, positionedFallbackSettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("posBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid positioned reader fallback input should still fail during DOM fallback validation");
+
+        const auto wildcardFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        wildcardFallbackIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-wildcard\" targetNamespace=\"urn:reader-identity-fallback-wildcard\">"
+            "  <xs:element name=\"container\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:any namespace=\"##targetNamespace\" processContents=\"strict\" maxOccurs=\"unbounded\"/>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"posBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book[position()=2]\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"posBookRef\" refer=\"tns:posBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference[position()=1]\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings wildcardFallbackIdentitySettings;
+        wildcardFallbackIdentitySettings.Validation = ValidationType::Schema;
+        wildcardFallbackIdentitySettings.Schemas = wildcardFallbackIdentitySchemas;
+
+        auto wildcardFallbackIdentityReader = XmlReader::Create(
+            "<container xmlns=\"urn:reader-identity-fallback-wildcard\">"
+            "  <catalog>"
+            "    <section>"
+            "      <book id=\"ignored\"/>"
+            "      <book id=\"b2\"/>"
+            "      <reference bookId=\"b2\"/>"
+            "    </section>"
+            "  </catalog>"
+            "</container>",
+            wildcardFallbackIdentitySettings);
+        Assert(wildcardFallbackIdentityReader.Read() && wildcardFallbackIdentityReader.Name() == "container",
+            "Schema-valid wildcard-reachable unsupported identity-constraint reader input should fall back and still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<container xmlns=\"urn:reader-identity-fallback-wildcard\">"
+                "  <catalog>"
+                "    <section>"
+                "      <book id=\"ignored\"/>"
+                "      <book id=\"b2\"/>"
+                "      <reference bookId=\"missing\"/>"
+                "    </section>"
+                "  </catalog>"
+                "</container>",
+                wildcardFallbackIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("posBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid wildcard-reachable unsupported identity-constraint reader input should fail during DOM fallback validation");
+
+        const auto xsiTypeFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        xsiTypeFallbackIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-xsitype\" targetNamespace=\"urn:reader-identity-fallback-xsitype\">"
+            "  <xs:complexType name=\"BaseRootType\">"
+            "    <xs:sequence/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"DerivedRootType\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:BaseRootType\">"
+            "        <xs:sequence>"
+            "          <xs:element ref=\"tns:catalog\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"dynamicRoot\" type=\"tns:BaseRootType\"/>"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"xsiTypePosBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book[position()=2]\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"xsiTypePosBookRef\" refer=\"tns:xsiTypePosBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference[position()=1]\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings xsiTypeFallbackIdentitySettings;
+        xsiTypeFallbackIdentitySettings.Validation = ValidationType::Schema;
+        xsiTypeFallbackIdentitySettings.Schemas = xsiTypeFallbackIdentitySchemas;
+
+        auto xsiTypeFallbackIdentityReader = XmlReader::Create(
+            "<dynamicRoot xmlns=\"urn:reader-identity-fallback-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DerivedRootType\">"
+            "  <catalog>"
+            "    <section>"
+            "      <book id=\"ignored\"/>"
+            "      <book id=\"b2\"/>"
+            "      <reference bookId=\"b2\"/>"
+            "    </section>"
+            "  </catalog>"
+            "</dynamicRoot>",
+            xsiTypeFallbackIdentitySettings);
+        Assert(xsiTypeFallbackIdentityReader.Read() && xsiTypeFallbackIdentityReader.Name() == "dynamicRoot",
+            "Schema-valid root xsi:type-reachable unsupported identity-constraint reader input should fall back and still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<dynamicRoot xmlns=\"urn:reader-identity-fallback-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DerivedRootType\">"
+                "  <catalog>"
+                "    <section>"
+                "      <book id=\"ignored\"/>"
+                "      <book id=\"b2\"/>"
+                "      <reference bookId=\"missing\"/>"
+                "    </section>"
+                "  </catalog>"
+                "</dynamicRoot>",
+                xsiTypeFallbackIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("xsiTypePosBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid root xsi:type-reachable unsupported identity-constraint reader input should fail during DOM fallback validation");
+
+        const auto nestedXsiTypeFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
+        nestedXsiTypeFallbackIdentitySchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" targetNamespace=\"urn:reader-identity-fallback-nested-xsitype\">"
+            "  <xs:complexType name=\"BasePayloadType\">"
+            "    <xs:sequence/>"
+            "  </xs:complexType>"
+            "  <xs:complexType name=\"DerivedPayloadType\">"
+            "    <xs:complexContent>"
+            "      <xs:extension base=\"tns:BasePayloadType\">"
+            "        <xs:sequence>"
+            "          <xs:element ref=\"tns:catalog\"/>"
+            "        </xs:sequence>"
+            "      </xs:extension>"
+            "    </xs:complexContent>"
+            "  </xs:complexType>"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"payload\" type=\"tns:BasePayloadType\"/>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "  <xs:element name=\"catalog\">"
+            "    <xs:complexType>"
+            "      <xs:sequence>"
+            "        <xs:element name=\"section\" maxOccurs=\"unbounded\">"
+            "          <xs:complexType>"
+            "            <xs:sequence>"
+            "              <xs:element name=\"book\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"id\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "              <xs:element name=\"reference\" minOccurs=\"0\" maxOccurs=\"unbounded\">"
+            "                <xs:complexType><xs:attribute name=\"bookId\" type=\"xs:string\" use=\"required\"/></xs:complexType>"
+            "              </xs:element>"
+            "            </xs:sequence>"
+            "          </xs:complexType>"
+            "        </xs:element>"
+            "      </xs:sequence>"
+            "    </xs:complexType>"
+            "    <xs:key name=\"nestedXsiTypePosBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:book[position()=2]\"/>"
+            "      <xs:field xpath=\"@id\"/>"
+            "    </xs:key>"
+            "    <xs:keyref name=\"nestedXsiTypePosBookRef\" refer=\"tns:nestedXsiTypePosBookKey\">"
+            "      <xs:selector xpath=\"tns:section/tns:reference[position()=1]\"/>"
+            "      <xs:field xpath=\"@bookId\"/>"
+            "    </xs:keyref>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings nestedXsiTypeFallbackIdentitySettings;
+        nestedXsiTypeFallbackIdentitySettings.Validation = ValidationType::Schema;
+        nestedXsiTypeFallbackIdentitySettings.Schemas = nestedXsiTypeFallbackIdentitySchemas;
+
+        auto nestedXsiTypeFallbackIdentityReader = XmlReader::Create(
+            "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+            "  <payload xsi:type=\"tns:DerivedPayloadType\">"
+            "    <catalog>"
+            "      <section>"
+            "        <book id=\"ignored\"/>"
+            "        <book id=\"b2\"/>"
+            "        <reference bookId=\"b2\"/>"
+            "      </section>"
+            "    </catalog>"
+            "  </payload>"
+            "</root>",
+            nestedXsiTypeFallbackIdentitySettings);
+        Assert(nestedXsiTypeFallbackIdentityReader.Read() && nestedXsiTypeFallbackIdentityReader.Name() == "root",
+            "Schema-valid nested xsi:type-reachable unsupported identity-constraint reader input should fall back and still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+                "  <payload xsi:type=\"tns:DerivedPayloadType\">"
+                "    <catalog>"
+                "      <section>"
+                "        <book id=\"ignored\"/>"
+                "        <book id=\"b2\"/>"
+                "        <reference bookId=\"missing\"/>"
+                "      </section>"
+                "    </catalog>"
+                "  </payload>"
+                "</root>",
+                nestedXsiTypeFallbackIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("nestedXsiTypePosBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid nested xsi:type-reachable unsupported identity-constraint reader input should fail during DOM fallback validation");
+
+        auto positionedNestedXsiTypeFallbackReader = XmlReader::Create(
+            "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+            "  <payload xsi:type=\"tns:DerivedPayloadType\">"
+            "    <catalog>"
+            "      <section>"
+            "        <book id=\"ignored\"/>"
+            "        <book id=\"b2\"/>"
+            "        <reference bookId=\"b2\"/>"
+            "      </section>"
+            "    </catalog>"
+            "  </payload>"
+            "</root>");
+        Assert(positionedNestedXsiTypeFallbackReader.Read() && positionedNestedXsiTypeFallbackReader.Name() == "root",
+            "Positioned nested xsi:type fallback setup reader should reach the root element before validation");
+        ValidateXmlReaderInputAgainstSchemas(positionedNestedXsiTypeFallbackReader, nestedXsiTypeFallbackIdentitySettings);
+
+        threw = false;
+        try {
+            auto invalidPositionedNestedXsiTypeFallbackReader = XmlReader::Create(
+                "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+                "  <payload xsi:type=\"tns:DerivedPayloadType\">"
+                "    <catalog>"
+                "      <section>"
+                "        <book id=\"ignored\"/>"
+                "        <book id=\"b2\"/>"
+                "        <reference bookId=\"missing\"/>"
+                "      </section>"
+                "    </catalog>"
+                "  </payload>"
+                "</root>");
+            Assert(invalidPositionedNestedXsiTypeFallbackReader.Read() && invalidPositionedNestedXsiTypeFallbackReader.Name() == "root",
+                "Invalid positioned nested xsi:type fallback setup reader should reach the root element before validation");
+            ValidateXmlReaderInputAgainstSchemas(invalidPositionedNestedXsiTypeFallbackReader, nestedXsiTypeFallbackIdentitySettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("nestedXsiTypePosBookRef") != std::string::npos
+                && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid positioned nested xsi:type fallback input should still fail during DOM fallback validation");
+
+        const auto listUnionSchemas = std::make_shared<XmlSchemaSet>();
+        listUnionSchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-list-union\" targetNamespace=\"urn:reader-list-union\">"
+            "  <xs:simpleType name=\"PositiveInt\">"
+            "    <xs:restriction base=\"xs:int\">"
+            "      <xs:minInclusive value=\"1\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"PositiveIntList\">"
+            "    <xs:list itemType=\"tns:PositiveInt\"/>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"CodeType\">"
+            "    <xs:restriction base=\"xs:token\">"
+            "      <xs:pattern value=\"[A-Z]{2}[0-9]{2}\"/>"
+            "    </xs:restriction>"
+            "  </xs:simpleType>"
+            "  <xs:simpleType name=\"CodeOrInt\">"
+            "    <xs:union memberTypes=\"tns:PositiveInt tns:CodeType\"/>"
+            "  </xs:simpleType>"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"items\" type=\"tns:PositiveIntList\" use=\"required\"/>"
+            "      <xs:attribute name=\"choice\" type=\"tns:CodeOrInt\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings listUnionSettings;
+        listUnionSettings.Validation = ValidationType::Schema;
+        listUnionSettings.Schemas = listUnionSchemas;
+
+        auto listUnionReader = XmlReader::Create(
+            "<root xmlns=\"urn:reader-list-union\" items=\"1 2 3\" choice=\"AB12\"/>",
+            listUnionSettings);
+        Assert(listUnionReader.Read() && listUnionReader.Name() == "root",
+            "Schema-valid list/union reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<root xmlns=\"urn:reader-list-union\" items=\"1 0 3\" choice=\"AB12\"/>",
+                listUnionSettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("list item 2") != std::string::npos
+                && std::string(exception.what()).find(">= 1") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid list simpleType reader input should fail during reader creation");
+
+        threw = false;
+        try {
+            auto invalidUnionReader = XmlReader::Create(
+                "<root xmlns=\"urn:reader-list-union\" items=\"1 2 3\" choice=\"bad\"/>",
+                listUnionSettings);
+            while (invalidUnionReader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("does not match any declared union member type") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid union simpleType reader input should fail during reader consumption");
+
+        auto validatingStringEntityReader = XmlReader::Create(
+            "<!DOCTYPE root [<!NOTATION jpg SYSTEM \"image/jpeg\"><!ENTITY cover SYSTEM \"cover.jpg\" NDATA jpg>]>"
+            "<root xmlns=\"urn:reader-entity-inline\" cover=\"cover\"/>",
+            [&] {
+                XmlReaderSettings entitySettings;
+                entitySettings.Validation = ValidationType::Schema;
+                entitySettings.Schemas = std::make_shared<XmlSchemaSet>();
+                entitySettings.Schemas->AddXml(
+                    "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-entity-inline\">"
+                    "  <xs:element name=\"root\">"
+                    "    <xs:complexType>"
+                    "      <xs:attribute name=\"cover\" type=\"xs:ENTITY\" use=\"required\"/>"
+                    "    </xs:complexType>"
+                    "  </xs:element>"
+                    "</xs:schema>");
+                return entitySettings;
+            }());
+        Assert(validatingStringEntityReader.Read() && validatingStringEntityReader.Name() == "root",
+            "Schema-valid string XmlReader input should preserve DOCTYPE entity declarations during creation-time validation");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<!DOCTYPE root [<!NOTATION jpg SYSTEM \"image/jpeg\"><!ENTITY cover SYSTEM \"cover.jpg\" NDATA jpg>]>"
+                "<root xmlns=\"urn:reader-entity-inline\" cover=\"missing\"/>",
+                [&] {
+                    XmlReaderSettings entitySettings;
+                    entitySettings.Validation = ValidationType::Schema;
+                    entitySettings.Schemas = std::make_shared<XmlSchemaSet>();
+                    entitySettings.Schemas->AddXml(
+                        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-entity-inline\">"
+                        "  <xs:element name=\"root\">"
+                        "    <xs:complexType>"
+                        "      <xs:attribute name=\"cover\" type=\"xs:ENTITY\" use=\"required\"/>"
+                        "    </xs:complexType>"
+                        "  </xs:element>"
+                        "</xs:schema>");
+                    return entitySettings;
+                }());
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared unparsed xs:ENTITY value") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid xs:ENTITY reader input should fail during reader creation");
+
+        const auto notationSchemas = std::make_shared<XmlSchemaSet>();
+        notationSchemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-notation\">"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"format\" type=\"xs:NOTATION\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings notationSettings;
+        notationSettings.Validation = ValidationType::Schema;
+        notationSettings.Schemas = notationSchemas;
+
+        auto notationReader = XmlReader::Create(
+            "<!DOCTYPE root [<!NOTATION jpg SYSTEM \"image/jpeg\">]>"
+            "<root xmlns=\"urn:reader-notation\" format=\"jpg\"/>",
+            notationSettings);
+        Assert(notationReader.Read() && notationReader.Name() == "root",
+            "Schema-valid xs:NOTATION reader input should still create a working reader");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create(
+                "<!DOCTYPE root [<!NOTATION jpg SYSTEM \"image/jpeg\">]>"
+                "<root xmlns=\"urn:reader-notation\" format=\"png\"/>",
+                notationSettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared xs:NOTATION value") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid xs:NOTATION reader input should fail during reader creation");
+
+        threw = false;
+        try {
+            (void)XmlReader::Create("<root xmlns=\"urn:reader\"><child/></root>", settings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("required attribute 'id'") != std::string::npos;
+        }
+        Assert(threw, "Schema-invalid XmlReader input should fail during reader creation");
+
+        threw = false;
+        try {
+            XmlReaderSettings fragmentSettings = settings;
+            fragmentSettings.Conformance = ConformanceLevel::Fragment;
+            (void)XmlReader::Create("<root xmlns=\"urn:reader\" id=\"7\"><child/></root>", fragmentSettings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("document conformance mode") != std::string::npos;
+        }
+        Assert(threw, "Schema validation should currently require document conformance mode");
+
+        std::string payload(200000, 'x');
+        std::string streamXml = "<root xmlns=\"urn:reader\" id=\"" + payload + "\"><child/></root>";
+        std::istringstream stream(streamXml);
+        auto validatingStreamReader = XmlReader::Create(stream, settings);
+        const auto consumedAfterCreate = stream.tellg();
+        Assert(consumedAfterCreate != std::streampos(-1)
+                && static_cast<std::size_t>(consumedAfterCreate) < streamXml.size(),
+            "Schema-valid seekable stream input should rewind after creation instead of staying fully consumed");
+        Assert(validatingStreamReader.Read() && validatingStreamReader.Name() == "root",
+            "Schema-valid seekable stream input should still create a working reader");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-entity\">"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:attribute name=\"cover\" type=\"xs:ENTITY\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+
+        const std::string streamXml =
+            "<!DOCTYPE root [<!NOTATION jpg SYSTEM \"image/jpeg\"><!ENTITY cover SYSTEM \"cover.jpg\" NDATA jpg>]>"
+            "<root xmlns=\"urn:reader-entity\" cover=\"cover\"/>";
+        std::istringstream stream(streamXml);
+        auto validatingStreamReader = XmlReader::Create(stream, settings);
+        Assert(validatingStreamReader.Read() && validatingStreamReader.Name() == "root",
+            "Schema-valid seekable stream input should preserve DOCTYPE entity declarations during creation-time validation");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:reader-nonseek\">"
+            "  <xs:element name=\"root\">"
+            "    <xs:complexType>"
+            "      <xs:sequence><xs:element name=\"child\"/></xs:sequence>"
+            "      <xs:attribute name=\"id\" use=\"required\"/>"
+            "    </xs:complexType>"
+            "  </xs:element>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+
+        std::string payload(200000, 'x');
+        NonSeekableStringStream stream(
+            "<root xmlns=\"urn:reader-nonseek\" id=\"" + payload + "\"><child/></root>");
+        Assert(stream.tellg() == std::streampos(-1),
+            "Non-seekable schema stream test setup should report tellg failure");
+
+        auto validatingStreamReader = XmlReader::Create(stream, settings);
+        Assert(validatingStreamReader.Read() && validatingStreamReader.Name() == "root",
+            "Schema-valid non-seekable stream input should still create a working reader");
+    }
+}
+
+void TestXmlDocumentStreamsAndEvents() {
+    {
+        std::istringstream input("<root><child/></root>");
+        XmlDocument document;
+        document.Load(input);
+        Assert(document.DocumentElement() != nullptr && document.DocumentElement()->Name() == "root",
+            "Document should load from istream");
+
+        std::ostringstream output;
+        document.Save(output);
+        Assert(output.str() == "<root><child/></root>", "Document should save to ostream");
+
+        std::ostringstream directWriterOutput;
+        XmlWriter::WriteToStream(document, directWriterOutput);
+        Assert(directWriterOutput.str() == "<root><child/></root>", "WriteToStream should serialize directly to ostream");
+    }
+
+    {
+        std::istringstream input(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<!DOCTYPE root [<!ENTITY label \"copy\">]>"
+            "<root>&label;</root>");
+        XmlDocument document;
+        document.Load(input);
+
+        Assert(document.Declaration() != nullptr && document.Declaration()->Encoding() == "utf-8",
+            "Document stream load should preserve the XML declaration");
+        Assert(document.DocumentType() != nullptr
+                && document.DocumentType()->Entities().GetNamedItem("label") != nullptr,
+            "Document stream load should preserve DOCTYPE entity declarations");
+        Assert(document.DocumentElement() != nullptr
+                && document.DocumentElement()->FirstChild() != nullptr
+                && document.DocumentElement()->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+            "Document stream load should preserve entity references in element content");
+    }
+
+    {
+        std::istringstream input("<root>  <child/>  </root>");
+        XmlDocument document;
+        document.SetPreserveWhitespace(true);
+        document.Load(input);
+
+        Assert(document.DocumentElement() != nullptr && document.DocumentElement()->ChildNodes().size() == 3,
+            "Document stream load should honor PreserveWhitespace");
+        Assert(document.DocumentElement()->FirstChild() != nullptr
+                && document.DocumentElement()->FirstChild()->NodeType() == XmlNodeType::Whitespace,
+            "Document stream load should materialize whitespace nodes when PreserveWhitespace is enabled");
+    }
+
+    {
+        XmlWriter writer;
+        writer.WriteStartElement("root");
+        writer.WriteElementString("child", "value");
+        writer.WriteEndDocument();
+
+        std::ostringstream output;
+        writer.Save(output);
+        Assert(output.str() == "<root><child>value</child></root>", "XmlWriter should save directly to ostream");
+    }
+
+    {
+        std::ostringstream output;
+        XmlWriter writer(output);
+        writer.WriteStartElement("root");
+        writer.WriteElementString("child", "value");
+        Assert(output.str() == "<root><child>value</child>",
+            "Stream-backed XmlWriter should expose incremental output before the root element closes");
+        writer.WriteEndDocument();
+        Assert(output.str() == "<root><child>value</child></root>",
+            "Stream-backed XmlWriter should finish directly into the bound ostream");
+    }
+
+    {
+        std::ostringstream output;
+        XmlWriter writer(output);
+        writer.WriteStartDocument("1.0", "utf-8", {});
+        writer.WriteStartElement("app", "root", "urn:app");
+        writer.WriteAttributeString("app", "id", "urn:app", "42");
+        writer.WriteRaw("<child/><!--tail-->");
+        writer.WriteEndDocument();
+
+        Assert(output.str().find("<?xml version=\"1.0\" encoding=\"utf-8\"?>") == 0,
+            "Stream-backed XmlWriter should write the XML declaration directly to the bound ostream");
+        Assert(output.str().find("<app:root xmlns:app=\"urn:app\" app:id=\"42\"><child/><!--tail--></app:root>") != std::string::npos,
+            "Stream-backed XmlWriter should preserve namespace declarations, attributes, and raw child markup");
+    }
+
+    {
+        XmlDocument document;
+        auto root = document.CreateElement("root");
+        auto child = document.CreateElement("child");
+        int inserting = 0;
+        int inserted = 0;
+        int changing = 0;
+        int changed = 0;
+        int removing = 0;
+        int removed = 0;
+        document.SetNodeInserting([&](const XmlNodeChangedEventArgs&) { ++inserting; });
+        document.SetNodeInserted([&](const XmlNodeChangedEventArgs&) { ++inserted; });
+        document.SetNodeChanging([&](const XmlNodeChangedEventArgs&) { ++changing; });
+        document.SetNodeChanged([&](const XmlNodeChangedEventArgs&) { ++changed; });
+        document.SetNodeRemoving([&](const XmlNodeChangedEventArgs&) { ++removing; });
+        document.SetNodeRemoved([&](const XmlNodeChangedEventArgs&) { ++removed; });
+
+        document.AppendChild(root);
+        root->AppendChild(child);
+        auto text = document.CreateTextNode("a");
+        child->AppendChild(text);
+        text->SetValue("b");
+        child->RemoveChild(text);
+
+        Assert(inserting >= 3 && inserted >= 3, "Insert events should fire for appended nodes");
+        Assert(changing == 1 && changed == 1, "Value change events should fire once for text mutation");
+        Assert(removing == 1 && removed == 1, "Remove events should fire once for child removal");
+    }
+}
+
+void TestXmlWriterBase64AndElementReader() {
+    XmlWriter writer;
+    writer.WriteStartElement("root");
+    writer.WriteStartElement("bin");
+    const unsigned char bytes[] = {'H', 'i'};
+    writer.WriteBase64(bytes, 2);
+    writer.WriteEndElement();
+    writer.WriteEndElement();
+    Assert(writer.GetString() == "<root><bin>SGk=</bin></root>", "WriteBase64 should encode binary content");
+
+    const auto document = XmlDocument::Parse("<root><child/></root>");
+    auto reader = document->DocumentElement()->CreateReader();
+    Assert(reader.Read() && reader.Name() == "root", "XmlElement::CreateReader should create a node reader over the element");
+    Assert(reader.NameTable().Get("root") != nullptr, "XmlNodeReader NameTable should intern element names");
+}
+
+void TestXmlNodeReader() {
+    const auto document = XmlDocument::Parse("<root id=\"7\"><child>text</child><empty flag=\"1\"/></root>");
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "XmlNodeReader root missing");
+
+    XmlNodeReader reader(*root);
+    Assert(reader.Read(), "XmlNodeReader should read the root element");
+    Assert(reader.NodeType() == XmlNodeType::Element && reader.Name() == "root",
+        "XmlNodeReader should expose the serialized root element");
+    Assert(reader.AttributeCount() == 1 && reader.GetAttribute("id") == "7",
+        "XmlNodeReader should expose root attributes");
+    Assert(reader.MoveToFirstAttribute(), "XmlNodeReader should navigate attributes");
+    Assert(reader.NodeType() == XmlNodeType::Attribute && reader.Value() == "7",
+        "XmlNodeReader attribute navigation mismatch");
+    Assert(reader.MoveToElement(), "XmlNodeReader should move back to the element node");
+
+    Assert(reader.Read(), "XmlNodeReader should read child element");
+    Assert(reader.Name() == "child", "XmlNodeReader child element mismatch");
+    Assert(reader.Read(), "XmlNodeReader should read child text");
+    Assert(reader.NodeType() == XmlNodeType::Text && reader.Value() == "text",
+        "XmlNodeReader text node mismatch");
+
+    XmlDocument entityDocument;
+    auto entityRoot = entityDocument.CreateElement("entityRoot");
+    entityRoot->AppendChild(entityDocument.CreateEntityReference("amp"));
+    entityRoot->AppendChild(entityDocument.CreateEntityReference("custom"));
+    entityDocument.AppendChild(entityRoot);
+
+    XmlNodeReader entityReader(*entityRoot);
+    Assert(entityReader.Read(), "XmlNodeReader should read entity root element");
+    Assert(entityReader.Read(), "XmlNodeReader should expose predefined entity references");
+    Assert(entityReader.NodeType() == XmlNodeType::EntityReference && entityReader.Name() == "amp" && entityReader.Value() == "&",
+        "XmlNodeReader should expose DOM EntityReference nodes directly");
+    Assert(entityReader.Read(), "XmlNodeReader should expose predefined entity expansion text");
+    Assert(entityReader.NodeType() == XmlNodeType::Text && entityReader.Value() == "&",
+        "XmlNodeReader should stream resolved predefined entity text after the entity reference event");
+    Assert(entityReader.Read(), "XmlNodeReader should close predefined entity scope");
+    Assert(entityReader.NodeType() == XmlNodeType::EndEntity && entityReader.Name() == "amp",
+        "XmlNodeReader should emit EndEntity after predefined entity references");
+    Assert(entityReader.ReadInnerXml().empty() && entityReader.ReadOuterXml().empty(),
+        "XmlNodeReader EndEntity should not expose inner or outer XML");
+    Assert(entityReader.Read(), "XmlNodeReader should expose unresolved custom entity references");
+    Assert(entityReader.NodeType() == XmlNodeType::EntityReference && entityReader.Name() == "custom" && entityReader.Value().empty(),
+        "XmlNodeReader should preserve unresolved entity references with empty values");
+    Assert(entityReader.Read(), "XmlNodeReader should close unresolved entity scope");
+    Assert(entityReader.NodeType() == XmlNodeType::EndEntity && entityReader.Name() == "custom",
+        "XmlNodeReader should emit EndEntity for unresolved entity references");
+    Assert(entityReader.ReadInnerXml().empty() && entityReader.ReadOuterXml().empty(),
+        "XmlNodeReader unresolved EndEntity should not expose inner or outer XML");
+
+    auto fragment = document->CreateDocumentFragment();
+    fragment->SetInnerXml("<a/>mid<b/>");
+    XmlNodeReader fragmentReader(*fragment);
+    Assert(fragmentReader.Read(), "XmlNodeReader should read first fragment child");
+    Assert(fragmentReader.NodeType() == XmlNodeType::Element && fragmentReader.Name() == "a",
+        "XmlNodeReader fragment first element mismatch");
+    Assert(fragmentReader.Read(), "XmlNodeReader should read fragment text");
+    Assert(fragmentReader.NodeType() == XmlNodeType::Text && fragmentReader.Value() == "mid",
+        "XmlNodeReader fragment text mismatch");
+    Assert(fragmentReader.Read(), "XmlNodeReader should read second fragment child");
+    Assert(fragmentReader.NodeType() == XmlNodeType::Element && fragmentReader.Name() == "b",
+        "XmlNodeReader fragment second element mismatch");
+}
+
+void TestXmlReaderFromFile() {
+    const auto path = std::filesystem::temp_directory_path() / "libxml-reader.xml";
+    {
+        std::ofstream stream(path);
+        stream << "<root><child/></root>";
+    }
+
+    XmlReader reader = XmlReader::CreateFromFile(path.string());
+    Assert(reader.Read(), "Reader should read root from file");
+    Assert(reader.Name() == "root", "File reader root name mismatch");
+    Assert(reader.Read(), "Reader should read child from file");
+    Assert(reader.Name() == "child" && reader.IsEmptyElement(), "File reader child element mismatch");
+
+    std::filesystem::remove(path);
+}
+
+void TestXPathAxes() {
+    const auto document = XmlDocument::Parse(
+        "<root>"
+        "  <group id=\"g1\">"
+        "    <item id=\"a\">alpha</item>"
+        "    <item id=\"b\">beta</item>"
+        "    <item id=\"c\">gamma</item>"
+        "  </group>"
+        "  <group id=\"g2\">"
+        "    <item id=\"d\">delta</item>"
+        "    <extra>bonus</extra>"
+        "    <item id=\"e\">epsilon</item>"
+        "  </group>"
+        "</root>");
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "XPath axes root missing");
+
+    // parent axis via ..
+    const auto parentViaAbbrev = root->SelectNodes("group/item/..");
+    Assert(parentViaAbbrev.Count() == 2,
+        ".. should navigate to parent elements (two groups)");
+    Assert(static_cast<XmlElement*>(parentViaAbbrev.Item(0).get())->GetAttribute("id") == "g1",
+        ".. first parent should be g1");
+    Assert(static_cast<XmlElement*>(parentViaAbbrev.Item(1).get())->GetAttribute("id") == "g2",
+        ".. second parent should be g2");
+
+    // parent:: explicit axis
+    const auto parentExplicit = root->SelectNodes("group/item/parent::group");
+    Assert(parentExplicit.Count() == 2,
+        "parent::group should select both group parents");
+
+    // parent::* with name filter
+    const auto parentFiltered = root->SelectNodes("group/extra/parent::group");
+    Assert(parentFiltered.Count() == 1,
+        "parent::group from extra should select only g2");
+    Assert(static_cast<XmlElement*>(parentFiltered.Item(0).get())->GetAttribute("id") == "g2",
+        "parent::group from extra should be g2");
+
+    // ancestor axis
+    const auto ancestors = root->SelectNodes("group/item/ancestor::root");
+    Assert(ancestors.Count() == 1,
+        "ancestor::root should find the root element");
+    Assert(ancestors.Item(0).get() == root.get(),
+        "ancestor::root should find the actual root element");
+
+    // ancestor-or-self axis
+    const auto ancestorOrSelf = document->SelectNodes("//item/ancestor-or-self::group");
+    Assert(ancestorOrSelf.Count() == 2,
+        "ancestor-or-self::group from items should find both group elements");
+
+    // following-sibling axis
+    const auto firstItem = root->SelectSingleNode("group[@id='g1']/item[@id='a']");
+    Assert(firstItem != nullptr, "XPath axes first item missing");
+    const auto followingSiblings = static_cast<XmlElement*>(firstItem.get())->SelectNodes("following-sibling::item");
+    Assert(followingSiblings.Count() == 2,
+        "following-sibling::item should find 2 siblings after item a");
+    Assert(static_cast<XmlElement*>(followingSiblings.Item(0).get())->GetAttribute("id") == "b",
+        "first following sibling should be b");
+    Assert(static_cast<XmlElement*>(followingSiblings.Item(1).get())->GetAttribute("id") == "c",
+        "second following sibling should be c");
+
+    // preceding-sibling axis
+    const auto lastItem = root->SelectSingleNode("group[@id='g1']/item[@id='c']");
+    Assert(lastItem != nullptr, "XPath axes last item missing");
+    const auto precedingSiblings = static_cast<XmlElement*>(lastItem.get())->SelectNodes("preceding-sibling::item");
+    Assert(precedingSiblings.Count() == 2,
+        "preceding-sibling::item should find 2 siblings before item c");
+
+    // following axis
+    const auto g1 = root->SelectSingleNode("group[@id='g1']");
+    Assert(g1 != nullptr, "XPath axes g1 missing");
+    const auto followingItems = static_cast<XmlElement*>(g1.get())->SelectNodes("following::item");
+    Assert(followingItems.Count() == 2,
+        "following::item from g1 should find items in g2");
+    Assert(static_cast<XmlElement*>(followingItems.Item(0).get())->GetAttribute("id") == "d",
+        "first following item should be d");
+    Assert(static_cast<XmlElement*>(followingItems.Item(1).get())->GetAttribute("id") == "e",
+        "second following item should be e");
+
+    // preceding axis
+    const auto e = root->SelectSingleNode("group[@id='g2']/item[@id='e']");
+    Assert(e != nullptr, "XPath axes item e missing");
+    const auto precedingItems = static_cast<XmlElement*>(e.get())->SelectNodes("preceding::item");
+    Assert(precedingItems.Count() >= 3,
+        "preceding::item from e should find items a, b, c, and d");
+
+    // node() test
+    const auto allNodes = root->SelectNodes("group[@id='g2']/node()");
+    Assert(allNodes.Count() >= 3,
+        "node() should match all child nodes including text, elements, etc.");
+
+    // self::element explicit axis with name filter
+    const auto selfWithName = static_cast<XmlElement*>(g1.get())->SelectNodes("self::group");
+    Assert(selfWithName.Count() == 1,
+        "self::group should match when the context node is a group element");
+    const auto selfNoMatch = static_cast<XmlElement*>(g1.get())->SelectNodes("self::item");
+    Assert(selfNoMatch.Count() == 0,
+        "self::item should not match when the context node is a group element");
+}
+
+void TestXPathUnionOperator() {
+    const auto document = XmlDocument::Parse(
+        "<root>"
+        "  <alpha id=\"1\">a</alpha>"
+        "  <beta id=\"2\">b</beta>"
+        "  <gamma id=\"3\">c</gamma>"
+        "</root>");
+    const auto root = document->DocumentElement();
+    Assert(root != nullptr, "XPath union root missing");
+
+    // Basic union of two paths
+    const auto unionResult = root->SelectNodes("alpha | gamma");
+    Assert(unionResult.Count() == 2,
+        "Union of alpha | gamma should return 2 nodes");
+    Assert(unionResult.Item(0)->Name() == "alpha",
+        "Union first result should be alpha");
+    Assert(unionResult.Item(1)->Name() == "gamma",
+        "Union second result should be gamma");
+
+    // Union with absolute paths from document
+    const auto docUnion = document->SelectNodes("/root/alpha | /root/beta");
+    Assert(docUnion.Count() == 2,
+        "Document-level union should return 2 nodes");
+    Assert(docUnion.Item(0)->Name() == "alpha",
+        "Document union first result should be alpha");
+    Assert(docUnion.Item(1)->Name() == "beta",
+        "Document union second result should be beta");
+
+    // Union should deduplicate overlapping results
+    const auto overlapUnion = root->SelectNodes("alpha | alpha");
+    Assert(overlapUnion.Count() == 1,
+        "Union should deduplicate overlapping results");
+
+    // Union with three parts
+    const auto tripleUnion = root->SelectNodes("alpha | beta | gamma");
+    Assert(tripleUnion.Count() == 3,
+        "Triple union should return all three elements");
+
+    // Union inside predicates should NOT trigger (pipe in predicates)
+    // This tests that | is only split at the top level
+    const auto predicateTest = root->SelectNodes("alpha[@id='1']");
+    Assert(predicateTest.Count() == 1,
+        "Predicate inside union context should work normally");
+}
+
+void TestXPathNavigatorAndDocument() {
+    const auto document = XmlDocument::Parse(
+        "<root id=\"r\" xmlns:bk=\"urn:books\">"
+        "<bk:book id=\"b1\"><title>One</title><author>A</author></bk:book>"
+        "<bk:book id=\"b2\"><title>Two</title><author>B</author></bk:book>"
+        "</root>");
+
+    XPathNavigator navigator = document->CreateNavigator();
+    Assert(!navigator.IsEmpty() && navigator.NodeType() == XmlNodeType::Document,
+        "CreateNavigator on XmlDocument should start at the document node");
+    Assert(navigator.MoveToFirstChild(), "Navigator should move from document to first child");
+    Assert(navigator.Name() == "root", "Navigator should reach the root element");
+    Assert(navigator.MoveToFirstAttribute(), "Navigator should navigate to the first attribute");
+    Assert(navigator.Name() == "id" && navigator.Value() == "r",
+        "Navigator should expose attribute name and value");
+    Assert(navigator.MoveToNextAttribute(), "Navigator should move to the next attribute");
+    Assert(navigator.Name() == "xmlns:bk", "Navigator should walk element attribute sequence");
+    Assert(navigator.MoveToParent() && navigator.Name() == "root",
+        "Navigator should move back to the owning element from an attribute");
+    Assert(navigator.MoveToFirstChild() && navigator.Name() == "bk:book",
+        "Navigator should move to the first child element");
+    Assert(navigator.MoveToNext() && navigator.Name() == "bk:book",
+        "Navigator should move across siblings");
+    Assert(navigator.MoveToPrevious() && navigator.Name() == "bk:book",
+        "Navigator should move back to the previous sibling");
+
+    XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("bk", "urn:books");
+    XPathNavigator selected = navigator.SelectSingleNode("title");
+    Assert(!selected.IsEmpty() && selected.Name() == "title" && selected.InnerXml() == "One",
+        "Navigator should select child nodes through existing XPath support");
+    const auto books = document->CreateNavigator().Select("/root/bk:book", namespaces);
+    Assert(books.size() == 2 && books[1].SelectSingleNode("title").InnerXml() == "Two",
+        "Navigator Select should wrap multiple XPath matches");
+
+    XPathDocument xpathDocument("<catalog><book id=\"1\"/><book id=\"2\"/></catalog>");
+    XPathNavigator docNavigator = xpathDocument.CreateNavigator();
+    Assert(docNavigator.MoveToFirstChild() && docNavigator.Name() == "catalog",
+        "XPathDocument navigator should start from the parsed document");
+    const auto selectedBooks = docNavigator.Select("book");
+    Assert(selectedBooks.size() == 2,
+        "XPathDocument navigator should expose XPath selection over the wrapped document");
+}
+
+void TestXmlConvert() {
+    // ToString
+    Assert(XmlConvert::ToString(true) == "true",
+        "XmlConvert::ToString(true) should return 'true'");
+    Assert(XmlConvert::ToString(false) == "false",
+        "XmlConvert::ToString(false) should return 'false'");
+    Assert(XmlConvert::ToString(42) == "42",
+        "XmlConvert::ToString(42) should return '42'");
+    Assert(XmlConvert::ToString(-1) == "-1",
+        "XmlConvert::ToString(-1) should return '-1'");
+    Assert(XmlConvert::ToString(static_cast<long long>(9876543210LL)) == "9876543210",
+        "XmlConvert::ToString(int64) should format large numbers");
+
+    {
+        const std::string doubleStr = XmlConvert::ToString(3.14);
+        Assert(doubleStr.find("3.14") != std::string::npos,
+            "XmlConvert::ToString(double) should format correctly");
+    }
+
+    Assert(XmlConvert::ToString(std::numeric_limits<double>::quiet_NaN()) == "NaN",
+        "XmlConvert::ToString(NaN) should return 'NaN'");
+    Assert(XmlConvert::ToString(std::numeric_limits<double>::infinity()) == "INF",
+        "XmlConvert::ToString(+Inf) should return 'INF'");
+    Assert(XmlConvert::ToString(-std::numeric_limits<double>::infinity()) == "-INF",
+        "XmlConvert::ToString(-Inf) should return '-INF'");
+
+    // ToBoolean
+    Assert(XmlConvert::ToBoolean("true") == true,
+        "XmlConvert::ToBoolean('true') should return true");
+    Assert(XmlConvert::ToBoolean("1") == true,
+        "XmlConvert::ToBoolean('1') should return true");
+    Assert(XmlConvert::ToBoolean("false") == false,
+        "XmlConvert::ToBoolean('false') should return false");
+    Assert(XmlConvert::ToBoolean("0") == false,
+        "XmlConvert::ToBoolean('0') should return false");
+
+    {
+        bool threw = false;
+        try { (void)XmlConvert::ToBoolean("yes"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "XmlConvert::ToBoolean('yes') should throw XmlException");
+    }
+
+    // ToInt32
+    Assert(XmlConvert::ToInt32("42") == 42,
+        "XmlConvert::ToInt32('42') should return 42");
+    Assert(XmlConvert::ToInt32("-99") == -99,
+        "XmlConvert::ToInt32('-99') should return -99");
+
+    {
+        bool threw = false;
+        try { (void)XmlConvert::ToInt32("abc"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "XmlConvert::ToInt32('abc') should throw XmlException");
+    }
+
+    // ToInt64
+    Assert(XmlConvert::ToInt64("9876543210") == 9876543210LL,
+        "XmlConvert::ToInt64 should handle large values");
+
+    // ToDouble
+    Assert(XmlConvert::ToDouble("3.14") == 3.14,
+        "XmlConvert::ToDouble('3.14') should return 3.14");
+    Assert(std::isnan(XmlConvert::ToDouble("NaN")),
+        "XmlConvert::ToDouble('NaN') should return NaN");
+    Assert(std::isinf(XmlConvert::ToDouble("INF")) && XmlConvert::ToDouble("INF") > 0,
+        "XmlConvert::ToDouble('INF') should return +Infinity");
+    Assert(std::isinf(XmlConvert::ToDouble("-INF")) && XmlConvert::ToDouble("-INF") < 0,
+        "XmlConvert::ToDouble('-INF') should return -Infinity");
+
+    {
+        bool threw = false;
+        try { (void)XmlConvert::ToDouble("xyz"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "XmlConvert::ToDouble('xyz') should throw XmlException");
+    }
+
+    // ToSingle
+    Assert(XmlConvert::ToSingle("1.5") == 1.5f,
+        "XmlConvert::ToSingle('1.5') should return 1.5f");
+    Assert(std::isnan(XmlConvert::ToSingle("NaN")),
+        "XmlConvert::ToSingle('NaN') should return NaN");
+
+    // EncodeName / DecodeName
+    Assert(XmlConvert::EncodeName("valid") == "valid",
+        "EncodeName should pass through valid names");
+    Assert(XmlConvert::EncodeName("1bad") == "_x0031_bad",
+        "EncodeName should encode leading digits");
+    Assert(XmlConvert::DecodeName("_x0031_bad") == "1bad",
+        "DecodeName should decode encoded characters");
+    Assert(XmlConvert::DecodeName("valid") == "valid",
+        "DecodeName should pass through valid names");
+
+    // EncodeLocalName (also encodes colons)
+    Assert(XmlConvert::EncodeLocalName("a:b") == "a_x003A_b",
+        "EncodeLocalName should encode colons");
+    Assert(XmlConvert::EncodeLocalName("valid") == "valid",
+        "EncodeLocalName should pass through valid local names");
+
+    // VerifyName
+    Assert(XmlConvert::VerifyName("valid") == "valid",
+        "VerifyName should return valid names");
+    {
+        bool threw = false;
+        try { (void)XmlConvert::VerifyName(""); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "VerifyName should throw for empty string");
+    }
+    {
+        bool threw = false;
+        try { (void)XmlConvert::VerifyName("1bad"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "VerifyName should throw for names starting with digits");
+    }
+
+    // VerifyNmToken
+    Assert(XmlConvert::VerifyNmToken("abc-123") == "abc-123",
+        "VerifyNmToken should accept valid NMTOKEN values");
+    {
+        bool threw = false;
+        try { (void)XmlConvert::VerifyNmToken("a b"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "VerifyNmToken should throw for tokens with spaces");
+    }
+
+    // VerifyXmlChars
+    Assert(XmlConvert::VerifyXmlChars("hello\tworld\n") == "hello\tworld\n",
+        "VerifyXmlChars should accept valid XML characters");
+
+    // IsXmlChar / IsStartNameChar / IsNameChar
+    Assert(XmlConvert::IsXmlChar('a'), "IsXmlChar should return true for 'a'");
+    Assert(XmlConvert::IsXmlChar('\t'), "IsXmlChar should return true for tab");
+    Assert(!XmlConvert::IsXmlChar('\x01'), "IsXmlChar should return false for control char 0x01");
+    Assert(XmlConvert::IsStartNameChar('a'), "IsStartNameChar should return true for 'a'");
+    Assert(XmlConvert::IsStartNameChar('_'), "IsStartNameChar should return true for '_'");
+    Assert(!XmlConvert::IsStartNameChar('1'), "IsStartNameChar should return false for '1'");
+    Assert(XmlConvert::IsNameChar('-'), "IsNameChar should return true for '-'");
+    Assert(XmlConvert::IsNameChar('.'), "IsNameChar should return true for '.'");
+}
+
+void TestReaderConvenienceApis() {
+    // ---- MoveToContent ----
+    {
+        auto reader = XmlReader::Create("<?xml version='1.0'?><!-- comment --><root>hello</root>");
+        // MoveToContent should skip declaration and comment, land on Element
+        auto nt = reader.MoveToContent();
+        Assert(nt == XmlNodeType::Element, "MoveToContent should skip non-content and land on Element");
+        Assert(reader.Name() == "root", "MoveToContent should land on root element");
+    }
+
+    // MoveToContent on text
+    {
+        auto reader = XmlReader::Create("<root>hello</root>");
+        reader.Read(); // root element
+        reader.Read(); // text
+        auto nt = reader.MoveToContent();
+        Assert(nt == XmlNodeType::Text, "MoveToContent at Text should return Text");
+    }
+
+    // MoveToContent while on attribute should snap back to element
+    {
+        auto reader = XmlReader::Create("<root attr='val'>text</root>");
+        reader.Read();
+        reader.MoveToAttribute("attr");
+        Assert(reader.NodeType() == XmlNodeType::Attribute, "Should be on attribute now");
+        auto nt = reader.MoveToContent();
+        Assert(nt == XmlNodeType::Element, "MoveToContent from attribute should snap to element");
+        Assert(reader.Name() == "root", "Should be back on root element");
+    }
+
+    // ---- IsStartElement ----
+    {
+        auto reader = XmlReader::Create("<!-- skip --><root/>");
+        Assert(reader.IsStartElement(), "IsStartElement should skip comment and return true");
+        Assert(reader.Name() == "root", "IsStartElement should land on root");
+    }
+    {
+        auto reader = XmlReader::Create("<root/>");
+        reader.Read(); // root (empty)
+        reader.Read(); // EOF
+        Assert(!reader.IsStartElement(), "IsStartElement at EOF should return false");
+    }
+
+    // ---- IsStartElement(name) ----
+    {
+        auto reader = XmlReader::Create("<root/>");
+        Assert(reader.IsStartElement("root"), "IsStartElement with correct name should return true");
+        Assert(!reader.IsStartElement("other"), "IsStartElement with wrong name should return false");
+    }
+
+    // ---- ReadStartElement ----
+    {
+        auto reader = XmlReader::Create("<root><child/></root>");
+        reader.ReadStartElement(); // advances past <root>
+        Assert(reader.NodeType() == XmlNodeType::Element, "After ReadStartElement, should be on child");
+        Assert(reader.Name() == "child", "After ReadStartElement, should be on child element");
+    }
+    {
+        auto reader = XmlReader::Create("<root/>");
+        reader.Read(); // empty root
+        reader.Read(); // end or EOF  
+        bool threw = false;
+        try { reader.ReadStartElement(); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "ReadStartElement at EOF should throw");
+    }
+
+    // ---- ReadStartElement(name) ----
+    {
+        auto reader = XmlReader::Create("<root><child/></root>");
+        reader.ReadStartElement("root");
+        Assert(reader.Name() == "child", "ReadStartElement(name) should advance past matched element");
+    }
+    {
+        auto reader = XmlReader::Create("<root/>");
+        bool threw = false;
+        try { reader.ReadStartElement("other"); } catch (const XmlException& e) {
+            threw = true;
+            std::string msg = e.what();
+            Assert(msg.find("other") != std::string::npos, "Error should mention expected name");
+            Assert(msg.find("root") != std::string::npos, "Error should mention actual name");
+        }
+        Assert(threw, "ReadStartElement with wrong name should throw");
+    }
+
+    // ---- ReadEndElement ----
+    {
+        auto reader = XmlReader::Create("<root></root>");
+        reader.Read(); // root
+        reader.Read(); // end root
+        Assert(reader.NodeType() == XmlNodeType::EndElement, "Should be on EndElement");
+        reader.ReadEndElement();
+        Assert(reader.IsEOF() || reader.NodeType() == XmlNodeType::None,
+            "After ReadEndElement, should be at EOF");
+    }
+    {
+        auto reader = XmlReader::Create("<root><child/></root>");
+        reader.Read(); // root element
+        bool threw = false;
+        try { reader.ReadEndElement(); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "ReadEndElement on Element node should throw");
+    }
+
+    // ---- ReadElementContentAsString ----
+    {
+        auto reader = XmlReader::Create("<root>hello world</root>");
+        reader.Read();
+        std::string content = reader.ReadElementContentAsString();
+        Assert(content == "hello world", "ReadElementContentAsString should return text content");
+    }
+    // empty element
+    {
+        auto reader = XmlReader::Create("<root/>");
+        reader.Read();
+        std::string content = reader.ReadElementContentAsString();
+        Assert(content.empty(), "ReadElementContentAsString on empty element should return empty string");
+    }
+    // element with CDATA
+    {
+        auto reader = XmlReader::Create("<root><![CDATA[data]]></root>");
+        reader.Read();
+        std::string content = reader.ReadElementContentAsString();
+        Assert(content == "data", "ReadElementContentAsString should include CDATA content");
+    }
+    // element with mixed text and comment (comment skipped)
+    {
+        auto reader = XmlReader::Create("<root>before<!-- comment -->after</root>");
+        reader.Read();
+        std::string content = reader.ReadElementContentAsString();
+        Assert(content == "beforeafter", "ReadElementContentAsString should skip comments");
+    }
+    {
+        auto reader = XmlReader::Create("<root>A&amp;B&#x43;</root>");
+        reader.Read();
+        std::string content = reader.ReadElementContentAsString();
+        Assert(content == "A&BC", "ReadElementContentAsString should preserve decoded entity semantics");
+    }
+    // after reading, reader should be past end element
+    {
+        auto reader = XmlReader::Create("<parent><child>text</child><next/></parent>");
+        reader.Read(); // parent
+        reader.Read(); // child
+        std::string content = reader.ReadElementContentAsString();
+        Assert(content == "text", "ReadElementContentAsString content check");
+        Assert(reader.NodeType() == XmlNodeType::Element, "After ReadElementContentAsString on child, should be on next element");
+        Assert(reader.Name() == "next", "Should advance to next sibling");
+    }
+
+    // ---- ReadElementString ----
+    {
+        auto reader = XmlReader::Create("<root>simple text</root>");
+        reader.Read();
+        std::string text = reader.ReadElementString();
+        Assert(text == "simple text", "ReadElementString should return element text");
+    }
+    {
+        auto reader = XmlReader::Create("<root/>");
+        reader.Read();
+        std::string text = reader.ReadElementString();
+        Assert(text.empty(), "ReadElementString on empty element should return empty");
+    }
+
+    // ---- ReadElementString(name) ----
+    {
+        auto reader = XmlReader::Create("<item>value</item>");
+        reader.Read();
+        std::string text = reader.ReadElementString("item");
+        Assert(text == "value", "ReadElementString(name) should return matched element text");
+    }
+    {
+        auto reader = XmlReader::Create("<item>value</item>");
+        reader.Read();
+        bool threw = false;
+        try { (void)reader.ReadElementString("other"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "ReadElementString(name) with wrong name should throw");
+    }
+
+    // ---- Skip ----
+    {
+        auto reader = XmlReader::Create("<root><a><b>deep</b></a><c/></root>");
+        reader.Read(); // root
+        reader.Read(); // a
+        reader.Skip(); // skip a and all descendants
+        Assert(reader.NodeType() == XmlNodeType::Element, "After Skip, should be on next sibling");
+        Assert(reader.Name() == "c", "After skipping <a>, should land on <c>");
+    }
+    {
+        // Skip on empty element
+        auto reader = XmlReader::Create("<root><empty/><next/></root>");
+        reader.Read(); // root
+        reader.Read(); // empty
+        reader.Skip(); // skip empty element
+        Assert(reader.Name() == "next", "After skipping empty element, should be on next");
+    }
+    {
+        // Skip on text node
+        auto reader = XmlReader::Create("<root>text<next/></root>");
+        reader.Read(); // root
+        reader.Read(); // text
+        reader.Skip(); // skip text
+        Assert(reader.NodeType() == XmlNodeType::Element, "After skipping text, should be on next element");
+        Assert(reader.Name() == "next", "After skipping text, should be on <next>");
+    }
+
+    // ---- ReadToFollowing ----
+    {
+        auto reader = XmlReader::Create("<root><a/><b><c/></b><d/></root>");
+        bool found = reader.ReadToFollowing("c");
+        Assert(found, "ReadToFollowing should find nested <c>");
+        Assert(reader.Name() == "c", "Should be positioned on <c>");
+    }
+    {
+        auto reader = XmlReader::Create("<root><a/><b/></root>");
+        bool found = reader.ReadToFollowing("missing");
+        Assert(!found, "ReadToFollowing for missing element should return false");
+        Assert(reader.IsEOF(), "Should be at EOF after failed ReadToFollowing");
+    }
+
+    // ---- ReadToDescendant ----
+    {
+        auto reader = XmlReader::Create("<root><a><target/></a><b/></root>");
+        reader.Read(); // root
+        bool found = reader.ReadToDescendant("target");
+        Assert(found, "ReadToDescendant should find <target> inside <root>");
+        Assert(reader.Name() == "target", "Should be positioned on <target>");
+    }
+    {
+        auto reader = XmlReader::Create("<root><a/><b/></root>");
+        reader.Read(); // root
+        bool found = reader.ReadToDescendant("missing");
+        Assert(!found, "ReadToDescendant for missing element should return false");
+    }
+    {
+        // ReadToDescendant on empty element should return false
+        auto reader = XmlReader::Create("<root/>");
+        reader.Read(); // root (empty)
+        bool found = reader.ReadToDescendant("child");
+        Assert(!found, "ReadToDescendant on empty element should return false");
+    }
+
+    // ---- ReadToNextSibling ----
+    {
+        auto reader = XmlReader::Create("<root><a/><b/><c/></root>");
+        reader.Read(); // root
+        reader.Read(); // a
+        bool found = reader.ReadToNextSibling("c");
+        Assert(found, "ReadToNextSibling should find <c>");
+        Assert(reader.Name() == "c", "Should be positioned on <c>");
+    }
+    {
+        auto reader = XmlReader::Create("<root><a/><b><deep/></b><target/></root>");
+        reader.Read(); // root
+        reader.Read(); // a
+        bool found = reader.ReadToNextSibling("target");
+        Assert(found, "ReadToNextSibling should skip past nested elements");
+        Assert(reader.Name() == "target", "Should be on <target>");
+    }
+    {
+        auto reader = XmlReader::Create("<root><a/><b/></root>");
+        reader.Read(); // root
+        reader.Read(); // a
+        bool found = reader.ReadToNextSibling("missing");
+        Assert(!found, "ReadToNextSibling for missing should return false");
+    }
+
+    // ---- XmlNodeReader parity ----
+    // Verify all convenience APIs produce identical results via XmlNodeReader
+    {
+        auto doc = XmlDocument::Parse("<root><!-- comment --><a>text</a><b><c/></b><d/></root>");
+
+        // MoveToContent parity
+        auto sr = XmlReader::Create("<root><!-- comment --><a>text</a></root>");
+        XmlNodeReader nr(*doc);
+        auto srNt = sr.MoveToContent();
+        auto nrNt = nr.MoveToContent();
+        Assert(srNt == nrNt, "MoveToContent parity: NodeType");
+        Assert(sr.Name() == nr.Name(), "MoveToContent parity: Name");
+    }
+    {
+        auto doc = XmlDocument::Parse("<root><child>hello</child><next/></root>");
+        auto sr = XmlReader::Create("<root><child>hello</child><next/></root>");
+        XmlNodeReader nr(*doc);
+
+        // ReadStartElement parity
+        sr.ReadStartElement("root");
+        nr.ReadStartElement("root");
+        Assert(sr.Name() == nr.Name(), "ReadStartElement parity after reading root");
+
+        // ReadElementContentAsString parity
+        std::string srContent = sr.ReadElementContentAsString();
+        std::string nrContent = nr.ReadElementContentAsString();
+        Assert(srContent == nrContent, "ReadElementContentAsString parity: " + srContent + " vs " + nrContent);
+        Assert(sr.Name() == nr.Name(), "After ReadElementContentAsString, both on same element");
+    }
+    {
+        // Skip parity
+        auto doc = XmlDocument::Parse("<root><a><b>deep</b></a><c/></root>");
+        auto sr = XmlReader::Create("<root><a><b>deep</b></a><c/></root>");
+        XmlNodeReader nr(*doc);
+        sr.Read(); sr.Read(); // root, a
+        nr.Read(); nr.Read();
+        sr.Skip();
+        nr.Skip();
+        Assert(sr.Name() == nr.Name(), "Skip parity: should both land on <c>");
+    }
+    {
+        // ReadToFollowing parity
+        auto doc = XmlDocument::Parse("<root><a/><b><c/></b></root>");
+        auto sr = XmlReader::Create("<root><a/><b><c/></b></root>");
+        XmlNodeReader nr(*doc);
+        Assert(sr.ReadToFollowing("c") == nr.ReadToFollowing("c"),
+            "ReadToFollowing parity: both should find <c>");
+        Assert(sr.Name() == nr.Name(), "ReadToFollowing parity: same position");
+    }
+    {
+        // ReadToDescendant parity
+        auto doc = XmlDocument::Parse("<root><a><target/></a></root>");
+        auto sr = XmlReader::Create("<root><a><target/></a></root>");
+        XmlNodeReader nr(*doc);
+        sr.Read(); nr.Read(); // root
+        Assert(sr.ReadToDescendant("target") == nr.ReadToDescendant("target"),
+            "ReadToDescendant parity: both should find <target>");
+    }
+    {
+        // ReadToNextSibling parity
+        auto doc = XmlDocument::Parse("<root><a/><b/><c/></root>");
+        auto sr = XmlReader::Create("<root><a/><b/><c/></root>");
+        XmlNodeReader nr(*doc);
+        sr.Read(); sr.Read(); // root, a
+        nr.Read(); nr.Read();
+        Assert(sr.ReadToNextSibling("c") == nr.ReadToNextSibling("c"),
+            "ReadToNextSibling parity: both should find <c>");
+        Assert(sr.Name() == nr.Name(), "ReadToNextSibling parity: same position");
+    }
+
+    // ---- Error boundaries ----
+    {
+        // ReadElementContentAsString on non-element
+        auto reader = XmlReader::Create("<root>text</root>");
+        reader.Read(); reader.Read(); // root, text
+        bool threw = false;
+        try { (void)reader.ReadElementContentAsString(); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "ReadElementContentAsString on Text should throw");
+    }
+    {
+        // ReadElementString on non-element
+        auto reader = XmlReader::Create("<root/>");
+        reader.Read(); reader.Read();
+        bool threw = false;
+        try { (void)reader.ReadElementString(); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "ReadElementString at EOF should throw");
+    }
+    {
+        // ReadElementContentAsString with nested elements (mixed content)
+        auto reader = XmlReader::Create("<root>text<child/>more</root>");
+        reader.Read();
+        bool threw = false;
+        try { (void)reader.ReadElementContentAsString(); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "ReadElementContentAsString on mixed content should throw");
+    }
+}
+
+void TestTier1Apis() {
+    // ---- ReadState ----
+    {
+        // Initial state before any Read
+        auto reader = XmlReader::Create("<root/>");
+        Assert(reader.GetReadState() == ReadState::Initial, "XmlReader should be in Initial state before first Read");
+
+        // Interactive after first Read
+        reader.Read();
+        Assert(reader.GetReadState() == ReadState::Interactive, "XmlReader should be Interactive after Read");
+
+        // EndOfFile after exhausting the document
+        while (reader.Read()) {}
+        Assert(reader.GetReadState() == ReadState::EndOfFile, "XmlReader should be in EndOfFile state after exhausting document");
+    }
+    {
+        // XmlNodeReader ReadState parity
+        auto doc = XmlDocument::Parse("<root/>");
+        XmlNodeReader nr(*doc);
+        Assert(nr.GetReadState() == ReadState::Initial, "XmlNodeReader should start in Initial state");
+        nr.Read();
+        Assert(nr.GetReadState() == ReadState::Interactive, "XmlNodeReader should be Interactive after Read");
+        while (nr.Read()) {}
+        Assert(nr.GetReadState() == ReadState::EndOfFile, "XmlNodeReader should be EndOfFile after exhaustion");
+    }
+
+    // ---- WriteState ----
+    {
+        XmlWriter w;
+        Assert(w.GetWriteState() == WriteState::Start, "XmlWriter should start in Start state");
+        w.WriteStartDocument();
+        Assert(w.GetWriteState() == WriteState::Prolog, "After WriteStartDocument, state should be Prolog");
+        w.WriteStartElement("root");
+        Assert(w.GetWriteState() == WriteState::Element, "After WriteStartElement, state should be Element");
+        w.WriteStartAttribute("id");
+        Assert(w.GetWriteState() == WriteState::Attribute, "After WriteStartAttribute, state should be Attribute");
+        w.WriteEndAttribute();
+        Assert(w.GetWriteState() == WriteState::Element, "After WriteEndAttribute, state should be back to Element");
+        w.WriteString("text");
+        Assert(w.GetWriteState() == WriteState::Content, "After WriteString(text), state should be Content");
+        w.WriteEndElement();
+        w.WriteEndDocument();
+        Assert(w.GetWriteState() == WriteState::Closed, "After WriteEndDocument, state should be Closed");
+    }
+    {
+        // WriteState::Start when no document or element started
+        XmlWriter w2;
+        Assert(w2.GetWriteState() == WriteState::Start, "Fresh writer starts in Start");
+        w2.WriteStartElement("root");
+        Assert(w2.GetWriteState() == WriteState::Element, "After WriteStartElement without document, should be Element");
+        w2.WriteEndElement();
+    }
+
+    // ---- GetAttribute(int) ----
+    {
+        auto reader = XmlReader::Create("<root a='1' b='2' c='3'/>");
+        reader.Read();
+        Assert(reader.GetAttribute(0) == "1", "GetAttribute(0) should return first attribute value");
+        Assert(reader.GetAttribute(1) == "2", "GetAttribute(1) should return second attribute value");
+        Assert(reader.GetAttribute(2) == "3", "GetAttribute(2) should return third attribute value");
+    }
+    {
+        auto doc = XmlDocument::Parse("<item x='10' y='20'/>");
+        XmlNodeReader nr(*doc);
+        nr.MoveToContent(); // land on the item element
+        Assert(nr.NodeType() == XmlNodeType::Element, "Should be on element");
+        Assert(nr.GetAttribute(0) == "10", "XmlNodeReader GetAttribute(0)");
+        Assert(nr.GetAttribute(1) == "20", "XmlNodeReader GetAttribute(1)");
+    }
+
+    // ---- MoveToAttribute(int) ----
+    {
+        auto reader = XmlReader::Create("<root a='1' b='2' c='3'/>");
+        reader.Read();
+        reader.MoveToAttribute(2);
+        Assert(reader.NodeType() == XmlNodeType::Attribute, "MoveToAttribute(int) should position on Attribute node");
+        Assert(reader.Value() == "3", "MoveToAttribute(2) should be on attribute c with value '3'");
+        reader.MoveToElement();
+        Assert(reader.NodeType() == XmlNodeType::Element, "MoveToElement should return to element after MoveToAttribute(int)");
+    }
+    {
+        // XmlNodeReader MoveToAttribute(int)
+        auto doc = XmlDocument::Parse("<item x='10' y='20'/>");
+        XmlNodeReader nr(*doc);
+        nr.MoveToContent(); // land on the item element
+        nr.MoveToAttribute(1);
+        Assert(nr.NodeType() == XmlNodeType::Attribute, "XmlNodeReader MoveToAttribute(int) positioning");
+        Assert(nr.Value() == "20", "XmlNodeReader MoveToAttribute(1) should be on y='20'");
+    }
+
+    // ---- LookupNamespace ----
+    {
+        auto reader = XmlReader::Create("<root xmlns='urn:default' xmlns:p='urn:pfx'><p:child/></root>");
+        reader.Read(); // root element
+        std::string dflt = reader.LookupNamespace("");
+        Assert(dflt == "urn:default", "LookupNamespace('') should return default namespace");
+        std::string pfx = reader.LookupNamespace("p");
+        Assert(pfx == "urn:pfx", "LookupNamespace('p') should return prefixed namespace");
+        std::string missing = reader.LookupNamespace("x");
+        Assert(missing.empty(), "LookupNamespace('x') for undeclared prefix should return empty");
+    }
+    {
+        // XmlNodeReader LookupNamespace
+        auto doc = XmlDocument::Parse("<root xmlns='urn:default' xmlns:p='urn:pfx'><p:child/></root>");
+        XmlNodeReader nr(*doc);
+        while (nr.Read() && nr.Name() != "root") {}
+        std::string dflt = nr.LookupNamespace("");
+        Assert(dflt == "urn:default", "XmlNodeReader LookupNamespace('') default ns");
+        std::string pfx = nr.LookupNamespace("p");
+        Assert(pfx == "urn:pfx", "XmlNodeReader LookupNamespace('p')");
+    }
+
+    // ---- ReadContentAsString ----
+    {
+        // Plain text
+        auto reader = XmlReader::Create("<root>hello world</root>");
+        reader.Read(); // root element
+        reader.Read(); // text node
+        std::string s = reader.ReadContentAsString();
+        Assert(s == "hello world", "ReadContentAsString should return text content");
+    }
+    {
+        // CDATA
+        auto reader = XmlReader::Create("<root><![CDATA[raw data]]></root>");
+        reader.Read(); // root
+        reader.Read(); // CDATA
+        std::string s = reader.ReadContentAsString();
+        Assert(s == "raw data", "ReadContentAsString should accumulate CDATA");
+    }
+    {
+        // Multiple consecutive text/CDATA segments
+        auto reader = XmlReader::Create("<root>abc<![CDATA[def]]>ghi</root>");
+        reader.Read(); // root
+        reader.Read(); // first text/cdata
+        std::string s = reader.ReadContentAsString();
+        Assert(s == "abcdefghi", "ReadContentAsString should concatenate adjacent text and CDATA");
+    }
+    {
+        // Mixed raw text with predefined and numeric entities
+        auto reader = XmlReader::Create("<root>A&amp;B&#x43;</root>");
+        reader.Read(); // root
+        reader.Read(); // text
+        std::string s = reader.ReadContentAsString();
+        Assert(s == "A&BC", "ReadContentAsString should preserve decoded entity semantics");
+    }
+    {
+        // XmlNodeReader ReadContentAsString
+        auto doc = XmlDocument::Parse("<root>hello</root>");
+        XmlNodeReader nr(*doc);
+        while (nr.Read() && nr.NodeType() != XmlNodeType::Text) {}
+        std::string s = nr.ReadContentAsString();
+        Assert(s == "hello", "XmlNodeReader ReadContentAsString");
+    }
+
+    // ---- XmlElement::IsEmpty ----
+    {
+        auto doc = XmlDocument::Parse("<root><empty/><nonempty>text</nonempty><alsoEmpty></alsoEmpty></root>");
+        auto root = doc->DocumentElement();
+        auto empty = std::static_pointer_cast<XmlElement>(root->ChildNodes()[0]);
+        auto nonempty = std::static_pointer_cast<XmlElement>(root->ChildNodes()[1]);
+        auto alsoEmpty = std::static_pointer_cast<XmlElement>(root->ChildNodes()[2]);
+        Assert(empty->IsEmpty(), "Self-closing element should be IsEmpty");
+        Assert(!nonempty->IsEmpty(), "Element with text content should not be IsEmpty");
+        Assert(alsoEmpty->IsEmpty(), "Element with explicit empty tags <tag></tag> should be IsEmpty");
+    }
+    {
+        // Programmatically created element is non-empty once a child is appended
+        XmlDocument doc2;
+        auto el = doc2.CreateElement("x");
+        Assert(el->IsEmpty(), "Newly created element should be IsEmpty");
+        el->AppendChild(doc2.CreateTextNode("hello"));
+        Assert(!el->IsEmpty(), "Element with text child should not be IsEmpty");
+    }
+
+    // ---- XmlNode::SetInnerText ----
+    {
+        auto doc = XmlDocument::Parse("<root>old text</root>");
+        auto root = doc->DocumentElement();
+        root->SetInnerText("new text");
+        Assert(root->InnerText() == "new text", "SetInnerText should replace text content");
+        Assert(root->ChildNodes().size() == 1, "SetInnerText should leave exactly one text child");
+        Assert(root->FirstChild()->NodeType() == XmlNodeType::Text, "SetInnerText child must be Text node");
+    }
+    {
+        // SetInnerText replaces mixed content
+        auto doc = XmlDocument::Parse("<root><child/>text</root>");
+        auto root = doc->DocumentElement();
+        root->SetInnerText("replaced");
+        Assert(root->InnerText() == "replaced", "SetInnerText on mixed content should replace everything");
+        Assert(root->ChildNodes().size() == 1, "After SetInnerText, should have exactly one child");
+    }
+    {
+        // SetInnerText on text node sets its own value
+        auto doc = XmlDocument::Parse("<root>original</root>");
+        auto textNode = doc->DocumentElement()->FirstChild();
+        Assert(textNode->NodeType() == XmlNodeType::Text, "Should be a text node");
+        textNode->SetInnerText("updated");
+        Assert(textNode->Value() == "updated", "SetInnerText on Text node should set value");
+    }
+
+    // ---- XmlNode::SelectSingleNode / SelectNodes in base class ----
+    {
+        // SelectSingleNode from XmlDocument root
+        auto doc = XmlDocument::Parse("<catalog><book id='b1'/><book id='b2'/></catalog>");
+        auto node = doc->SelectSingleNode("/catalog/book");
+        Assert(node != nullptr, "SelectSingleNode from document should find node");
+        auto el = std::static_pointer_cast<XmlElement>(node);
+        Assert(el->GetAttribute("id") == "b1", "SelectSingleNode should return first matching node");
+    }
+    {
+        // SelectNodes returns all matches
+        auto doc = XmlDocument::Parse("<catalog><book/><book/><book/></catalog>");
+        auto nodes = doc->SelectNodes("/catalog/book");
+        Assert(nodes.Count() == 3, "SelectNodes from document should return all matching nodes");
+    }
+    {
+        // SelectSingleNode via element (non-document base class path)
+        auto doc = XmlDocument::Parse("<root><a><b/></a><a><b/></a></root>");
+        auto root = doc->DocumentElement();
+        auto node = root->SelectSingleNode("a/b");
+        Assert(node != nullptr, "SelectSingleNode from element base class should work");
+    }
+    {
+        // SelectNodes via element
+        auto doc = XmlDocument::Parse("<root><a/><a/><b/></root>");
+        auto root = doc->DocumentElement();
+        auto nodes = root->SelectNodes("a");
+        Assert(nodes.Count() == 2, "SelectNodes from element should return matching children");
+    }
+
+    // ---- XmlDocument namespace-aware factory methods ----
+    {
+        // CreateElement(prefix, localName, ns)
+        XmlDocument doc;
+        auto el = doc.CreateElement("p", "item", "urn:myns");
+        Assert(el->LocalName() == "item", "CreateElement prefix/localName/ns: LocalName");
+        Assert(el->Prefix() == "p", "CreateElement prefix/localName/ns: Prefix");
+        Assert(el->NamespaceURI() == "urn:myns", "CreateElement prefix/localName/ns: NamespaceURI");
+        // xmlns:p attribute should be present
+        Assert(el->GetAttribute("xmlns:p") == "urn:myns", "CreateElement should auto-set xmlns:p");
+    }
+    {
+        // CreateAttribute(prefix, localName, ns, value)
+        XmlDocument doc;
+        auto attr = doc.CreateAttribute("p", "code", "urn:myns", "42");
+        Assert(attr->LocalName() == "code", "CreateAttribute prefix/localName/ns/value: LocalName");
+        Assert(attr->Prefix() == "p", "CreateAttribute: Prefix");
+        Assert(attr->Value() == "42", "CreateAttribute: Value");
+        // NamespaceURI requires the attribute to be attached to an element with the ns declaration;
+        // verify it resolves correctly when appended to a scoped element
+        auto el = doc.CreateElement("p", "item", "urn:myns");
+        el->SetAttributeNode(attr);
+        Assert(attr->NamespaceURI() == "urn:myns", "CreateAttribute: NamespaceURI when attached to ns-scoped element");
+    }
+
+    // ---- XmlWriter::WriteNode(XmlReader&) ----
+    {
+        // Basic element round-trip via reader
+        auto reader = XmlReader::Create("<root id='1'>text</root>");
+        reader.Read(); // position on root element
+        XmlWriter w;
+        w.WriteNode(reader);
+        std::string xml = w.GetString();
+        Assert(xml.find("<root") != std::string::npos, "WriteNode(XmlReader) should emit element");
+        Assert(xml.find("id=\"1\"") != std::string::npos || xml.find("id='1'") != std::string::npos,
+            "WriteNode(XmlReader) should emit attributes");
+        Assert(xml.find("text") != std::string::npos, "WriteNode(XmlReader) should emit text content");
+    }
+    {
+        // WriteNode(XmlReader) for comment
+        auto reader = XmlReader::Create("<root><!-- my comment --></root>");
+        reader.Read(); // root
+        reader.Read(); // comment node
+        XmlWriter w;
+        w.WriteStartElement("wrapper");
+        w.WriteNode(reader);
+        w.WriteEndElement();
+        std::string xml = w.GetString();
+        Assert(xml.find("<!-- my comment -->") != std::string::npos,
+            "WriteNode(XmlReader) should emit comment node");
+    }
+    {
+        // WriteNode(XmlReader) for text node
+        auto reader = XmlReader::Create("<root>hello</root>");
+        reader.Read(); // root
+        reader.Read(); // text
+        XmlWriter w;
+        w.WriteStartElement("out");
+        w.WriteNode(reader);
+        w.WriteEndElement();
+        Assert(w.GetString() == "<out>hello</out>", "WriteNode(XmlReader) for text node");
+    }
+    {
+        // WriteNode(XmlReader) for CDATA
+        auto reader = XmlReader::Create("<root><![CDATA[data]]></root>");
+        reader.Read(); // root
+        reader.Read(); // CDATA
+        XmlWriter w;
+        w.WriteStartElement("out");
+        w.WriteNode(reader);
+        w.WriteEndElement();
+        std::string xml = w.GetString();
+        Assert(xml.find("data") != std::string::npos, "WriteNode(XmlReader) for CDATA should emit data");
+    }
+    {
+        // Parity: WriteNode(XmlReader) output should match writing element manually
+        auto reader = XmlReader::Create("<elem a='1' b='2'>content</elem>");
+        reader.Read();
+        XmlWriter via_reader;
+        via_reader.WriteNode(reader);
+
+        XmlWriter manual;
+        manual.WriteStartElement("elem");
+        manual.WriteAttributeString("a", "1");
+        manual.WriteAttributeString("b", "2");
+        manual.WriteString("content");
+        manual.WriteEndElement();
+
+        Assert(via_reader.GetString() == manual.GetString(),
+            "WriteNode(XmlReader) output should match manually constructed equivalent");
+    }
+}
+
+void TestTier2Apis() {
+    // ── XmlCharacterData ─────────────────────────────────────────────────────
+    {
+        // Data() / Length()
+        auto doc = XmlDocument{};
+        auto text = doc.CreateTextNode("Hello");
+        Assert(text->Data() == "Hello", "XmlCharacterData::Data mismatch");
+        Assert(text->Length() == 5, "XmlCharacterData::Length mismatch");
+
+        // SetData / AppendData
+        text->SetData("abc");
+        Assert(text->Data() == "abc", "SetData failed");
+        text->AppendData("def");
+        Assert(text->Data() == "abcdef", "AppendData failed");
+
+        // DeleteData
+        text->DeleteData(2, 2);  // "ab" + "ef" → "abef"
+        Assert(text->Data() == "abef", "DeleteData failed");
+
+        // InsertData
+        text->InsertData(2, "CD");  // "ab" + "CD" + "ef" → "abCDef"
+        Assert(text->Data() == "abCDef", "InsertData failed");
+
+        // ReplaceData
+        text->ReplaceData(2, 2, "XY");  // replace "CD" with "XY" → "abXYef"
+        Assert(text->Data() == "abXYef", "ReplaceData failed");
+
+        // Substring
+        std::string sub = text->Substring(2, 2);
+        Assert(sub == "XY", "Substring failed");
+    }
+
+    // ── XmlText::SplitText ───────────────────────────────────────────────────
+    {
+        auto doc = XmlDocument{};
+        auto root = doc.CreateElement("root");
+        doc.AppendChild(root);
+        auto text = doc.CreateTextNode("HelloWorld");
+        root->AppendChild(text);
+
+        auto tail = text->SplitText(5);
+        Assert(text->Data() == "Hello", "SplitText: head wrong");
+        Assert(tail->Data() == "World", "SplitText: tail wrong");
+        // Both nodes are now siblings under root
+        Assert(root->ChildNodes().size() == 2, "SplitText: sibling count wrong");
+        Assert(root->ChildNodes()[0].get() == text.get(), "SplitText: first sibling should be head");
+        Assert(root->ChildNodes()[1].get() == tail.get(), "SplitText: second sibling should be tail");
+    }
+
+    // ── XmlText::SplitText detached (no parent) ──────────────────────────────
+    {
+        auto detached = std::make_shared<XmlText>("Hello");
+        auto tail = detached->SplitText(3);
+        Assert(detached->Data() == "Hel", "SplitText detached: head wrong");
+        Assert(tail->Data() == "lo", "SplitText detached: tail wrong");
+        // tail has no parent, that's fine — just verify it doesn't crash
+    }
+
+    // ── XmlNode::Normalize ───────────────────────────────────────────────────
+    {
+        auto doc = XmlDocument{};
+        auto root = doc.CreateElement("root");
+        doc.AppendChild(root);
+        root->AppendChild(doc.CreateTextNode("Hello"));
+        root->AppendChild(doc.CreateTextNode(" "));
+        root->AppendChild(doc.CreateTextNode("World"));
+        Assert(root->ChildNodes().size() == 3, "Normalize: pre-condition 3 text nodes");
+        root->Normalize();
+        Assert(root->ChildNodes().size() == 1, "Normalize: should merge adjacent text nodes");
+        Assert(root->ChildNodes()[0]->NodeType() == XmlNodeType::Text, "Normalize: merged node should be Text");
+        Assert(root->ChildNodes()[0]->Value() == "Hello World", "Normalize: merged text value wrong");
+    }
+
+    // ── XmlElement NS-aware attribute overloads ──────────────────────────────
+    {
+        auto doc = XmlDocument{};
+        auto root = doc.CreateElement("ns", "root", "http://example.com");
+        doc.AppendChild(root);
+
+        // SetAttribute(localName, ns, value)
+        root->SetAttribute("id", "http://example.com", "42");
+        Assert(root->HasAttribute("id", "http://example.com"), "NS HasAttribute should be true");
+        Assert(!root->HasAttribute("id", "http://other.com"), "NS HasAttribute wrong ns should be false");
+
+        // GetAttribute(localName, ns)
+        std::string val = root->GetAttribute("id", "http://example.com");
+        Assert(val == "42", "NS GetAttribute value mismatch");
+
+        // GetAttributeNode(localName, ns)
+        auto node = root->GetAttributeNode("id", "http://example.com");
+        Assert(node != nullptr, "NS GetAttributeNode should return node");
+        Assert(node->Value() == "42", "NS GetAttributeNode value mismatch");
+
+        // RemoveAttribute(localName, ns)
+        bool removed = root->RemoveAttribute("id", "http://example.com");
+        Assert(removed, "NS RemoveAttribute should return true");
+        Assert(!root->HasAttribute("id", "http://example.com"), "NS attribute should be gone after remove");
+    }
+
+    // ── XmlWriter::LookupPrefix ───────────────────────────────────────────────
+    {
+        XmlWriter w;
+        w.WriteStartElement("ns", "root", "http://example.com");
+        std::string prefix = w.LookupPrefix("http://example.com");
+        Assert(prefix == "ns", "LookupPrefix should return declared prefix");
+        w.WriteEndElement();
+    }
+
+    // ── XmlReader::HasAttributes / ReadString ────────────────────────────────
+    {
+        auto reader = XmlReader::Create("<root a='1'><child>text content</child></root>");
+        reader.Read();  // <root>
+        Assert(reader.HasAttributes(), "XmlReader::HasAttributes on element with attrs");
+
+        reader.Read();  // <child>
+        Assert(!reader.HasAttributes(), "XmlReader::HasAttributes on element without attrs");
+
+        // ReadString: on element → reads text child
+        std::string s = reader.ReadString();
+        Assert(s == "text content", "XmlReader::ReadString on element");
+    }
+
+    // ── XmlNodeReader::HasAttributes / ReadString ────────────────────────────
+    {
+        auto doc = XmlDocument{};
+        doc.LoadXml("<root a='1'><child>hello</child></root>");
+        auto root = doc.DocumentElement();
+        auto nodeReader = XmlNodeReader{*root};
+
+        nodeReader.Read();  // element 'root'
+        Assert(nodeReader.HasAttributes(), "XmlNodeReader::HasAttributes with attrs");
+
+        nodeReader.Read();  // <child>
+        Assert(!nodeReader.HasAttributes(), "XmlNodeReader::HasAttributes without attrs");
+
+        std::string s = nodeReader.ReadString();
+        Assert(s == "hello", "XmlNodeReader::ReadString");
+    }
+
+    // ── XmlNewLineHandling::Entitize ─────────────────────────────────────────
+    {
+        XmlWriterSettings settings;
+        settings.NewLineHandling = XmlNewLineHandling::Entitize;
+        XmlWriter w{settings};
+        w.WriteStartElement("root");
+        w.WriteString("line1\nline2\r\nline3");
+        w.WriteEndElement();
+        std::string xml = w.GetString();
+        Assert(xml.find("&#xA;") != std::string::npos, "Entitize: \\n should become &#xA;");
+        Assert(xml.find("&#xD;") != std::string::npos, "Entitize: \\r should become &#xD;");
+        Assert(xml.find('\n') == std::string::npos, "Entitize: raw \\n should not appear");
+        Assert(xml.find('\r') == std::string::npos, "Entitize: raw \\r should not appear");
+    }
+
+    // ── XmlConvert::VerifyNCName / IsNCNameChar / IsWhitespaceChar ───────────
+    {
+        // Valid NCNames
+        Assert(XmlConvert::VerifyNCName("valid") == "valid", "VerifyNCName: simple name");
+        Assert(XmlConvert::VerifyNCName("_myName") == "_myName", "VerifyNCName: underscore start");
+
+        // Invalid NCName: colon not allowed
+        bool threwColon = false;
+        try { XmlConvert::VerifyNCName("ns:local"); } catch (...) { threwColon = true; }
+        Assert(threwColon, "VerifyNCName: colon should throw");
+
+        // Invalid NCName: digit start
+        bool threwDigit = false;
+        try { XmlConvert::VerifyNCName("1bad"); } catch (...) { threwDigit = true; }
+        Assert(threwDigit, "VerifyNCName: digit-start should throw");
+
+        // IsNCNameChar
+        Assert(XmlConvert::IsNCNameChar('a'), "IsNCNameChar 'a' should be true");
+        Assert(XmlConvert::IsNCNameChar('0'), "IsNCNameChar '0' should be true");
+        Assert(XmlConvert::IsNCNameChar('_'), "IsNCNameChar '_' should be true");
+        Assert(!XmlConvert::IsNCNameChar(':'), "IsNCNameChar ':' should be false");
+        Assert(!XmlConvert::IsNCNameChar(' '), "IsNCNameChar ' ' should be false");
+
+        // IsWhitespaceChar
+        Assert(XmlConvert::IsWhitespaceChar(' '), "IsWhitespaceChar ' '");
+        Assert(XmlConvert::IsWhitespaceChar('\t'), "IsWhitespaceChar \\t");
+        Assert(XmlConvert::IsWhitespaceChar('\n'), "IsWhitespaceChar \\n");
+        Assert(XmlConvert::IsWhitespaceChar('\r'), "IsWhitespaceChar \\r");
+        Assert(!XmlConvert::IsWhitespaceChar('a'), "IsWhitespaceChar 'a' should be false");
+    }
+}
+
+void TestTier3Apis() {
+    // ── XmlWhitespace / XmlSignificantWhitespace inherit XmlCharacterData ────
+    {
+        auto doc = XmlDocument{};
+        auto ws = doc.CreateWhitespace("   ");
+        auto sws = doc.CreateSignificantWhitespace("  \t  ");
+
+        // Both are XmlCharacterData — Data()/Length()/AppendData etc. work
+        Assert(ws->Data() == "   ", "XmlWhitespace::Data");
+        Assert(ws->Length() == 3, "XmlWhitespace::Length");
+        ws->AppendData(" ");
+        Assert(ws->Data() == "    ", "XmlWhitespace::AppendData");
+
+        Assert(sws->Data() == "  \t  ", "XmlSignificantWhitespace::Data");
+        Assert(sws->Substring(2, 1) == "\t", "XmlSignificantWhitespace::Substring");
+    }
+
+    // ── XmlConvert::IsNCNameStartChar ─────────────────────────────────────
+    {
+        Assert(XmlConvert::IsNCNameStartChar('a'), "IsNCNameStartChar 'a'");
+        Assert(XmlConvert::IsNCNameStartChar('Z'), "IsNCNameStartChar 'Z'");
+        Assert(XmlConvert::IsNCNameStartChar('_'), "IsNCNameStartChar '_'");
+        Assert(!XmlConvert::IsNCNameStartChar(':'), "IsNCNameStartChar ':' should be false");
+        Assert(!XmlConvert::IsNCNameStartChar('0'), "IsNCNameStartChar '0' should be false");
+        Assert(!XmlConvert::IsNCNameStartChar('-'), "IsNCNameStartChar '-' should be false");
+    }
+
+    // ── XmlReader::GetAttribute(localName, ns) / MoveToAttribute(localName, ns) ──
+    {
+        auto reader = XmlReader::Create("<root xmlns:ns='http://example.com' ns:id='42' />");
+        reader.Read();
+        Assert(reader.NodeType() == XmlNodeType::Element, "Reader: element");
+        std::string val = reader.GetAttribute("id", "http://example.com");
+        Assert(val == "42", "XmlReader::GetAttribute(localName, ns)");
+
+        bool moved = reader.MoveToAttribute("id", "http://example.com");
+        Assert(moved, "XmlReader::MoveToAttribute(localName, ns) should return true");
+        Assert(reader.Value() == "42", "XmlReader::MoveToAttribute(localName, ns) value");
+    }
+
+    // ── XmlNodeReader::GetAttribute(localName, ns) / MoveToAttribute(localName, ns) ──
+    {
+        auto doc = XmlDocument{};
+        doc.LoadXml("<root xmlns:ns='http://example.com' ns:id='42' />");
+        auto nodeReader = XmlNodeReader{*doc.DocumentElement()};
+        nodeReader.Read();
+
+        std::string val = nodeReader.GetAttribute("id", "http://example.com");
+        Assert(val == "42", "XmlNodeReader::GetAttribute(localName, ns)");
+
+        bool moved = nodeReader.MoveToAttribute("id", "http://example.com");
+        Assert(moved, "XmlNodeReader::MoveToAttribute(localName, ns) should return true");
+        Assert(nodeReader.Value() == "42", "XmlNodeReader::MoveToAttribute value");
+    }
+
+    // ── XmlWriter::WriteElementString(prefix, localName, ns, value) ───────
+    {
+        XmlWriter w;
+        w.WriteStartElement("root");
+        w.WriteElementString("ns", "title", "http://example.com", "hello");
+        w.WriteEndElement();
+        std::string xml = w.GetString();
+        Assert(xml.find("ns:title") != std::string::npos, "WriteElementString NS: element name");
+        Assert(xml.find("hello") != std::string::npos, "WriteElementString NS: value");
+        Assert(xml.find("http://example.com") != std::string::npos, "WriteElementString NS: namespace decl");
+    }
+
+    // ── GetElementsByTagName(localName, ns) ───────────────────────────────
+    {
+        auto doc = XmlDocument{};
+        doc.LoadXml(
+            "<root xmlns:a='http://a.com' xmlns:b='http://b.com'>"
+            "  <a:item id='1'/><b:item id='2'/><a:item id='3'/>"
+            "</root>");
+
+        // From document
+        auto aItems = doc.GetElementsByTagName("item", "http://a.com");
+        Assert(aItems.size() == 2, "Document::GetElementsByTagName NS: count");
+        Assert(aItems[0]->GetAttribute("id") == "1", "Document::GetElementsByTagName NS: first");
+        Assert(aItems[1]->GetAttribute("id") == "3", "Document::GetElementsByTagName NS: second");
+
+        auto bItems = doc.GetElementsByTagName("item", "http://b.com");
+        Assert(bItems.size() == 1, "Document::GetElementsByTagName NS: b count");
+        Assert(bItems[0]->GetAttribute("id") == "2", "Document::GetElementsByTagName NS: b item");
+
+        // From element
+        auto root = doc.DocumentElement();
+        auto allA = root->GetElementsByTagName("item", "http://a.com");
+        Assert(allA.size() == 2, "Element::GetElementsByTagName NS: count");
+
+        // Wildcard ns
+        auto allItems = root->GetElementsByTagName("item", "*");
+        Assert(allItems.size() == 3, "GetElementsByTagName wildcard ns: count");
+    }
+
+    // ── XmlNode::SetInnerXml base throws for unsupported types ───────────
+    {
+        auto doc = XmlDocument{};
+        auto comment = doc.CreateComment("original");
+        bool threw = false;
+        try { comment->SetInnerXml("<b/>"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "XmlNode::SetInnerXml should throw for Comment node");
+
+        // But works fine for element (override)
+        auto elem = doc.CreateElement("root");
+        doc.AppendChild(elem);
+        elem->SetInnerXml("<child/>");
+        Assert(elem->ChildNodes().size() == 1, "XmlElement::SetInnerXml works");
+        Assert(elem->ChildNodes()[0]->Name() == "child", "XmlElement::SetInnerXml child name");
+    }
+}
+
+}  // namespace
+
+int main() {
+    try {
+        TestParseDocument();
+        TestDocumentTypeDeclarations();
+        TestDocumentTypeBoundaries();
+        TestInvalidDtdInputs();
+        TestDeclaredEntityResolution();
+        TestEntitySemanticsConsistency();
+        TestEntityResolutionFailures();
+        TestDocumentTypeEntityNotationRoundTrip();
+        TestXmlWriterEntitySemantics();
+        TestGenerateDocument();
+        TestFileRoundTrip();
+        TestValidationErrors();
+        TestXmlSchemaValidation();
+        TestXmlSchemaSimpleTypesAndChoice();
+        TestXmlSchemaNamedTypesAndOccurs();
+        TestXmlSchemaFacets();
+        TestXmlSchemaListAndUnion();
+        TestXmlSchemaAnnotations();
+        TestXmlSchemaSimpleTypeFinalDerivationControls();
+        TestXmlSchemaNestedCompositors();
+        TestXmlSchemaAllCompositor();
+        TestXmlSchemaParticleOccursLegality();
+        TestXmlSchemaForwardTypeReferences();
+        TestXmlSchemaElementReferences();
+        TestXmlSchemaGroupsAndAttributeReuse();
+        TestXmlSchemaAnyWildcards();
+        TestXmlSchemaContentExtensions();
+        TestXmlSchemaContentRestrictions();
+        TestXmlSchemaRestrictionLegality();
+        TestXmlSchemaComplexTypeFinalDerivationControls();
+        TestXmlSchemaSchemaDerivationDefaults();
+        TestXmlSchemaSubstitutionGroups();
+        TestXmlSchemaSubstitutionDerivationControls();
+        TestXmlSchemaWildcardProcessContents();
+        TestXmlSchemaNillableElements();
+        TestXmlSchemaFileIncludesAndImports();
+        TestXmlSchemaElementAndAttributeFormDefaults();
+        TestXmlSchemaFileOverrideAndRedefineHandling();
+        TestXmlSchemaFileCompositionWithTypeDerivation();
+        TestXmlSchemaDefaultAndFixedValues();
+        TestXmlSchemaIdentityConstraints();
+        TestXmlSchemaIdAndIdRefTypes();
+        TestXmlSchemaEntityTypes();
+        TestXmlSchemaNotationType();
+        TestXmlSchemaNameLikePrimitiveTypes();
+        TestXmlSchemaCommonStringDerivedTypes();
+        TestXmlSchemaTemporalTypes();
+        TestXmlSchemaDurationType();
+        TestXmlSchemaBinaryTypes();
+        TestXmlSchemaIntegerDerivedTypes();
+        TestXmlSchemaFloatType();
+        TestXmlSchemaDecimalType();
+        TestXmlSchemaDoubleType();
+        TestXmlSchemaAnySimpleType();
+        TestXmlSchemaAnyType();
+        TestXmlSchemaAnyTypeRestriction();
+        TestXmlSchemaDirectAnyParticles();
+        TestXmlSchemaGYearTypes();
+        TestXmlSchemaGMonthTypes();
+        TestXmlSchemaXsiType();
+        TestXmlExceptionLineInfo();
+        TestDocumentConfiguration();
+        TestXmlDocumentStreamsAndEvents();
+        TestWhitespaceNodes();
+        TestGetElementsByTagName();
+        TestDomCollections();
+        TestXPathSelection();
+        TestXPathNamespaces();
+        TestXPathBoundaries();
+        TestXPathHighFrequencyFunctions();
+        TestInvalidXPathInputs();
+        TestXPathErrorBoundaries();
+        TestDomEditing();
+        TestDocumentEditingConstraints();
+        TestImportNode();
+        TestCloneNode();
+        TestCreateNode();
+        TestDomNodeBoundaryMatrix();
+        TestNodeValueMutationBoundaries();
+        TestNodeStructureMutationMatrix();
+        TestAttributeStructureMutationMatrix();
+        TestCrossDocumentStructureMutationMatrix();
+        TestDocumentStructureMutationMatrix();
+        TestNamespaceManager();
+        TestDomNamespaces();
+        TestNamespaceScopeRoundTrip();
+        TestXmlReader();
+        TestXmlReaderNamespaces();
+        TestXmlReaderNodeReaderParity();
+        TestXmlReaderNodeReaderSignificantWhitespaceParity();
+        TestReaderEventSnapshotMatrix();
+        TestXmlReaderDocumentBoundaryMatrix();
+        TestXmlWriterInstance();
+        TestXmlWriterStateMachine();
+        TestXmlWriterConfiguration();
+        TestXmlWriterBase64AndElementReader();
+        TestXmlWriterWhitespace();
+        TestXmlWriterWriteNode();
+        TestXmlWriterWriteRaw();
+        TestXmlWriterFormattingBoundaries();
+        TestXmlWriterHighFrequencyApis();
+        TestXmlExceptionClassification();
+        TestXmlReaderStreamingSettings();
+        TestXmlReaderConfiguration();
+        TestXmlNodeReaderRootBoundaryMatrix();
+        TestXmlNodeReader();
+        TestXmlReaderFromFile();
+        TestXPathAxes();
+        TestXPathUnionOperator();
+        TestXPathNavigatorAndDocument();
+        TestXmlConvert();
+        TestReaderConvenienceApis();
+        TestTier1Apis();
+        TestTier2Apis();
+        TestTier3Apis();
+        std::cout << "All System.Xml tests passed." << std::endl;
+        return 0;
+    } catch (const std::exception& exception) {
+        std::cerr << "Test failure: " << exception.what() << std::endl;
+        return 1;
+    }
+}
