@@ -1,4 +1,4 @@
-#include "XmlInternal.h"
+#include "XmlUtilityInternal.h"
 
 namespace System::Xml {
 

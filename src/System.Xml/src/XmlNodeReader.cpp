@@ -63,11 +63,25 @@ const std::string& XmlNodeReader::Name() const {
 }
 
 std::string XmlNodeReader::LocalName() const {
-    return std::string{SplitQualifiedNameView(Name()).second};
+    const auto* event = CurrentEvent();
+    if (attributeIndex_ >= 0) {
+        return event == nullptr ? std::string{} : event->attributeLocalNames[static_cast<std::size_t>(attributeIndex_)];
+    }
+    if (event == nullptr) {
+        return {};
+    }
+    return event->localName;
 }
 
 std::string XmlNodeReader::Prefix() const {
-    return std::string{SplitQualifiedNameView(Name()).first};
+    const auto* event = CurrentEvent();
+    if (attributeIndex_ >= 0) {
+        return event == nullptr ? std::string{} : event->attributePrefixes[static_cast<std::size_t>(attributeIndex_)];
+    }
+    if (event == nullptr) {
+        return {};
+    }
+    return event->prefix;
 }
 
 const std::string& XmlNodeReader::NamespaceURI() const {
@@ -124,11 +138,16 @@ bool XmlNodeReader::HasAttributes() const noexcept {
     return !CurrentAttributes().empty();
 }
 
-std::string XmlNodeReader::GetAttribute(const std::string& name) const {
+std::string XmlNodeReader::GetAttribute(std::string_view name) const {
+    const auto* event = CurrentEvent();
+    if (event == nullptr) {
+        return {};
+    }
+
     const auto& attributes = CurrentAttributes();
-    const auto found = std::find_if(attributes.begin(), attributes.end(), [&name](const auto& attribute) {
-        const std::string_view attributeName(attribute.first);
-        return attributeName == name || SplitQualifiedNameView(attributeName).second == name;
+    const auto found = std::find_if(attributes.begin(), attributes.end(), [&name, event, &attributes](const auto& attribute) {
+        const std::size_t index = static_cast<std::size_t>(&attribute - attributes.data());
+        return attribute.first == name || event->attributeLocalNames[index] == name;
     });
     return found == attributes.end() ? std::string{} : found->second;
 }
@@ -141,24 +160,28 @@ std::string XmlNodeReader::GetAttribute(int index) const {
     return attributes[static_cast<std::size_t>(index)].second;
 }
 
-std::string XmlNodeReader::GetAttribute(const std::string& localName, const std::string& namespaceUri) const {
+std::string XmlNodeReader::GetAttribute(std::string_view localName, std::string_view namespaceUri) const {
     const auto* event = CurrentEvent();
     if (event == nullptr) return {};
     for (std::size_t i = 0; i < event->attributes.size(); ++i) {
-        const auto local = SplitQualifiedNameView(event->attributes[i].first).second;
         const auto ns = i < event->attributeNamespaceUris.size() ? event->attributeNamespaceUris[i] : std::string{};
-        if (local == localName && ns == namespaceUri) {
+        if (event->attributeLocalNames[i] == localName && ns == namespaceUri) {
             return event->attributes[i].second;
         }
     }
     return {};
 }
 
-bool XmlNodeReader::MoveToAttribute(const std::string& name) {
+bool XmlNodeReader::MoveToAttribute(std::string_view name) {
+    const auto* event = CurrentEvent();
+    if (event == nullptr) {
+        return false;
+    }
+
     const auto& attributes = CurrentAttributes();
-    const auto found = std::find_if(attributes.begin(), attributes.end(), [&name](const auto& attribute) {
-        const std::string_view attributeName(attribute.first);
-        return attributeName == name || SplitQualifiedNameView(attributeName).second == name;
+    const auto found = std::find_if(attributes.begin(), attributes.end(), [&name, event, &attributes](const auto& attribute) {
+        const std::size_t index = static_cast<std::size_t>(&attribute - attributes.data());
+        return attribute.first == name || event->attributeLocalNames[index] == name;
     });
     if (found == attributes.end()) {
         return false;
@@ -177,13 +200,12 @@ bool XmlNodeReader::MoveToAttribute(int index) {
     return true;
 }
 
-bool XmlNodeReader::MoveToAttribute(const std::string& localName, const std::string& namespaceUri) {
+bool XmlNodeReader::MoveToAttribute(std::string_view localName, std::string_view namespaceUri) {
     const auto* event = CurrentEvent();
     if (event == nullptr) return false;
     for (std::size_t i = 0; i < event->attributes.size(); ++i) {
-        const auto local = SplitQualifiedNameView(event->attributes[i].first).second;
         const auto ns = i < event->attributeNamespaceUris.size() ? event->attributeNamespaceUris[i] : std::string{};
-        if (local == localName && ns == namespaceUri) {
+        if (event->attributeLocalNames[i] == localName && ns == namespaceUri) {
             attributeIndex_ = static_cast<int>(i);
             return true;
         }
@@ -218,7 +240,7 @@ bool XmlNodeReader::MoveToElement() {
     return moved;
 }
 
-std::string XmlNodeReader::LookupNamespace(const std::string& prefix) const {
+std::string XmlNodeReader::LookupNamespace(std::string_view prefix) const {
     // XmlNodeReader resolves namespaces from the current event's attribute namespace URIs
     const auto* event = CurrentEvent();
     if (event == nullptr) return {};
@@ -343,7 +365,7 @@ bool XmlNodeReader::IsStartElement() {
     return MoveToContent() == XmlNodeType::Element;
 }
 
-bool XmlNodeReader::IsStartElement(const std::string& name) {
+bool XmlNodeReader::IsStartElement(std::string_view name) {
     return MoveToContent() == XmlNodeType::Element && Name() == name;
 }
 
@@ -354,12 +376,12 @@ void XmlNodeReader::ReadStartElement() {
     Read();
 }
 
-void XmlNodeReader::ReadStartElement(const std::string& name) {
+void XmlNodeReader::ReadStartElement(std::string_view name) {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadStartElement called when the reader is not positioned on an element");
     }
     if (Name() != name) {
-        throw XmlException("Element '" + name + "' was not found. Current element is '" + Name() + "'");
+        throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
     }
     Read();
 }
@@ -427,12 +449,12 @@ std::string XmlNodeReader::ReadElementString() {
     }
 }
 
-std::string XmlNodeReader::ReadElementString(const std::string& name) {
+std::string XmlNodeReader::ReadElementString(std::string_view name) {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadElementString called when the reader is not positioned on an element");
     }
     if (Name() != name) {
-        throw XmlException("Element '" + name + "' was not found. Current element is '" + Name() + "'");
+        throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
     }
     return ReadElementString();
 }
@@ -452,7 +474,7 @@ void XmlNodeReader::Skip() {
     }
 }
 
-bool XmlNodeReader::ReadToFollowing(const std::string& name) {
+bool XmlNodeReader::ReadToFollowing(std::string_view name) {
     while (Read()) {
         if (NodeType() == XmlNodeType::Element && Name() == name) {
             return true;
@@ -461,7 +483,7 @@ bool XmlNodeReader::ReadToFollowing(const std::string& name) {
     return false;
 }
 
-bool XmlNodeReader::ReadToDescendant(const std::string& name) {
+bool XmlNodeReader::ReadToDescendant(std::string_view name) {
     if (NodeType() != XmlNodeType::Element || IsEmptyElement()) {
         return false;
     }
@@ -477,7 +499,7 @@ bool XmlNodeReader::ReadToDescendant(const std::string& name) {
     return false;
 }
 
-bool XmlNodeReader::ReadToNextSibling(const std::string& name) {
+bool XmlNodeReader::ReadToNextSibling(std::string_view name) {
     int targetDepth = Depth();
     if (NodeType() == XmlNodeType::Element && !IsEmptyElement()) {
         Skip();
@@ -617,9 +639,25 @@ void XmlNodeReader::AppendEvent(
             nameTable_.Add(attributeNamespaceUri);
         }
     }
+
+    const auto [prefixView, localNameView] = SplitQualifiedNameView(name);
+    std::string localName(localNameView);
+    std::string prefix(prefixView);
+    std::vector<std::string> attributeLocalNames;
+    std::vector<std::string> attributePrefixes;
+    attributeLocalNames.reserve(attributes.size());
+    attributePrefixes.reserve(attributes.size());
+    for (const auto& attribute : attributes) {
+        const auto [attributePrefixView, attributeLocalNameView] = SplitQualifiedNameView(attribute.first);
+        attributeLocalNames.emplace_back(attributeLocalNameView);
+        attributePrefixes.emplace_back(attributePrefixView);
+    }
+
     events_.push_back(NodeEvent{
         nodeType,
         std::move(name),
+        std::move(localName),
+        std::move(prefix),
         std::move(namespaceUri),
         std::move(value),
         depth,
@@ -627,6 +665,8 @@ void XmlNodeReader::AppendEvent(
         std::move(innerXml),
         std::move(outerXml),
         std::move(attributes),
+        std::move(attributeLocalNames),
+        std::move(attributePrefixes),
         std::move(attributeNamespaceUris)});
 }
 

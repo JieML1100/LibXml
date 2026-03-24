@@ -2,11 +2,41 @@
 
 namespace System::Xml {
 
-std::string LookupNamespaceUriOnElement(const XmlElement* element, std::string_view prefix) {
+namespace {
+
+constexpr std::string_view kXmlNamespaceUri = "http://www.w3.org/XML/1998/namespace";
+constexpr std::string_view kXmlnsNamespaceUri = "http://www.w3.org/2000/xmlns/";
+
+const std::vector<std::shared_ptr<XmlNode>>& EmptyXmlNodeChildren() noexcept {
+    static const std::vector<std::shared_ptr<XmlNode>> empty;
+    return empty;
+}
+
+bool PrefixResolvesToNamespaceUri(const XmlElement* element, std::string_view prefix, std::string_view namespaceUri) noexcept {
+    if (prefix.empty()) {
+        return namespaceUri.empty();
+    }
+
+    std::string_view resolvedNamespaceUri;
+    return LookupNamespaceUriOnElementView(element, prefix, resolvedNamespaceUri) && resolvedNamespaceUri == namespaceUri;
+}
+
+std::size_t FindChildIndexOrThrow(const XmlNode& parent, const std::shared_ptr<XmlNode>& child) {
+    const auto& children = parent.ChildNodes();
+    const auto found = std::find(children.begin(), children.end(), child);
+    if (found == children.end()) {
+        throw XmlException("Reference child is not a child of the current node");
+    }
+
+    return static_cast<std::size_t>(std::distance(children.begin(), found));
+}
+
+}  // namespace
+
+bool LookupNamespaceUriOnElementView(const XmlElement* element, std::string_view prefix, std::string_view& namespaceUri) noexcept {
     for (auto current = element; current != nullptr; ) {
-        std::string_view value;
-        if (current->TryFindNamespaceDeclarationValueView(prefix, value)) {
-            return std::string(value);
+        if (current->TryFindNamespaceDeclarationValueView(prefix, namespaceUri)) {
+            return true;
         }
 
         const XmlNode* parent = current->ParentNode();
@@ -16,13 +46,21 @@ std::string LookupNamespaceUriOnElement(const XmlElement* element, std::string_v
     }
 
     if (prefix == "xml") {
-        return "http://www.w3.org/XML/1998/namespace";
+        namespaceUri = kXmlNamespaceUri;
+        return true;
     }
     if (prefix == "xmlns") {
-        return "http://www.w3.org/2000/xmlns/";
+        namespaceUri = kXmlnsNamespaceUri;
+        return true;
     }
 
-    return {};
+    namespaceUri = {};
+    return false;
+}
+
+std::string LookupNamespaceUriOnElement(const XmlElement* element, std::string_view prefix) {
+    std::string_view namespaceUri;
+    return LookupNamespaceUriOnElementView(element, prefix, namespaceUri) ? std::string(namespaceUri) : std::string{};
 }
 
 void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
@@ -32,36 +70,27 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
     const bool useFastAppend = !document.HasNodeChangeHandlers();
 
     const auto createOwnedTextNode = [&document, &reader]() {
-        static_cast<void>(reader.Value());
-        auto node = std::make_shared<XmlText>(std::move(reader.currentValue_));
-        node->SetOwnerDocument(&document);
-        return node;
+        reader.MaterializeValue();
+        return document.AllocateOwnedNode<XmlText>(std::move(reader.currentValue_));
     };
 
     const auto createOwnedWhitespaceNode = [&document, &reader]() {
-        static_cast<void>(reader.Value());
-        auto node = std::make_shared<XmlWhitespace>(std::move(reader.currentValue_));
-        node->SetOwnerDocument(&document);
-        return node;
+        reader.MaterializeValue();
+        return document.AllocateOwnedNode<XmlWhitespace>(std::move(reader.currentValue_));
     };
 
     const auto createOwnedCDataNode = [&document, &reader]() {
-        static_cast<void>(reader.Value());
-        auto node = std::make_shared<XmlCDataSection>(std::move(reader.currentValue_));
-        node->SetOwnerDocument(&document);
-        return node;
+        reader.MaterializeValue();
+        return document.AllocateOwnedNode<XmlCDataSection>(std::move(reader.currentValue_));
     };
 
     const auto createOwnedCommentNode = [&document, &reader]() {
-        static_cast<void>(reader.Value());
-        auto node = std::make_shared<XmlComment>(std::move(reader.currentValue_));
-        node->SetOwnerDocument(&document);
-        return node;
+        reader.MaterializeValue();
+        return document.AllocateOwnedNode<XmlComment>(std::move(reader.currentValue_));
     };
 
     const auto createOwnedElementNode = [&document, &reader]() {
-        auto node = std::make_shared<XmlElement>(std::move(reader.currentName_));
-        node->SetOwnerDocument(&document);
+        auto node = document.AllocateOwnedNode<XmlElement>(std::move(reader.currentName_));
         reader.AppendCurrentAttributesForLoad(*node);
         return node;
     };
@@ -212,7 +241,7 @@ std::shared_ptr<XmlAttribute> XmlAttributeCollection::Item(std::size_t index) co
     return index < attributes_.size() ? attributes_[index] : nullptr;
 }
 
-std::shared_ptr<XmlAttribute> XmlAttributeCollection::Item(const std::string& name) const {
+std::shared_ptr<XmlAttribute> XmlAttributeCollection::Item(std::string_view name) const {
     const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&name](const auto& attribute) {
         return attribute->Name() == name || attribute->LocalName() == name;
     });
@@ -242,7 +271,7 @@ std::shared_ptr<XmlNode> XmlNamedNodeMap::Item(std::size_t index) const {
     return index < nodes_.size() ? nodes_[index] : nullptr;
 }
 
-std::shared_ptr<XmlNode> XmlNamedNodeMap::GetNamedItem(const std::string& name) const {
+std::shared_ptr<XmlNode> XmlNamedNodeMap::GetNamedItem(std::string_view name) const {
     const auto found = std::find_if(nodes_.begin(), nodes_.end(), [&name](const auto& node) {
         return node != nullptr && node->Name() == name;
     });
@@ -262,7 +291,12 @@ std::vector<std::shared_ptr<XmlNode>>::const_iterator XmlNamedNodeMap::end() con
 }
 
 XmlNode::XmlNode(XmlNodeType nodeType, std::string name, std::string value)
-    : nodeType_(nodeType), name_(std::move(name)), value_(std::move(value)), parent_(nullptr), ownerDocument_(nullptr) {
+    : nodeType_(nodeType),
+      name_(std::move(name)),
+      value_(std::move(value)),
+      parent_(nullptr),
+      ownerDocument_(nullptr),
+      siblingIndex_(DetachedSiblingIndex) {
 }
 
 XmlNodeType XmlNode::NodeType() const noexcept {
@@ -285,7 +319,7 @@ std::string XmlNode::NamespaceURI() const {
     return ResolveNodeNamespaceUri(*this);
 }
 
-std::string XmlNode::GetNamespaceOfPrefix(const std::string& prefix) const {
+std::string XmlNode::GetNamespaceOfPrefix(std::string_view prefix) const {
     if (NodeType() == XmlNodeType::Element) {
         return LookupNamespaceUriOnElement(static_cast<const XmlElement*>(this), prefix);
     }
@@ -306,7 +340,7 @@ std::string XmlNode::GetNamespaceOfPrefix(const std::string& prefix) const {
     return {};
 }
 
-std::string XmlNode::GetPrefixOfNamespace(const std::string& namespaceUri) const {
+std::string XmlNode::GetPrefixOfNamespace(std::string_view namespaceUri) const {
     if (namespaceUri.empty()) return {};
     if (NodeType() == XmlNodeType::Element) {
         return LookupPrefixOnElement(static_cast<const XmlElement*>(this), namespaceUri);
@@ -331,7 +365,7 @@ const std::string& XmlNode::Value() const noexcept {
     return value_;
 }
 
-void XmlNode::SetValue(const std::string& value) {
+void XmlNode::SetValue(std::string_view value) {
     switch (NodeType()) {
     case XmlNodeType::Attribute:
     case XmlNodeType::Text:
@@ -341,10 +375,10 @@ void XmlNode::SetValue(const std::string& value) {
     case XmlNodeType::Whitespace:
     case XmlNodeType::SignificantWhitespace: {
         const std::string oldValue = value_;
-        if (ownerDocument_ != nullptr) {
-            ownerDocument_->FireNodeChanging(this, oldValue, value);
-        }
         value_ = value;
+        if (ownerDocument_ != nullptr) {
+            ownerDocument_->FireNodeChanging(this, oldValue, value_);
+        }
         if (ownerDocument_ != nullptr) {
             ownerDocument_->FireNodeChanged(this, oldValue, value_);
         }
@@ -372,23 +406,28 @@ const XmlDocument* XmlNode::OwnerDocument() const noexcept {
 }
 
 const std::vector<std::shared_ptr<XmlNode>>& XmlNode::ChildNodes() const noexcept {
-    return childNodes_;
+    return childNodes_ == nullptr ? EmptyXmlNodeChildren() : *childNodes_;
 }
 
 XmlNodeList XmlNode::ChildNodeList() const {
-    return XmlNodeList(childNodes_);
+    return XmlNodeList(childNodes_ == nullptr ? std::vector<std::shared_ptr<XmlNode>>{} : *childNodes_);
 }
 
 std::vector<std::shared_ptr<XmlNode>>& XmlNode::MutableChildNodes() noexcept {
-    return childNodes_;
+    if (childNodes_ == nullptr) {
+        childNodes_ = std::make_unique<std::vector<std::shared_ptr<XmlNode>>>();
+    }
+    return *childNodes_;
 }
 
 std::shared_ptr<XmlNode> XmlNode::FirstChild() const {
-    return childNodes_.empty() ? nullptr : childNodes_.front();
+    const auto& children = ChildNodes();
+    return children.empty() ? nullptr : children.front();
 }
 
 std::shared_ptr<XmlNode> XmlNode::LastChild() const {
-    return childNodes_.empty() ? nullptr : childNodes_.back();
+    const auto& children = ChildNodes();
+    return children.empty() ? nullptr : children.back();
 }
 
 std::shared_ptr<XmlNode> XmlNode::PreviousSibling() const {
@@ -397,15 +436,12 @@ std::shared_ptr<XmlNode> XmlNode::PreviousSibling() const {
     }
 
     const auto& siblings = parent_->ChildNodes();
-    const auto found = std::find_if(siblings.begin(), siblings.end(), [this](const auto& sibling) {
-        return sibling.get() == this;
-    });
-
-    if (found == siblings.begin() || found == siblings.end()) {
+    const auto siblingIndex = ResolveSiblingIndex();
+    if (siblingIndex == DetachedSiblingIndex || siblingIndex == 0 || siblingIndex > siblings.size()) {
         return nullptr;
     }
 
-    return *(found - 1);
+    return siblings[siblingIndex - 1];
 }
 
 std::shared_ptr<XmlNode> XmlNode::NextSibling() const {
@@ -414,19 +450,16 @@ std::shared_ptr<XmlNode> XmlNode::NextSibling() const {
     }
 
     const auto& siblings = parent_->ChildNodes();
-    const auto found = std::find_if(siblings.begin(), siblings.end(), [this](const auto& sibling) {
-        return sibling.get() == this;
-    });
-
-    if (found == siblings.end() || found + 1 == siblings.end()) {
+    const auto siblingIndex = ResolveSiblingIndex();
+    if (siblingIndex == DetachedSiblingIndex || siblingIndex + 1 >= siblings.size()) {
         return nullptr;
     }
 
-    return *(found + 1);
+    return siblings[siblingIndex + 1];
 }
 
 bool XmlNode::HasChildNodes() const noexcept {
-    return !childNodes_.empty();
+    return childNodes_ != nullptr && !childNodes_->empty();
 }
 
 void XmlNode::ValidateChildInsertion(const std::shared_ptr<XmlNode>& child, const XmlNode* replacingChild) const {
@@ -491,11 +524,13 @@ std::shared_ptr<XmlNode> XmlNode::AppendChild(const std::shared_ptr<XmlNode>& ch
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeInserting(child.get(), this);
     }
+    auto& children = MutableChildNodes();
     child->SetParent(this);
     if (child->OwnerDocument() != ownerDocument_) {
         child->SetOwnerDocumentRecursive(ownerDocument_);
     }
-    childNodes_.push_back(child);
+    child->SetSiblingIndex(children.size());
+    children.push_back(child);
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeInserted(child.get(), this);
     }
@@ -507,11 +542,13 @@ std::shared_ptr<XmlNode> XmlNode::AppendChildForLoad(const std::shared_ptr<XmlNo
         return child;
     }
 
+    auto& children = MutableChildNodes();
     child->SetParent(this);
     if (child->OwnerDocument() != ownerDocument_) {
         child->SetOwnerDocumentRecursive(ownerDocument_);
     }
-    childNodes_.push_back(child);
+    child->SetSiblingIndex(children.size());
+    children.push_back(child);
     return child;
 }
 
@@ -520,8 +557,10 @@ std::shared_ptr<XmlNode> XmlNode::AppendChildForOwnedLoad(const std::shared_ptr<
         return child;
     }
 
+    auto& children = MutableChildNodes();
     child->SetParent(this);
-    childNodes_.push_back(child);
+    child->SetSiblingIndex(children.size());
+    children.push_back(child);
     return child;
 }
 
@@ -536,6 +575,7 @@ std::shared_ptr<XmlNode> XmlNode::InsertBefore(
     ValidateChildInsertion(newChild);
 
     if (newChild->NodeType() == XmlNodeType::DocumentFragment) {
+        auto& children = MutableChildNodes();
         auto insertionIndex = index;
         while (newChild->FirstChild() != nullptr) {
             auto fragmentChild = newChild->RemoveChild(newChild->FirstChild());
@@ -545,21 +585,24 @@ std::shared_ptr<XmlNode> XmlNode::InsertBefore(
             }
             fragmentChild->SetParent(this);
             fragmentChild->SetOwnerDocumentRecursive(ownerDocument_);
-            MutableChildNodes().insert(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(insertionIndex), fragmentChild);
+            children.insert(children.begin() + static_cast<std::ptrdiff_t>(insertionIndex), fragmentChild);
             if (ownerDocument_ != nullptr) {
                 ownerDocument_->FireNodeInserted(fragmentChild.get(), this);
             }
             ++insertionIndex;
         }
+        ReindexChildNodesFrom(index);
         return newChild;
     }
 
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeInserting(newChild.get(), this);
     }
+    auto& children = MutableChildNodes();
     newChild->SetParent(this);
     newChild->SetOwnerDocumentRecursive(ownerDocument_);
-    MutableChildNodes().insert(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(index), newChild);
+    children.insert(children.begin() + static_cast<std::ptrdiff_t>(index), newChild);
+    ReindexChildNodesFrom(index);
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeInserted(newChild.get(), this);
     }
@@ -574,9 +617,11 @@ std::shared_ptr<XmlNode> XmlNode::InsertAfter(
         if (ownerDocument_ != nullptr) {
             ownerDocument_->FireNodeInserting(newChild.get(), this);
         }
+        auto& children = MutableChildNodes();
         newChild->SetParent(this);
         newChild->SetOwnerDocumentRecursive(ownerDocument_);
-        MutableChildNodes().insert(MutableChildNodes().begin(), newChild);
+        children.insert(children.begin(), newChild);
+        ReindexChildNodesFrom(0);
         if (ownerDocument_ != nullptr) {
             ownerDocument_->FireNodeInserted(newChild.get(), this);
         }
@@ -587,6 +632,7 @@ std::shared_ptr<XmlNode> XmlNode::InsertAfter(
     ValidateChildInsertion(newChild);
 
     if (newChild->NodeType() == XmlNodeType::DocumentFragment) {
+        auto& children = MutableChildNodes();
         auto insertionIndex = index + 1;
         while (newChild->FirstChild() != nullptr) {
             auto fragmentChild = newChild->RemoveChild(newChild->FirstChild());
@@ -596,21 +642,24 @@ std::shared_ptr<XmlNode> XmlNode::InsertAfter(
             }
             fragmentChild->SetParent(this);
             fragmentChild->SetOwnerDocumentRecursive(ownerDocument_);
-            MutableChildNodes().insert(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(insertionIndex), fragmentChild);
+            children.insert(children.begin() + static_cast<std::ptrdiff_t>(insertionIndex), fragmentChild);
             if (ownerDocument_ != nullptr) {
                 ownerDocument_->FireNodeInserted(fragmentChild.get(), this);
             }
             ++insertionIndex;
         }
+        ReindexChildNodesFrom(index + 1);
         return newChild;
     }
 
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeInserting(newChild.get(), this);
     }
+    auto& children = MutableChildNodes();
     newChild->SetParent(this);
     newChild->SetOwnerDocumentRecursive(ownerDocument_);
-    MutableChildNodes().insert(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(index + 1), newChild);
+    children.insert(children.begin() + static_cast<std::ptrdiff_t>(index + 1), newChild);
+    ReindexChildNodesFrom(index + 1);
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeInserted(newChild.get(), this);
     }
@@ -628,11 +677,12 @@ std::shared_ptr<XmlNode> XmlNode::ReplaceChild(
     ValidateChildInsertion(newChild, oldChild.get());
 
     if (newChild->NodeType() == XmlNodeType::DocumentFragment) {
+        auto& children = MutableChildNodes();
         if (ownerDocument_ != nullptr) {
             ownerDocument_->FireNodeRemoving(oldChild.get(), this);
         }
         oldChild->SetParent(nullptr);
-        MutableChildNodes().erase(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(index));
+        children.erase(children.begin() + static_cast<std::ptrdiff_t>(index));
         if (ownerDocument_ != nullptr) {
             ownerDocument_->FireNodeRemoved(oldChild.get(), this);
         }
@@ -646,12 +696,13 @@ std::shared_ptr<XmlNode> XmlNode::ReplaceChild(
             }
             fragmentChild->SetParent(this);
             fragmentChild->SetOwnerDocumentRecursive(ownerDocument_);
-            MutableChildNodes().insert(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(insertionIndex), fragmentChild);
+            children.insert(children.begin() + static_cast<std::ptrdiff_t>(insertionIndex), fragmentChild);
             if (ownerDocument_ != nullptr) {
                 ownerDocument_->FireNodeInserted(fragmentChild.get(), this);
             }
             ++insertionIndex;
         }
+        ReindexChildNodesFrom(index);
         return oldChild;
     }
 
@@ -663,6 +714,7 @@ std::shared_ptr<XmlNode> XmlNode::ReplaceChild(
     newChild->SetParent(this);
     newChild->SetOwnerDocumentRecursive(ownerDocument_);
     MutableChildNodes()[index] = newChild;
+    newChild->SetSiblingIndex(index);
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeRemoved(oldChild.get(), this);
         ownerDocument_->FireNodeInserted(newChild.get(), this);
@@ -672,12 +724,14 @@ std::shared_ptr<XmlNode> XmlNode::ReplaceChild(
 
 std::shared_ptr<XmlNode> XmlNode::RemoveChild(const std::shared_ptr<XmlNode>& child) {
     const auto index = FindChildIndexOrThrow(*this, child);
-    auto removed = MutableChildNodes()[index];
+    auto& children = MutableChildNodes();
+    auto removed = children[index];
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeRemoving(removed.get(), this);
     }
     removed->SetParent(nullptr);
-    MutableChildNodes().erase(MutableChildNodes().begin() + static_cast<std::ptrdiff_t>(index));
+    children.erase(children.begin() + static_cast<std::ptrdiff_t>(index));
+    ReindexChildNodesFrom(index);
     if (ownerDocument_ != nullptr) {
         ownerDocument_->FireNodeRemoved(removed.get(), this);
     }
@@ -685,10 +739,15 @@ std::shared_ptr<XmlNode> XmlNode::RemoveChild(const std::shared_ptr<XmlNode>& ch
 }
 
 void XmlNode::RemoveAllChildren() {
-    for (const auto& child : MutableChildNodes()) {
+    if (childNodes_ == nullptr) {
+        return;
+    }
+
+    for (const auto& child : *childNodes_) {
         child->SetParent(nullptr);
     }
-    MutableChildNodes().clear();
+    childNodes_->clear();
+    childNodes_.reset();
 }
 
 void XmlNode::RemoveAll() {
@@ -698,41 +757,24 @@ void XmlNode::RemoveAll() {
     RemoveAllChildren();
 }
 
-std::shared_ptr<XmlNode> XmlNode::SelectSingleNode(const std::string& xpath) const {
+std::shared_ptr<XmlNode> XmlNode::SelectSingleNode(std::string_view xpath) const {
     const auto nodes = SelectNodes(xpath);
     return nodes.Item(0);
 }
 
-std::shared_ptr<XmlNode> XmlNode::SelectSingleNode(const std::string& xpath, const XmlNamespaceManager& namespaces) const {
+std::shared_ptr<XmlNode> XmlNode::SelectSingleNode(std::string_view xpath, const XmlNamespaceManager& namespaces) const {
     const auto nodes = SelectNodes(xpath, namespaces);
     return nodes.Item(0);
 }
 
-XmlNodeList XmlNode::SelectNodes(const std::string& xpath) const {
-    if (NodeType() == XmlNodeType::Document) {
-        return EvaluateXPathFromDocument(static_cast<const XmlDocument&>(*this), xpath);
-    }
-    if (NodeType() == XmlNodeType::Element) {
-        return EvaluateXPathFromElement(static_cast<const XmlElement&>(*this), xpath);
-    }
-    // For other node types, evaluate from the parent element or document context
-    if (ParentNode() != nullptr) {
-        return ParentNode()->SelectNodes(xpath);
-    }
-    return XmlNodeList{};
+XmlNodeList XmlNode::SelectNodes(std::string_view xpath) const {
+    const std::string xpathStr(xpath);
+    return EvaluateXPathFromNode(*this, xpathStr, nullptr);
 }
 
-XmlNodeList XmlNode::SelectNodes(const std::string& xpath, const XmlNamespaceManager& namespaces) const {
-    if (NodeType() == XmlNodeType::Document) {
-        return EvaluateXPathFromDocument(static_cast<const XmlDocument&>(*this), xpath, &namespaces);
-    }
-    if (NodeType() == XmlNodeType::Element) {
-        return EvaluateXPathFromElement(static_cast<const XmlElement&>(*this), xpath, &namespaces);
-    }
-    if (ParentNode() != nullptr) {
-        return ParentNode()->SelectNodes(xpath, namespaces);
-    }
-    return XmlNodeList{};
+XmlNodeList XmlNode::SelectNodes(std::string_view xpath, const XmlNamespaceManager& namespaces) const {
+    const std::string xpathStr(xpath);
+    return EvaluateXPathFromNode(*this, xpathStr, &namespaces);
 }
 
 std::string XmlNode::InnerText() const {
@@ -748,7 +790,7 @@ std::string XmlNode::InnerText() const {
     }
 
     std::string text;
-    for (const auto& child : childNodes_) {
+    for (const auto& child : ChildNodes()) {
         if (child->NodeType() == XmlNodeType::Comment
             || child->NodeType() == XmlNodeType::ProcessingInstruction
             || child->NodeType() == XmlNodeType::XmlDeclaration
@@ -760,7 +802,7 @@ std::string XmlNode::InnerText() const {
     return text;
 }
 
-void XmlNode::SetInnerText(const std::string& text) {
+void XmlNode::SetInnerText(std::string_view text) {
     switch (NodeType()) {
     case XmlNodeType::Document:
     case XmlNodeType::DocumentType:
@@ -780,20 +822,20 @@ void XmlNode::SetInnerText(const std::string& text) {
     RemoveAllChildren();
     if (!text.empty()) {
         auto ownerDoc = OwnerDocument();
-        auto textNode = ownerDoc ? ownerDoc->CreateTextNode(text) : std::make_shared<XmlText>(text);
+        auto textNode = ownerDoc ? ownerDoc->CreateTextNode(std::string(text)) : std::make_shared<XmlText>(std::string(text));
         AppendChild(textNode);
     }
 }
 
 std::string XmlNode::InnerXml(const XmlWriterSettings& settings) const {
     std::string xml;
-    for (const auto& child : childNodes_) {
+    for (const auto& child : ChildNodes()) {
         xml += XmlWriter::WriteToString(*child, settings);
     }
     return xml;
 }
 
-void XmlNode::SetInnerXml(const std::string& xml) {
+void XmlNode::SetInnerXml(std::string_view xml) {
     (void)xml;
     throw XmlException("Setting InnerXml is not supported for " + Name());
 }
@@ -804,6 +846,7 @@ std::string XmlNode::OuterXml(const XmlWriterSettings& settings) const {
 
 std::shared_ptr<XmlNode> XmlNode::CloneNode(bool deep) const {
     std::shared_ptr<XmlNode> clone;
+    XmlDocument* ownerDocument = ownerDocument_;
 
     switch (NodeType()) {
     case XmlNodeType::Document: {
@@ -819,7 +862,9 @@ std::shared_ptr<XmlNode> XmlNode::CloneNode(bool deep) const {
         return documentClone;
     }
     case XmlNodeType::Element: {
-        auto elementClone = std::make_shared<XmlElement>(Name());
+        auto elementClone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlElement>(Name())
+            : std::make_shared<XmlElement>(Name());
         const auto* sourceElement = static_cast<const XmlElement*>(this);
         elementClone->writeFullEndElement_ = sourceElement->writeFullEndElement_;
         for (const auto& attribute : sourceElement->Attributes()) {
@@ -829,13 +874,19 @@ std::shared_ptr<XmlNode> XmlNode::CloneNode(bool deep) const {
         break;
     }
     case XmlNodeType::Attribute:
-        clone = std::make_shared<XmlAttribute>(Name(), Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlAttribute>(Name(), Value())
+            : std::make_shared<XmlAttribute>(Name(), Value());
         break;
     case XmlNodeType::Text:
-        clone = std::make_shared<XmlText>(Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlText>(Value())
+            : std::make_shared<XmlText>(Value());
         break;
     case XmlNodeType::EntityReference:
-        clone = std::make_shared<XmlEntityReference>(Name(), Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlEntityReference>(Name(), Value())
+            : std::make_shared<XmlEntityReference>(Name(), Value());
         break;
     case XmlNodeType::Entity: {
         const auto* entity = static_cast<const XmlEntity*>(this);
@@ -853,38 +904,58 @@ std::shared_ptr<XmlNode> XmlNode::CloneNode(bool deep) const {
         break;
     }
     case XmlNodeType::Whitespace:
-        clone = std::make_shared<XmlWhitespace>(Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlWhitespace>(Value())
+            : std::make_shared<XmlWhitespace>(Value());
         break;
     case XmlNodeType::SignificantWhitespace:
-        clone = std::make_shared<XmlSignificantWhitespace>(Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlSignificantWhitespace>(Value())
+            : std::make_shared<XmlSignificantWhitespace>(Value());
         break;
     case XmlNodeType::CDATA:
-        clone = std::make_shared<XmlCDataSection>(Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlCDataSection>(Value())
+            : std::make_shared<XmlCDataSection>(Value());
         break;
     case XmlNodeType::Comment:
-        clone = std::make_shared<XmlComment>(Value());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlComment>(Value())
+            : std::make_shared<XmlComment>(Value());
         break;
     case XmlNodeType::ProcessingInstruction: {
         const auto* instruction = static_cast<const XmlProcessingInstruction*>(this);
-        clone = std::make_shared<XmlProcessingInstruction>(instruction->Target(), instruction->Data());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlProcessingInstruction>(instruction->Target(), instruction->Data())
+            : std::make_shared<XmlProcessingInstruction>(instruction->Target(), instruction->Data());
         break;
     }
     case XmlNodeType::XmlDeclaration: {
         const auto* declaration = static_cast<const XmlDeclaration*>(this);
-        clone = std::make_shared<XmlDeclaration>(declaration->Version(), declaration->Encoding(), declaration->Standalone());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlDeclaration>(declaration->Version(), declaration->Encoding(), declaration->Standalone())
+            : std::make_shared<XmlDeclaration>(declaration->Version(), declaration->Encoding(), declaration->Standalone());
         break;
     }
     case XmlNodeType::DocumentType: {
         const auto* documentType = static_cast<const XmlDocumentType*>(this);
-        clone = std::make_shared<XmlDocumentType>(
-            documentType->Name(),
-            documentType->PublicId(),
-            documentType->SystemId(),
-            documentType->InternalSubset());
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlDocumentType>(
+                documentType->Name(),
+                documentType->PublicId(),
+                documentType->SystemId(),
+                documentType->InternalSubset())
+            : std::make_shared<XmlDocumentType>(
+                documentType->Name(),
+                documentType->PublicId(),
+                documentType->SystemId(),
+                documentType->InternalSubset());
         break;
     }
     case XmlNodeType::DocumentFragment:
-        clone = std::make_shared<XmlDocumentFragment>();
+        clone = ownerDocument != nullptr
+            ? ownerDocument->AllocateNode<XmlDocumentFragment>()
+            : std::make_shared<XmlDocumentFragment>();
         break;
     default:
         throw XmlException("CloneNode does not support the specified node type");
@@ -929,13 +1000,56 @@ void XmlNode::SetOwnerDocumentRecursive(XmlDocument* ownerDocument) {
         }
     }
 
-    for (const auto& child : childNodes_) {
+    for (const auto& child : ChildNodes()) {
         child->SetOwnerDocumentRecursive(ownerDocument);
     }
 }
 
 void XmlNode::SetParent(XmlNode* parent) noexcept {
     parent_ = parent;
+    if (parent == nullptr) {
+        siblingIndex_ = DetachedSiblingIndex;
+    }
+}
+
+void XmlNode::SetSiblingIndex(std::size_t siblingIndex) noexcept {
+    siblingIndex_ = siblingIndex;
+}
+
+std::size_t XmlNode::ResolveSiblingIndex() const noexcept {
+    if (parent_ == nullptr || siblingIndex_ == DetachedSiblingIndex) {
+        return DetachedSiblingIndex;
+    }
+
+    const auto& siblings = parent_->ChildNodes();
+    if (siblingIndex_ < siblings.size() && siblings[siblingIndex_].get() == this) {
+        return siblingIndex_;
+    }
+
+    const auto found = std::find_if(siblings.begin(), siblings.end(), [this](const auto& sibling) {
+        return sibling.get() == this;
+    });
+    if (found == siblings.end()) {
+        return DetachedSiblingIndex;
+    }
+
+    const auto resolvedIndex = static_cast<std::size_t>(std::distance(siblings.begin(), found));
+    const_cast<XmlNode*>(this)->siblingIndex_ = resolvedIndex;
+    return resolvedIndex;
+}
+
+void XmlNode::ReindexChildNodesFrom(std::size_t startIndex) noexcept {
+    if (childNodes_ == nullptr || startIndex >= childNodes_->size()) {
+        return;
+    }
+
+    for (std::size_t index = startIndex; index < childNodes_->size(); ++index) {
+        auto& child = (*childNodes_)[index];
+        if (child != nullptr) {
+            child->parent_ = this;
+            child->siblingIndex_ = index;
+        }
+    }
 }
 
 XmlAttribute::XmlAttribute(std::string name, std::string value)
@@ -956,7 +1070,11 @@ const XmlElement* XmlAttribute::OwnerElement() const noexcept {
 
 // XmlNode::Normalize — merge adjacent Text nodes recursively
 void XmlNode::Normalize() {
-    auto& children = MutableChildNodes();
+    if (childNodes_ == nullptr) {
+        return;
+    }
+
+    auto& children = *childNodes_;
     std::size_t i = 0;
     while (i < children.size()) {
         if (children[i]->NodeType() == XmlNodeType::Text) {
@@ -994,7 +1112,7 @@ const std::string& XmlCharacterData::Data() const noexcept {
     return Value();
 }
 
-void XmlCharacterData::SetData(const std::string& data) {
+void XmlCharacterData::SetData(std::string_view data) {
     SetValue(data);
 }
 
@@ -1002,8 +1120,8 @@ std::size_t XmlCharacterData::Length() const noexcept {
     return Value().size();
 }
 
-void XmlCharacterData::AppendData(const std::string& strData) {
-    SetValue(Value() + strData);
+void XmlCharacterData::AppendData(std::string_view strData) {
+    SetValue(std::string(Value()) + std::string(strData));
 }
 
 void XmlCharacterData::DeleteData(std::size_t offset, std::size_t count) {
@@ -1018,20 +1136,20 @@ void XmlCharacterData::DeleteData(std::size_t offset, std::size_t count) {
     SetValue(result);
 }
 
-void XmlCharacterData::InsertData(std::size_t offset, const std::string& strData) {
+void XmlCharacterData::InsertData(std::size_t offset, std::string_view strData) {
     const std::string& v = Value();
     if (offset > v.size()) {
         throw XmlException("InsertData offset out of range");
     }
-    SetValue(v.substr(0, offset) + strData + v.substr(offset));
+    SetValue(v.substr(0, offset) + std::string(strData) + v.substr(offset));
 }
 
-void XmlCharacterData::ReplaceData(std::size_t offset, std::size_t count, const std::string& strData) {
+void XmlCharacterData::ReplaceData(std::size_t offset, std::size_t count, std::string_view strData) {
     const std::string& v = Value();
     if (offset > v.size()) {
         throw XmlException("ReplaceData offset out of range");
     }
-    std::string result = v.substr(0, offset) + strData;
+    std::string result = v.substr(0, offset) + std::string(strData);
     if (offset + count < v.size()) {
         result += v.substr(offset + count);
     }
@@ -1057,8 +1175,10 @@ std::shared_ptr<XmlText> XmlText::SplitText(std::size_t offset) {
     std::string tail = current.substr(offset);
     SetValue(current.substr(0, offset));
 
-    auto newNode = std::make_shared<XmlText>(std::move(tail));
-    newNode->SetOwnerDocumentRecursive(OwnerDocument());
+    auto* ownerDocument = OwnerDocument();
+    auto newNode = ownerDocument != nullptr
+        ? ownerDocument->CreateTextNode(tail)
+        : std::make_shared<XmlText>(std::move(tail));
     if (ParentNode() != nullptr) {
         auto next = NextSibling();
         if (next != nullptr) {
@@ -1117,7 +1237,7 @@ XmlWhitespace::XmlWhitespace(std::string whitespace)
     ValidateWhitespaceValue(Value(), "Whitespace");
 }
 
-void XmlWhitespace::SetValue(const std::string& value) {
+void XmlWhitespace::SetValue(std::string_view value) {
     ValidateWhitespaceValue(value, "Whitespace");
     XmlNode::SetValue(value);
 }
@@ -1127,7 +1247,7 @@ XmlSignificantWhitespace::XmlSignificantWhitespace(std::string whitespace)
     ValidateWhitespaceValue(Value(), "SignificantWhitespace");
 }
 
-void XmlSignificantWhitespace::SetValue(const std::string& value) {
+void XmlSignificantWhitespace::SetValue(std::string_view value) {
     ValidateWhitespaceValue(value, "SignificantWhitespace");
     XmlNode::SetValue(value);
 }
@@ -1150,7 +1270,7 @@ const std::string& XmlProcessingInstruction::Data() const noexcept {
     return Value();
 }
 
-void XmlProcessingInstruction::SetData(const std::string& data) {
+void XmlProcessingInstruction::SetData(std::string_view data) {
     SetValue(data);
 }
 
@@ -1208,7 +1328,7 @@ XmlNamedNodeMap XmlDocumentType::Notations() const {
 XmlDocumentFragment::XmlDocumentFragment() : XmlNode(XmlNodeType::DocumentFragment, "#document-fragment") {
 }
 
-void XmlDocumentFragment::SetInnerXml(const std::string& xml) {
+void XmlDocumentFragment::SetInnerXml(std::string_view xml) {
     auto* ownerDocument = OwnerDocument();
     if (ownerDocument == nullptr) {
         throw XmlException("Document fragment must belong to an owner document before parsing XML");
@@ -1216,7 +1336,7 @@ void XmlDocumentFragment::SetInnerXml(const std::string& xml) {
 
     XmlDocument scratch;
     scratch.SetPreserveWhitespace(ownerDocument->PreserveWhitespace());
-    scratch.LoadXml("<__fragment_root__>" + xml + "</__fragment_root__>");
+    scratch.LoadXml("<__fragment_root__>" + std::string(xml) + "</__fragment_root__>");
 
     RemoveAllChildren();
 
@@ -1236,6 +1356,53 @@ std::string_view XmlElement::PendingLoadAttributeNameView(const PendingLoadAttri
 
 std::string_view XmlElement::PendingLoadAttributeValueView(const PendingLoadAttribute& attribute) const noexcept {
     return std::string_view(pendingLoadAttributeStorage_).substr(attribute.valueOffset, attribute.valueLength);
+}
+
+void XmlElement::MarkAttributeNameIndexesDirty() const noexcept {
+    attributeNameIndexesDirty_ = true;
+}
+
+void XmlElement::EnsureAttributeNameIndexes() const {
+    if (!attributeNameIndexesDirty_) {
+        return;
+    }
+
+    if (!attributeNameIndex_) {
+        attributeNameIndex_ = std::make_unique<AttributeNameIndex>();
+    } else {
+        attributeNameIndex_->clear();
+    }
+    attributeNameIndex_->reserve(attributes_.size());
+    for (std::size_t index = 0; index < attributes_.size(); ++index) {
+        const auto& attribute = attributes_[index];
+        if (attribute != nullptr) {
+            attributeNameIndex_->insert_or_assign(attribute->Name(), index);
+        }
+    }
+
+    if (!pendingLoadAttributeNameIndex_) {
+        pendingLoadAttributeNameIndex_ = std::make_unique<PendingAttributeNameIndex>();
+    } else {
+        pendingLoadAttributeNameIndex_->clear();
+    }
+    pendingLoadAttributeNameIndex_->reserve(pendingLoadAttributes_.size());
+    for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
+        pendingLoadAttributeNameIndex_->insert_or_assign(PendingLoadAttributeNameView(pendingLoadAttributes_[index]), index);
+    }
+
+    attributeNameIndexesDirty_ = false;
+}
+
+std::size_t XmlElement::FindIndexedAttributeIndex(std::string_view name) const noexcept {
+    EnsureAttributeNameIndexes();
+    const auto found = attributeNameIndex_->find(name);
+    return found == attributeNameIndex_->end() ? std::string::npos : found->second;
+}
+
+std::size_t XmlElement::FindIndexedPendingLoadAttributeIndex(std::string_view name) const noexcept {
+    EnsureAttributeNameIndexes();
+    const auto found = pendingLoadAttributeNameIndex_->find(name);
+    return found == pendingLoadAttributeNameIndex_->end() ? std::string::npos : found->second;
 }
 
 bool XmlElement::TryFindNamespaceDeclarationValueView(std::string_view prefix, std::string_view& value) const noexcept {
@@ -1264,19 +1431,42 @@ bool XmlElement::TryFindNamespaceDeclarationValueView(std::string_view prefix, s
     return false;
 }
 
-bool TryGetAttributeValueViewInternal(const XmlElement& element, std::string_view name, std::string_view& value) noexcept {
-    for (const auto& attribute : element.attributes_) {
-        if (attribute->Name() == name) {
-            value = attribute->Value();
+bool XmlElement::TryFindNamespaceDeclarationPrefixView(std::string_view namespaceUri, std::string_view& prefix) const noexcept {
+    for (const auto& attribute : attributes_) {
+        const std::string_view attributeName(attribute->Name());
+        if (!IsNamespaceDeclarationName(attributeName)) {
+            continue;
+        }
+        if (attribute->Value() == namespaceUri) {
+            prefix = NamespaceDeclarationPrefixView(attributeName);
             return true;
         }
     }
 
-    for (const auto& pendingAttribute : element.pendingLoadAttributes_) {
-        if (element.PendingLoadAttributeNameView(pendingAttribute) == name) {
-            value = element.PendingLoadAttributeValueView(pendingAttribute);
+    for (const auto& pendingAttribute : pendingLoadAttributes_) {
+        const std::string_view pendingName = PendingLoadAttributeNameView(pendingAttribute);
+        if (!IsNamespaceDeclarationName(pendingName)) {
+            continue;
+        }
+        if (PendingLoadAttributeValueView(pendingAttribute) == namespaceUri) {
+            prefix = NamespaceDeclarationPrefixView(pendingName);
             return true;
         }
+    }
+
+    prefix = {};
+    return false;
+}
+
+bool TryGetAttributeValueViewInternal(const XmlElement& element, std::string_view name, std::string_view& value) noexcept {
+    if (const auto attributeIndex = element.FindIndexedAttributeIndex(name); attributeIndex != std::string::npos) {
+        value = element.attributes_[attributeIndex]->Value();
+        return true;
+    }
+
+    if (const auto pendingIndex = element.FindIndexedPendingLoadAttributeIndex(name); pendingIndex != std::string::npos) {
+        value = element.PendingLoadAttributeValueView(element.pendingLoadAttributes_[pendingIndex]);
+        return true;
     }
 
     value = {};
@@ -1293,27 +1483,16 @@ std::shared_ptr<XmlAttribute> XmlElement::MaterializePendingLoadAttribute(std::s
         return nullptr;
     }
 
-    const auto pendingAttribute = pendingLoadAttributes_[index];
-    auto attribute = std::make_shared<XmlAttribute>(
-        std::string(PendingLoadAttributeNameView(pendingAttribute)),
-        std::string(PendingLoadAttributeValueView(pendingAttribute)));
-    attribute->SetParent(const_cast<XmlElement*>(this));
-    attribute->SetOwnerDocument(const_cast<XmlDocument*>(OwnerDocument()));
-    attributes_.push_back(attribute);
-    pendingLoadAttributes_.erase(pendingLoadAttributes_.begin() + static_cast<std::ptrdiff_t>(index));
-    return attribute;
+    const std::size_t materializedIndex = attributes_.size() + index;
+    EnsureAttributesMaterialized();
+    return materializedIndex < attributes_.size() ? attributes_[materializedIndex] : nullptr;
 }
 
-std::size_t XmlElement::FindPendingLoadAttributeIndex(const std::string& name) const noexcept {
-    for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
-        if (PendingLoadAttributeNameView(pendingLoadAttributes_[index]) == name) {
-            return index;
-        }
-    }
-    return std::string::npos;
+std::size_t XmlElement::FindPendingLoadAttributeIndex(std::string_view name) const noexcept {
+    return FindIndexedPendingLoadAttributeIndex(name);
 }
 
-std::size_t XmlElement::FindPendingLoadAttributeIndex(const std::string& localName, const std::string& namespaceUri) const {
+std::size_t XmlElement::FindPendingLoadAttributeIndex(std::string_view localName, std::string_view namespaceUri) const {
     for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
         const auto& pendingAttribute = pendingLoadAttributes_[index];
         const auto [prefix, pendingLocalName] = SplitQualifiedNameView(PendingLoadAttributeNameView(pendingAttribute));
@@ -1326,45 +1505,26 @@ std::size_t XmlElement::FindPendingLoadAttributeIndex(const std::string& localNa
             }
             continue;
         }
-        if (LookupNamespaceUriOnElement(this, prefix) == namespaceUri) {
+        if (PrefixResolvesToNamespaceUri(this, prefix, namespaceUri)) {
             return index;
         }
     }
     return std::string::npos;
 }
 
-std::string XmlElement::FindNamespaceDeclarationValue(const std::string& prefix) const {
+std::string XmlElement::FindNamespaceDeclarationValue(std::string_view prefix) const {
     std::string_view value;
     return TryFindNamespaceDeclarationValueView(prefix, value) ? std::string(value) : std::string{};
 }
 
-bool XmlElement::HasNamespaceDeclaration(const std::string& prefix) const {
+bool XmlElement::HasNamespaceDeclaration(std::string_view prefix) const {
     std::string_view value;
     return TryFindNamespaceDeclarationValueView(prefix, value);
 }
 
-std::string XmlElement::FindNamespaceDeclarationPrefix(const std::string& namespaceUri) const {
-    for (const auto& attribute : attributes_) {
-        const std::string_view attributeName(attribute->Name());
-        if (!IsNamespaceDeclarationName(attributeName)) {
-            continue;
-        }
-        if (attribute->Value() == namespaceUri) {
-            return std::string(NamespaceDeclarationPrefixView(attributeName));
-        }
-    }
-
-    for (const auto& pendingAttribute : pendingLoadAttributes_) {
-        const std::string_view pendingName = PendingLoadAttributeNameView(pendingAttribute);
-        if (!IsNamespaceDeclarationName(pendingName)) {
-            continue;
-        }
-        if (PendingLoadAttributeValueView(pendingAttribute) == namespaceUri) {
-            return std::string(NamespaceDeclarationPrefixView(pendingName));
-        }
-    }
-
-    return {};
+std::string XmlElement::FindNamespaceDeclarationPrefix(std::string_view namespaceUri) const {
+    std::string_view prefix;
+    return TryFindNamespaceDeclarationPrefixView(namespaceUri, prefix) ? std::string(prefix) : std::string{};
 }
 
 void XmlElement::EnsureAttributesMaterialized() const {
@@ -1373,9 +1533,24 @@ void XmlElement::EnsureAttributesMaterialized() const {
     }
 
     attributes_.reserve(attributes_.size() + pendingLoadAttributes_.size());
-    while (!pendingLoadAttributes_.empty()) {
-        MaterializePendingLoadAttribute(pendingLoadAttributes_.size() - 1);
+    auto* ownerDocument = OwnerDocument();
+    for (const auto& pendingAttribute : pendingLoadAttributes_) {
+        auto attribute = ownerDocument != nullptr
+            ? ownerDocument->CreateAttribute(
+                std::string(PendingLoadAttributeNameView(pendingAttribute)),
+                std::string(PendingLoadAttributeValueView(pendingAttribute)))
+            : std::make_shared<XmlAttribute>(
+                std::string(PendingLoadAttributeNameView(pendingAttribute)),
+                std::string(PendingLoadAttributeValueView(pendingAttribute)));
+        attribute->SetParent(const_cast<XmlElement*>(this));
+        attribute->SetOwnerDocument(const_cast<XmlDocument*>(ownerDocument));
+        attributes_.push_back(std::move(attribute));
     }
+
+    pendingLoadAttributes_.clear();
+    pendingLoadAttributeStorage_.clear();
+    pendingLoadAttributeNameIndex_.reset();
+    MarkAttributeNameIndexesDirty();
 }
 
 const std::vector<std::shared_ptr<XmlAttribute>>& XmlElement::Attributes() const {
@@ -1392,12 +1567,12 @@ bool XmlElement::HasAttributes() const noexcept {
     return !attributes_.empty() || !pendingLoadAttributes_.empty();
 }
 
-bool XmlElement::HasAttribute(const std::string& name) const {
+bool XmlElement::HasAttribute(std::string_view name) const {
     std::string_view value;
     return TryGetAttributeValueViewInternal(*this, name, value);
 }
 
-bool XmlElement::HasAttribute(const std::string& localName, const std::string& namespaceUri) const {
+bool XmlElement::HasAttribute(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
         const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
         if (attributeLocalName != localName) {
@@ -1406,17 +1581,17 @@ bool XmlElement::HasAttribute(const std::string& localName, const std::string& n
         if (prefix.empty()) {
             return namespaceUri.empty();
         }
-        return LookupNamespaceUriOnElement(this, prefix) == namespaceUri;
+        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
     });
     return found != attributes_.end() || FindPendingLoadAttributeIndex(localName, namespaceUri) != std::string::npos;
 }
 
-std::string XmlElement::GetAttribute(const std::string& name) const {
+std::string XmlElement::GetAttribute(std::string_view name) const {
     std::string_view value;
     return TryGetAttributeValueViewInternal(*this, name, value) ? std::string(value) : std::string{};
 }
 
-std::string XmlElement::GetAttribute(const std::string& localName, const std::string& namespaceUri) const {
+std::string XmlElement::GetAttribute(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
         const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
         if (attributeLocalName != localName) {
@@ -1425,7 +1600,7 @@ std::string XmlElement::GetAttribute(const std::string& localName, const std::st
         if (prefix.empty()) {
             return namespaceUri.empty();
         }
-        return LookupNamespaceUriOnElement(this, prefix) == namespaceUri;
+        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
     });
     if (found != attributes_.end()) {
         return (*found)->Value();
@@ -1437,16 +1612,12 @@ std::string XmlElement::GetAttribute(const std::string& localName, const std::st
         : std::string(PendingLoadAttributeValueView(pendingLoadAttributes_[pendingIndex]));
 }
 
-std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(const std::string& name) const {
-    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&name](const auto& attribute) {
-        return attribute->Name() == name;
-    });
-
-    if (found != attributes_.end()) {
-        return *found;
+std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(std::string_view name) const {
+    if (const auto index = FindIndexedAttributeIndex(name); index != std::string::npos) {
+        return attributes_[index];
     }
 
-    const auto pendingIndex = FindPendingLoadAttributeIndex(name);
+    const auto pendingIndex = FindIndexedPendingLoadAttributeIndex(name);
     if (pendingIndex != std::string::npos) {
         return MaterializePendingLoadAttribute(pendingIndex);
     }
@@ -1454,7 +1625,7 @@ std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(const std::string& na
     return nullptr;
 }
 
-std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(const std::string& localName, const std::string& namespaceUri) const {
+std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
         const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
         if (attributeLocalName != localName) {
@@ -1463,7 +1634,7 @@ std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(const std::string& lo
         if (prefix.empty()) {
             return namespaceUri.empty();
         }
-        return LookupNamespaceUriOnElement(this, prefix) == namespaceUri;
+        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
     });
 
     if (found != attributes_.end()) {
@@ -1478,16 +1649,20 @@ std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(const std::string& lo
     return nullptr;
 }
 
-std::shared_ptr<XmlAttribute> XmlElement::SetAttribute(const std::string& name, const std::string& value) {
+std::shared_ptr<XmlAttribute> XmlElement::SetAttribute(std::string_view name, std::string_view value) {
     if (auto attribute = GetAttributeNode(name)) {
         attribute->SetValue(value);
         return attribute;
     }
 
-    auto attribute = std::make_shared<XmlAttribute>(name, value);
+    auto* ownerDocument = OwnerDocument();
+    auto attribute = ownerDocument != nullptr
+        ? ownerDocument->CreateAttribute(std::string(name), std::string(value))
+        : std::make_shared<XmlAttribute>(std::string(name), std::string(value));
     attribute->SetParent(this);
     attribute->SetOwnerDocumentRecursive(OwnerDocument());
     attributes_.push_back(attribute);
+    MarkAttributeNameIndexesDirty();
     return attribute;
 }
 
@@ -1508,9 +1683,10 @@ void XmlElement::AppendAttributeForLoad(std::string name, std::string value) {
         name.size(),
         valueOffset,
         value.size()});
+    MarkAttributeNameIndexesDirty();
 }
 
-void XmlElement::SetAttribute(const std::string& localName, const std::string& namespaceUri, const std::string& value) {
+void XmlElement::SetAttribute(std::string_view localName, std::string_view namespaceUri, std::string_view value) {
     // Find existing attribute with matching localName+ns, or create prefix:localName
     if (auto existing = GetAttributeNode(localName, namespaceUri)) {
         existing->SetValue(value);
@@ -1537,7 +1713,7 @@ void XmlElement::SetAttribute(const std::string& localName, const std::string& n
         } while (HasNamespaceDeclaration(existingPrefix));
         SetAttribute("xmlns:" + existingPrefix, namespaceUri);
     }
-    SetAttribute(existingPrefix + ":" + localName, value);
+    SetAttribute(existingPrefix + ":" + std::string(localName), value);
 }
 
 std::shared_ptr<XmlAttribute> XmlElement::SetAttributeNode(const std::shared_ptr<XmlAttribute>& attribute) {
@@ -1573,15 +1749,16 @@ std::shared_ptr<XmlAttribute> XmlElement::SetAttributeNode(const std::shared_ptr
 
     attribute->SetParent(this);
     attribute->SetOwnerDocumentRecursive(OwnerDocument());
+    MarkAttributeNameIndexesDirty();
     return replaced;
 }
 
-void XmlElement::SetInnerXml(const std::string& xml) {
+void XmlElement::SetInnerXml(std::string_view xml) {
     XmlDocument scratch;
     if (OwnerDocument() != nullptr) {
         scratch.SetPreserveWhitespace(OwnerDocument()->PreserveWhitespace());
     }
-    scratch.LoadXml("<__element_inner_xml__>" + xml + "</__element_inner_xml__>");
+    scratch.LoadXml("<__element_inner_xml__>" + std::string(xml) + "</__element_inner_xml__>");
 
     RemoveAllChildren();
 
@@ -1596,27 +1773,28 @@ void XmlElement::SetInnerXml(const std::string& xml) {
     }
 }
 
-bool XmlElement::RemoveAttribute(const std::string& name) {
+bool XmlElement::RemoveAttribute(std::string_view name) {
     if (const auto pendingIndex = FindPendingLoadAttributeIndex(name); pendingIndex != std::string::npos) {
         pendingLoadAttributes_.erase(pendingLoadAttributes_.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
+        MarkAttributeNameIndexesDirty();
         return true;
     }
 
-    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&name](const auto& attribute) {
-        return attribute->Name() == name;
-    });
-    if (found == attributes_.end()) {
+    const auto index = FindIndexedAttributeIndex(name);
+    if (index == std::string::npos) {
         return false;
     }
 
-    (*found)->SetParent(nullptr);
-    attributes_.erase(found);
+    attributes_[index]->SetParent(nullptr);
+    attributes_.erase(attributes_.begin() + static_cast<std::ptrdiff_t>(index));
+    MarkAttributeNameIndexesDirty();
     return true;
 }
 
-bool XmlElement::RemoveAttribute(const std::string& localName, const std::string& namespaceUri) {
+bool XmlElement::RemoveAttribute(std::string_view localName, std::string_view namespaceUri) {
     if (const auto pendingIndex = FindPendingLoadAttributeIndex(localName, namespaceUri); pendingIndex != std::string::npos) {
         pendingLoadAttributes_.erase(pendingLoadAttributes_.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
+        MarkAttributeNameIndexesDirty();
         return true;
     }
 
@@ -1628,7 +1806,7 @@ bool XmlElement::RemoveAttribute(const std::string& localName, const std::string
         if (prefix.empty()) {
             return namespaceUri.empty();
         }
-        return LookupNamespaceUriOnElement(this, prefix) == namespaceUri;
+        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
     });
     if (found == attributes_.end()) {
         return false;
@@ -1636,6 +1814,7 @@ bool XmlElement::RemoveAttribute(const std::string& localName, const std::string
 
     (*found)->SetParent(nullptr);
     attributes_.erase(found);
+    MarkAttributeNameIndexesDirty();
     return true;
 }
 
@@ -1653,6 +1832,7 @@ std::shared_ptr<XmlAttribute> XmlElement::RemoveAttributeNode(const std::shared_
     auto removed = *found;
     removed->SetParent(nullptr);
     attributes_.erase(found);
+    MarkAttributeNameIndexesDirty();
     return removed;
 }
 
@@ -1662,19 +1842,22 @@ void XmlElement::RemoveAllAttributes() {
         attribute->SetParent(nullptr);
     }
     attributes_.clear();
+    attributeNameIndex_.reset();
+    pendingLoadAttributeNameIndex_.reset();
+    attributeNameIndexesDirty_ = true;
 }
 
 bool XmlElement::IsEmpty() const noexcept {
     return !HasChildNodes() && !writeFullEndElement_;
 }
 
-std::vector<std::shared_ptr<XmlElement>> XmlElement::GetElementsByTagName(const std::string& name) const {
+std::vector<std::shared_ptr<XmlElement>> XmlElement::GetElementsByTagName(std::string_view name) const {
     std::vector<std::shared_ptr<XmlElement>> results;
     CollectElementsByName(*this, name, results);
     return results;
 }
 
-XmlNodeList XmlElement::GetElementsByTagNameList(const std::string& name) const {
+XmlNodeList XmlElement::GetElementsByTagNameList(std::string_view name) const {
     std::vector<std::shared_ptr<XmlNode>> nodes;
     for (const auto& element : GetElementsByTagName(name)) {
         nodes.push_back(element);
@@ -1682,13 +1865,13 @@ XmlNodeList XmlElement::GetElementsByTagNameList(const std::string& name) const 
     return XmlNodeList(std::move(nodes));
 }
 
-std::vector<std::shared_ptr<XmlElement>> XmlElement::GetElementsByTagName(const std::string& localName, const std::string& namespaceUri) const {
+std::vector<std::shared_ptr<XmlElement>> XmlElement::GetElementsByTagName(std::string_view localName, std::string_view namespaceUri) const {
     std::vector<std::shared_ptr<XmlElement>> results;
     CollectElementsByNameNS(*this, localName, namespaceUri, results);
     return results;
 }
 
-XmlNodeList XmlElement::GetElementsByTagNameList(const std::string& localName, const std::string& namespaceUri) const {
+XmlNodeList XmlElement::GetElementsByTagNameList(std::string_view localName, std::string_view namespaceUri) const {
     std::vector<std::shared_ptr<XmlNode>> nodes;
     for (const auto& element : GetElementsByTagName(localName, namespaceUri)) {
         nodes.push_back(element);

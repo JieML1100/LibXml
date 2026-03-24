@@ -2,17 +2,443 @@
 
 namespace System::Xml {
 
-XmlWriter::XmlWriter(XmlWriterSettings settings) : settings_(std::move(settings)) {
-    fragmentRoot_ = document_.CreateDocumentFragment();
+namespace {
+
+void WriteNodesFromReader(XmlWriter& writer, XmlReader& reader) {
+    while (reader.GetReadState() != ReadState::EndOfFile) {
+        writer.WriteNode(reader);
+    }
 }
 
-XmlWriter::XmlWriter(std::ostream& stream, XmlWriterSettings settings)
-    : settings_(std::move(settings)), directOutputStream_(&stream) {
-    fragmentRoot_ = document_.CreateDocumentFragment();
+void WriteAttributeNode(XmlWriter& writer, const XmlNode& attribute) {
+    if (IsNamespaceDeclarationName(attribute.Name())) {
+        writer.WriteAttributeString(std::string_view(attribute.Name()), std::string_view(attribute.Value()));
+        return;
+    }
+
+    writer.WriteAttributeString(
+        std::string_view(attribute.Prefix()),
+        std::string_view(attribute.LocalName()),
+        std::string_view(attribute.NamespaceURI()),
+        std::string_view(attribute.Value()));
 }
+
+void WritePendingAttribute(XmlWriter& writer, const XmlElement& element, std::string_view name, std::string_view value) {
+    if (IsNamespaceDeclarationName(name)) {
+        writer.WriteAttributeString(name, value);
+        return;
+    }
+
+    const auto [prefix, localName] = SplitQualifiedNameView(name);
+    std::string_view namespaceUri;
+    static_cast<void>(LookupNamespaceUriOnElementView(&element, prefix, namespaceUri));
+    writer.WriteAttributeString(
+        prefix,
+        localName,
+        namespaceUri,
+        value);
+}
+
+}  // namespace
+
+namespace {
+
+void AppendIndent(std::string& output, int depth, const XmlWriterSettings& settings) {
+    for (int index = 0; index < depth; ++index) {
+        output += settings.IndentChars;
+    }
+}
+
+bool ChildrenCanBeIndented(const XmlNode& node) {
+    if (!node.HasChildNodes()) {
+        return false;
+    }
+
+    for (const auto& child : node.ChildNodes()) {
+        if (IsTextLike(child->NodeType())) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void SerializeNode(const XmlNode& node, const XmlWriterSettings& settings, std::string& output, int depth);
+
+void SerializeNodeToStream(const XmlNode& node, const XmlWriterSettings& settings, std::ostream& stream, int depth);
+
+void WriteChildren(const XmlNode& node, const XmlWriterSettings& settings, std::string& output, int depth, bool indented) {
+    for (std::size_t index = 0; index < node.ChildNodes().size(); ++index) {
+        const auto& child = node.ChildNodes()[index];
+        if (indented) {
+            output += settings.NewLineChars;
+            AppendIndent(output, depth, settings);
+        }
+
+        SerializeNode(*child, settings, output, depth);
+    }
+}
+
+void WriteChildrenToStream(const XmlNode& node, const XmlWriterSettings& settings, std::ostream& stream, int depth, bool indented) {
+    for (std::size_t index = 0; index < node.ChildNodes().size(); ++index) {
+        const auto& child = node.ChildNodes()[index];
+        if (indented) {
+            stream << settings.NewLineChars;
+            std::string indentation;
+            AppendIndent(indentation, depth, settings);
+            stream << indentation;
+        }
+
+        SerializeNodeToStream(*child, settings, stream, depth);
+    }
+}
+
+void SerializeNode(const XmlNode& node, const XmlWriterSettings& settings, std::string& output, int depth) {
+    switch (node.NodeType()) {
+    case XmlNodeType::Document: {
+        bool firstWritten = false;
+        for (const auto& child : node.ChildNodes()) {
+            if (settings.OmitXmlDeclaration && child->NodeType() == XmlNodeType::XmlDeclaration) {
+                continue;
+            }
+
+            if (firstWritten && settings.Indent) {
+                output += settings.NewLineChars;
+            }
+
+            SerializeNode(*child, settings, output, depth);
+            firstWritten = true;
+        }
+        break;
+    }
+    case XmlNodeType::DocumentFragment: {
+        bool firstWritten = false;
+        for (const auto& child : node.ChildNodes()) {
+            if (firstWritten && settings.Indent) {
+                output += settings.NewLineChars;
+            }
+
+            SerializeNode(*child, settings, output, depth);
+            firstWritten = true;
+        }
+        break;
+    }
+    case XmlNodeType::XmlDeclaration: {
+        const auto& declaration = static_cast<const XmlDeclaration&>(node);
+        output += "<?xml version=\"" + EscapeAttribute(declaration.Version(), settings) + "\"";
+        if (!declaration.Encoding().empty()) {
+            output += " encoding=\"" + EscapeAttribute(declaration.Encoding(), settings) + "\"";
+        }
+        if (!declaration.Standalone().empty()) {
+            output += " standalone=\"" + EscapeAttribute(declaration.Standalone(), settings) + "\"";
+        }
+        output += "?>";
+        break;
+    }
+    case XmlNodeType::DocumentType: {
+        const auto& documentType = static_cast<const XmlDocumentType&>(node);
+        output += "<!DOCTYPE " + documentType.Name();
+        if (!documentType.PublicId().empty()) {
+            output += " PUBLIC \"" + documentType.PublicId() + "\" \"" + documentType.SystemId() + "\"";
+        } else if (!documentType.SystemId().empty()) {
+            output += " SYSTEM \"" + documentType.SystemId() + "\"";
+        }
+        if (!documentType.InternalSubset().empty()) {
+            output += " [" + documentType.InternalSubset() + "]";
+        }
+        output += '>';
+        break;
+    }
+    case XmlNodeType::Element: {
+        const auto& element = static_cast<const XmlElement&>(node);
+        output += '<';
+        output += element.Name();
+        for (const auto& attribute : element.Attributes()) {
+            output += ' ';
+            output += attribute->Name();
+            output += "=\"";
+            output += EscapeAttribute(attribute->Value(), settings);
+            output += '\"';
+        }
+
+        if (!element.HasChildNodes() && !element.WritesFullEndElement()) {
+            output += "/>";
+            break;
+        }
+
+        const bool indentedChildren = settings.Indent && ChildrenCanBeIndented(element);
+        output += '>';
+        WriteChildren(element, settings, output, indentedChildren ? depth + 1 : depth, indentedChildren);
+        if (indentedChildren) {
+            output += settings.NewLineChars;
+            AppendIndent(output, depth, settings);
+        }
+        output += "</" + element.Name() + ">";
+        break;
+    }
+    case XmlNodeType::Attribute:
+        output += node.Name();
+        output += "=\"";
+        output += EscapeAttribute(node.Value(), settings);
+        output += '"';
+        break;
+    case XmlNodeType::Text:
+    case XmlNodeType::Whitespace:
+    case XmlNodeType::SignificantWhitespace:
+        output += EscapeText(node.Value(), settings);
+        break;
+    case XmlNodeType::EntityReference:
+        output += '&';
+        output += node.Name();
+        output += ';';
+        break;
+    case XmlNodeType::Entity: {
+        const auto& entity = static_cast<const XmlEntity&>(node);
+        output += "<!ENTITY " + entity.Name();
+        if (!entity.PublicId().empty()) {
+            output += " PUBLIC \"" + entity.PublicId() + "\" \"" + entity.SystemId() + "\"";
+        } else if (!entity.SystemId().empty()) {
+            output += " SYSTEM \"" + entity.SystemId() + "\"";
+        } else {
+            output += " \"" + entity.Value() + "\"";
+        }
+        if (!entity.NotationName().empty()) {
+            output += " NDATA " + entity.NotationName();
+        }
+        output += '>';
+        break;
+    }
+    case XmlNodeType::Notation: {
+        const auto& notation = static_cast<const XmlNotation&>(node);
+        output += "<!NOTATION " + notation.Name();
+        if (!notation.PublicId().empty()) {
+            output += " PUBLIC \"" + notation.PublicId() + "\"";
+            if (!notation.SystemId().empty()) {
+                output += " \"" + notation.SystemId() + "\"";
+            }
+        } else if (!notation.SystemId().empty()) {
+            output += " SYSTEM \"" + notation.SystemId() + "\"";
+        }
+        output += '>';
+        break;
+    }
+    case XmlNodeType::CDATA:
+        output += "<![CDATA[" + node.Value() + "]]>";
+        break;
+    case XmlNodeType::Comment:
+        output += "<!--" + node.Value() + "-->";
+        break;
+    case XmlNodeType::ProcessingInstruction: {
+        const auto& instruction = static_cast<const XmlProcessingInstruction&>(node);
+        output += "<?" + instruction.Target();
+        if (!instruction.Data().empty()) {
+            output += ' ';
+            output += instruction.Data();
+        }
+        output += "?>";
+        break;
+    }
+    default:
+        throw XmlException("Unsupported node type for serialization");
+    }
+}
+
+void SerializeNodeToStream(const XmlNode& node, const XmlWriterSettings& settings, std::ostream& stream, int depth) {
+    switch (node.NodeType()) {
+    case XmlNodeType::Document: {
+        bool firstWritten = false;
+        for (const auto& child : node.ChildNodes()) {
+            if (settings.OmitXmlDeclaration && child->NodeType() == XmlNodeType::XmlDeclaration) {
+                continue;
+            }
+
+            if (firstWritten && settings.Indent) {
+                stream << settings.NewLineChars;
+            }
+
+            SerializeNodeToStream(*child, settings, stream, depth);
+            firstWritten = true;
+        }
+        break;
+    }
+    case XmlNodeType::DocumentFragment: {
+        bool firstWritten = false;
+        for (const auto& child : node.ChildNodes()) {
+            if (firstWritten && settings.Indent) {
+                stream << settings.NewLineChars;
+            }
+
+            SerializeNodeToStream(*child, settings, stream, depth);
+            firstWritten = true;
+        }
+        break;
+    }
+    case XmlNodeType::XmlDeclaration: {
+        const auto& declaration = static_cast<const XmlDeclaration&>(node);
+        stream << "<?xml version=\"" << EscapeAttribute(declaration.Version(), settings) << '\"';
+        if (!declaration.Encoding().empty()) {
+            stream << " encoding=\"" << EscapeAttribute(declaration.Encoding(), settings) << '\"';
+        }
+        if (!declaration.Standalone().empty()) {
+            stream << " standalone=\"" << EscapeAttribute(declaration.Standalone(), settings) << '\"';
+        }
+        stream << "?>";
+        break;
+    }
+    case XmlNodeType::DocumentType: {
+        const auto& documentType = static_cast<const XmlDocumentType&>(node);
+        stream << "<!DOCTYPE " << documentType.Name();
+        if (!documentType.PublicId().empty()) {
+            stream << " PUBLIC \"" << documentType.PublicId() << "\" \"" << documentType.SystemId() << "\"";
+        } else if (!documentType.SystemId().empty()) {
+            stream << " SYSTEM \"" << documentType.SystemId() << "\"";
+        }
+        if (!documentType.InternalSubset().empty()) {
+            stream << " [" << documentType.InternalSubset() << ']';
+        }
+        stream << '>';
+        break;
+    }
+    case XmlNodeType::Element: {
+        const auto& element = static_cast<const XmlElement&>(node);
+        stream << '<' << element.Name();
+        for (const auto& attribute : element.Attributes()) {
+            stream << ' ' << attribute->Name() << "=\"" << EscapeAttribute(attribute->Value(), settings) << '\"';
+        }
+
+        if (!element.HasChildNodes() && !element.WritesFullEndElement()) {
+            stream << "/>";
+            break;
+        }
+
+        const bool indentedChildren = settings.Indent && ChildrenCanBeIndented(element);
+        stream << '>';
+        WriteChildrenToStream(element, settings, stream, indentedChildren ? depth + 1 : depth, indentedChildren);
+        if (indentedChildren) {
+            stream << settings.NewLineChars;
+            std::string indentation;
+            AppendIndent(indentation, depth, settings);
+            stream << indentation;
+        }
+        stream << "</" << element.Name() << ">";
+        break;
+    }
+    case XmlNodeType::Attribute:
+        stream << node.Name() << "=\"" << EscapeAttribute(node.Value(), settings) << '\"';
+        break;
+    case XmlNodeType::Text:
+    case XmlNodeType::Whitespace:
+    case XmlNodeType::SignificantWhitespace:
+        stream << EscapeText(node.Value(), settings);
+        break;
+    case XmlNodeType::EntityReference:
+        stream << '&' << node.Name() << ';';
+        break;
+    case XmlNodeType::Entity: {
+        const auto& entity = static_cast<const XmlEntity&>(node);
+        stream << "<!ENTITY " << entity.Name();
+        if (!entity.PublicId().empty()) {
+            stream << " PUBLIC \"" << entity.PublicId() << "\" \"" << entity.SystemId() << "\"";
+        } else if (!entity.SystemId().empty()) {
+            stream << " SYSTEM \"" << entity.SystemId() << "\"";
+        } else {
+            stream << " \"" << entity.Value() << "\"";
+        }
+        if (!entity.NotationName().empty()) {
+            stream << " NDATA " << entity.NotationName();
+        }
+        stream << '>';
+        break;
+    }
+    case XmlNodeType::Notation: {
+        const auto& notation = static_cast<const XmlNotation&>(node);
+        stream << "<!NOTATION " << notation.Name();
+        if (!notation.PublicId().empty()) {
+            stream << " PUBLIC \"" << notation.PublicId() << "\"";
+            if (!notation.SystemId().empty()) {
+                stream << " \"" << notation.SystemId() << "\"";
+            }
+        } else if (!notation.SystemId().empty()) {
+            stream << " SYSTEM \"" << notation.SystemId() << "\"";
+        }
+        stream << '>';
+        break;
+    }
+    case XmlNodeType::CDATA:
+        stream << "<![CDATA[" << node.Value() << "]]>";
+        break;
+    case XmlNodeType::Comment:
+        stream << "<!--" << node.Value() << "-->";
+        break;
+    case XmlNodeType::ProcessingInstruction: {
+        const auto& instruction = static_cast<const XmlProcessingInstruction&>(node);
+        stream << "<?" << instruction.Target();
+        if (!instruction.Data().empty()) {
+            stream << ' ' << instruction.Data();
+        }
+        stream << "?>";
+        break;
+    }
+    default:
+        throw XmlException("Unsupported node type for serialization");
+    }
+}
+
+
+}  // namespace
+
+XmlWriter::XmlWriter(XmlWriterSettings settings) : settings_(std::move(settings)) {}
+
+XmlWriter::XmlWriter(std::ostream& stream, XmlWriterSettings settings)
+    : settings_(std::move(settings)), directOutputStream_(&stream) {}
 
 bool XmlWriter::UsesDirectOutput() const noexcept {
     return directOutputStream_ != nullptr;
+}
+
+XmlWriter::InMemoryMutationCheckpoint XmlWriter::CaptureInMemoryMutationCheckpoint() const {
+    InMemoryMutationCheckpoint checkpoint;
+    checkpoint.elementStack = elementStack_;
+    checkpoint.startTagOpenStack = startTagOpenStack_;
+    checkpoint.startDocumentWritten = startDocumentWritten_;
+    checkpoint.targetParent = checkpoint.elementStack.empty() ? std::shared_ptr<XmlElement>{} : checkpoint.elementStack.back();
+    checkpoint.parentChildCount = checkpoint.targetParent == nullptr ? 0 : checkpoint.targetParent->ChildNodes().size();
+    checkpoint.documentChildCount = document_.ChildNodes().size();
+    checkpoint.hadFragmentRoot = fragmentRoot_ != nullptr;
+    checkpoint.fragmentChildCount = fragmentRoot_ == nullptr ? 0 : fragmentRoot_->ChildNodes().size();
+    return checkpoint;
+}
+
+void XmlWriter::RollbackInMemoryMutation(const InMemoryMutationCheckpoint& checkpoint) {
+    if (checkpoint.targetParent != nullptr) {
+        while (checkpoint.targetParent->ChildNodes().size() > checkpoint.parentChildCount) {
+            checkpoint.targetParent->RemoveChild(checkpoint.targetParent->LastChild());
+        }
+    }
+
+    while (document_.ChildNodes().size() > checkpoint.documentChildCount) {
+        document_.RemoveChild(document_.LastChild());
+    }
+
+    if (fragmentRoot_ != nullptr) {
+        while (fragmentRoot_->ChildNodes().size() > checkpoint.fragmentChildCount) {
+            fragmentRoot_->RemoveChild(fragmentRoot_->LastChild());
+        }
+        if (!checkpoint.hadFragmentRoot && fragmentRoot_->ChildNodes().empty()) {
+            fragmentRoot_.reset();
+        }
+    }
+
+    elementStack_ = checkpoint.elementStack;
+    startTagOpenStack_ = checkpoint.startTagOpenStack;
+    startDocumentWritten_ = checkpoint.startDocumentWritten;
+}
+
+std::shared_ptr<XmlDocumentFragment> XmlWriter::EnsureFragmentRoot() const {
+    if (fragmentRoot_ == nullptr) {
+        fragmentRoot_ = document_.CreateDocumentFragment();
+    }
+    return fragmentRoot_;
 }
 
 WriteState XmlWriter::GetWriteState() const noexcept {
@@ -34,40 +460,40 @@ WriteState XmlWriter::GetWriteState() const noexcept {
     return WriteState::Start;
 }
 
-std::string XmlWriter::LookupPrefix(const std::string& namespaceUri) const {
+std::string XmlWriter::LookupPrefix(std::string_view namespaceUri) const {
     if (UsesDirectOutput()) {
         return LookupDirectNamespacePrefix(namespaceUri);
     }
     return LookupNamespacePrefix(namespaceUri);
 }
 
-void XmlWriter::EnsureDocumentOpen(const std::string& operation) const {
+void XmlWriter::EnsureDocumentOpen(std::string_view operation) const {
     if (documentClosed_) {
-        throw XmlException("Cannot " + operation + " after the XML document has been closed");
+        throw XmlException("Cannot " + std::string(operation) + " after the XML document has been closed");
     }
 }
 
-void XmlWriter::EnsureOpenElement(const std::string& operation) const {
+void XmlWriter::EnsureOpenElement(std::string_view operation) const {
     EnsureDocumentOpen(operation);
     const bool hasOpenElement = UsesDirectOutput() ? !directElementStack_.empty() : !elementStack_.empty();
     if (!hasOpenElement) {
-        throw XmlException("Cannot " + operation + " outside of an element");
+        throw XmlException("Cannot " + std::string(operation) + " outside of an element");
     }
 }
 
-void XmlWriter::EnsureOpenStartElement(const std::string& operation) const {
+void XmlWriter::EnsureOpenStartElement(std::string_view operation) const {
     EnsureOpenElement(operation);
     const bool startTagOpen = UsesDirectOutput()
         ? directElementStack_.back().startTagOpen
         : startTagOpenStack_.back();
     if (!startTagOpen) {
-        throw XmlException("Cannot " + operation + " after the current element start tag has been closed");
+        throw XmlException("Cannot " + std::string(operation) + " after the current element start tag has been closed");
     }
 }
 
-void XmlWriter::EnsureNoOpenAttribute(const std::string& operation) const {
+void XmlWriter::EnsureNoOpenAttribute(std::string_view operation) const {
     if (currentAttributeName_.has_value()) {
-        throw XmlException("Cannot " + operation + " while an attribute is still open");
+        throw XmlException("Cannot " + std::string(operation) + " while an attribute is still open");
     }
 }
 
@@ -100,7 +526,7 @@ void XmlWriter::MarkCurrentElementContentStarted() {
     }
 }
 
-std::string XmlWriter::LookupNamespacePrefix(const std::string& namespaceUri) const {
+std::string XmlWriter::LookupNamespacePrefix(std::string_view namespaceUri) const {
     if (namespaceUri.empty()) {
         return {};
     }
@@ -166,11 +592,11 @@ void XmlWriter::PrepareDirectParentForChild(bool textLikeChild) {
     }
 }
 
-void XmlWriter::WriteDirectAttribute(const std::string& name, const std::string& value) {
+void XmlWriter::WriteDirectAttribute(std::string_view name, std::string_view value) {
     *directOutputStream_ << ' ' << name << "=\"" << EscapeAttribute(value, settings_) << '"';
 }
 
-bool XmlWriter::HasDirectNamespaceBinding(const std::string& prefix, const std::string& namespaceUri) const {
+bool XmlWriter::HasDirectNamespaceBinding(std::string_view prefix, std::string_view namespaceUri) const {
     if (namespaceUri.empty()) {
         return prefix.empty();
     }
@@ -180,8 +606,11 @@ bool XmlWriter::HasDirectNamespaceBinding(const std::string& prefix, const std::
     }
 
     for (auto it = directElementStack_.rbegin(); it != directElementStack_.rend(); ++it) {
-        const auto found = it->namespaceDeclarations.find(prefix);
-        if (found != it->namespaceDeclarations.end()) {
+        if (!it->namespaceDeclarations) {
+            continue;
+        }
+        const auto found = it->namespaceDeclarations->find(std::string(prefix));
+        if (found != it->namespaceDeclarations->end()) {
             return found->second == namespaceUri;
         }
     }
@@ -189,7 +618,7 @@ bool XmlWriter::HasDirectNamespaceBinding(const std::string& prefix, const std::
     return false;
 }
 
-std::string XmlWriter::LookupDirectNamespacePrefix(const std::string& namespaceUri) const {
+std::string XmlWriter::LookupDirectNamespacePrefix(std::string_view namespaceUri) const {
     if (namespaceUri.empty()) {
         return {};
     }
@@ -198,7 +627,10 @@ std::string XmlWriter::LookupDirectNamespacePrefix(const std::string& namespaceU
     }
 
     for (auto it = directElementStack_.rbegin(); it != directElementStack_.rend(); ++it) {
-        for (const auto& [prefix, uri] : it->namespaceDeclarations) {
+        if (!it->namespaceDeclarations) {
+            continue;
+        }
+        for (const auto& [prefix, uri] : *it->namespaceDeclarations) {
             if (uri == namespaceUri) {
                 return prefix;
             }
@@ -208,15 +640,18 @@ std::string XmlWriter::LookupDirectNamespacePrefix(const std::string& namespaceU
     return {};
 }
 
-void XmlWriter::DeclareDirectNamespaceIfNeeded(const std::string& prefix, const std::string& namespaceUri) {
+void XmlWriter::DeclareDirectNamespaceIfNeeded(std::string_view prefix, std::string_view namespaceUri) {
     if (namespaceUri.empty() || directElementStack_.empty() || HasDirectNamespaceBinding(prefix, namespaceUri)) {
         return;
     }
 
     auto& current = directElementStack_.back();
-    const std::string attributeName = prefix.empty() ? "xmlns" : "xmlns:" + prefix;
+    const std::string attributeName = prefix.empty() ? "xmlns" : "xmlns:" + std::string(prefix);
     WriteDirectAttribute(attributeName, namespaceUri);
-    current.namespaceDeclarations[prefix] = namespaceUri;
+    if (!current.namespaceDeclarations) {
+        current.namespaceDeclarations = std::make_unique<std::unordered_map<std::string, std::string>>();
+    }
+    (*current.namespaceDeclarations)[std::string(prefix)] = std::string(namespaceUri);
 }
 
 void XmlWriter::WriteDirectTopLevelNode(const XmlNode& node) {
@@ -260,7 +695,7 @@ void XmlWriter::WriteDirectTopLevelNode(const XmlNode& node) {
     }
 }
 
-void XmlWriter::WriteStartDocument(const std::string& version, const std::string& encoding, const std::string& standalone) {
+void XmlWriter::WriteStartDocument(std::string_view version, std::string_view encoding, std::string_view standalone) {
     EnsureDocumentOpen("write the XML declaration");
     EnsureNoOpenAttribute("write the XML declaration");
     if (settings_.Conformance == ConformanceLevel::Fragment) {
@@ -277,7 +712,7 @@ void XmlWriter::WriteStartDocument(const std::string& version, const std::string
             throw XmlException("XML declaration must be the first node in the document");
         }
 
-        const std::string effectiveEncoding = encoding.empty() ? settings_.Encoding : encoding;
+        const std::string effectiveEncoding = encoding.empty() ? settings_.Encoding : std::string(encoding);
         *directOutputStream_ << "<?xml version=\"" << EscapeAttribute(version, settings_) << '\"';
         if (!effectiveEncoding.empty()) {
             *directOutputStream_ << " encoding=\"" << EscapeAttribute(effectiveEncoding, settings_) << '\"';
@@ -300,16 +735,16 @@ void XmlWriter::WriteStartDocument(const std::string& version, const std::string
         throw XmlException("XML declaration must be the first node in the document");
     }
 
-    const std::string effectiveEncoding = encoding.empty() ? settings_.Encoding : encoding;
+    const std::string effectiveEncoding = encoding.empty() ? settings_.Encoding : std::string(encoding);
     document_.AppendChild(document_.CreateXmlDeclaration(version, effectiveEncoding, standalone));
     startDocumentWritten_ = true;
 }
 
 void XmlWriter::WriteDocType(
-    const std::string& name,
-    const std::string& publicId,
-    const std::string& systemId,
-    const std::string& internalSubset) {
+    std::string_view name,
+    std::string_view publicId,
+    std::string_view systemId,
+    std::string_view internalSubset) {
     EnsureDocumentOpen("write a document type declaration");
     EnsureNoOpenAttribute("write a document type declaration");
     if (settings_.Conformance == ConformanceLevel::Fragment) {
@@ -351,7 +786,7 @@ void XmlWriter::WriteDocType(
     document_.AppendChild(document_.CreateDocumentType(name, publicId, systemId, internalSubset));
 }
 
-void XmlWriter::WriteStartElement(const std::string& name) {
+void XmlWriter::WriteStartElement(std::string_view name) {
     EnsureDocumentOpen("write a start element");
     EnsureNoOpenAttribute("write a start element");
     if (UsesDirectOutput()) {
@@ -369,7 +804,7 @@ void XmlWriter::WriteStartElement(const std::string& name) {
         }
 
         directElementStack_.push_back(DirectElementState{});
-        directElementStack_.back().name = name;
+        directElementStack_.back().name = std::string(name);
         *directOutputStream_ << '<' << name;
         return;
     }
@@ -391,7 +826,7 @@ void XmlWriter::WriteStartElement(const std::string& name) {
     startTagOpenStack_.push_back(true);
 }
 
-void XmlWriter::WriteStartElement(const std::string& prefix, const std::string& localName, const std::string& namespaceUri) {
+void XmlWriter::WriteStartElement(std::string_view prefix, std::string_view localName, std::string_view namespaceUri) {
     WriteStartElement(ComposeQualifiedName(prefix, localName));
     if (UsesDirectOutput()) {
         if (!namespaceUri.empty()) {
@@ -400,24 +835,24 @@ void XmlWriter::WriteStartElement(const std::string& prefix, const std::string& 
         return;
     }
     if (!namespaceUri.empty()) {
-        const std::string xmlnsName = prefix.empty() ? "xmlns" : "xmlns:" + prefix;
+        const std::string xmlnsName = prefix.empty() ? "xmlns" : "xmlns:" + std::string(prefix);
         if (!elementStack_.back()->HasAttribute(xmlnsName)) {
-            elementStack_.back()->SetAttribute(xmlnsName, namespaceUri);
+            elementStack_.back()->SetAttribute(xmlnsName, std::string(namespaceUri));
         }
     }
 }
 
-void XmlWriter::WriteStartAttribute(const std::string& name) {
+void XmlWriter::WriteStartAttribute(std::string_view name) {
     EnsureOpenStartElement("write an attribute");
     EnsureNoOpenAttribute("write an attribute");
-    currentAttributeName_ = name;
+    currentAttributeName_ = std::string(name);
     currentAttributeValue_.clear();
 }
 
 void XmlWriter::WriteStartAttribute(
-    const std::string& prefix,
-    const std::string& localName,
-    const std::string& namespaceUri) {
+    std::string_view prefix,
+    std::string_view localName,
+    std::string_view namespaceUri) {
     WriteStartAttribute(ComposeQualifiedName(prefix, localName));
 
     if (UsesDirectOutput()) {
@@ -428,9 +863,9 @@ void XmlWriter::WriteStartAttribute(
     }
 
     if (!prefix.empty() && !namespaceUri.empty()) {
-        const std::string xmlnsName = "xmlns:" + prefix;
+        const std::string xmlnsName = "xmlns:" + std::string(prefix);
         if (!elementStack_.back()->HasAttribute(xmlnsName)) {
-            elementStack_.back()->SetAttribute(xmlnsName, namespaceUri);
+            elementStack_.back()->SetAttribute(xmlnsName, std::string(namespaceUri));
         }
     }
 }
@@ -453,20 +888,42 @@ void XmlWriter::WriteEndAttribute() {
     currentAttributeValue_.clear();
 }
 
-void XmlWriter::WriteAttributeString(const std::string& name, const std::string& value) {
-    WriteStartAttribute(name);
-    WriteString(value);
-    WriteEndAttribute();
+void XmlWriter::WriteAttributeString(std::string_view name, std::string_view value) {
+    EnsureOpenStartElement("write an attribute");
+    EnsureNoOpenAttribute("write an attribute");
+    if (UsesDirectOutput()) {
+        WriteDirectAttribute(name, value);
+        return;
+    }
+
+    elementStack_.back()->SetAttribute(std::string(name), std::string(value));
 }
 
 void XmlWriter::WriteAttributeString(
-    const std::string& prefix,
-    const std::string& localName,
-    const std::string& namespaceUri,
-    const std::string& value) {
-    WriteStartAttribute(prefix, localName, namespaceUri);
-    WriteString(value);
-    WriteEndAttribute();
+    std::string_view prefix,
+    std::string_view localName,
+    std::string_view namespaceUri,
+    std::string_view value) {
+    EnsureOpenStartElement("write an attribute");
+    EnsureNoOpenAttribute("write an attribute");
+
+    const std::string qualifiedName = ComposeQualifiedName(prefix, localName);
+    if (UsesDirectOutput()) {
+        if (!prefix.empty() && !namespaceUri.empty()) {
+            DeclareDirectNamespaceIfNeeded(prefix, namespaceUri);
+        }
+        WriteDirectAttribute(qualifiedName, value);
+        return;
+    }
+
+    if (!prefix.empty() && !namespaceUri.empty()) {
+        const std::string xmlnsName = "xmlns:" + std::string(prefix);
+        if (!elementStack_.back()->HasAttribute(xmlnsName)) {
+            elementStack_.back()->SetAttribute(xmlnsName, std::string(namespaceUri));
+        }
+    }
+
+    elementStack_.back()->SetAttribute(qualifiedName, std::string(value));
 }
 
 void XmlWriter::WriteAttributes(const XmlAttributeCollection& attributes) {
@@ -484,13 +941,15 @@ void XmlWriter::WriteAttributes(const XmlElement& element) {
     EnsureNoOpenAttribute("write attributes");
     for (const auto& attribute : element.attributes_) {
         if (attribute != nullptr) {
-            WriteAttributeString(attribute->Name(), attribute->Value());
+            WriteAttributeNode(*this, *attribute);
         }
     }
     for (const auto& pendingAttribute : element.pendingLoadAttributes_) {
-        WriteAttributeString(
-            std::string(element.PendingLoadAttributeNameView(pendingAttribute)),
-            std::string(element.PendingLoadAttributeValueView(pendingAttribute)));
+        WritePendingAttribute(
+            *this,
+            element,
+            element.PendingLoadAttributeNameView(pendingAttribute),
+            element.PendingLoadAttributeValueView(pendingAttribute));
     }
 }
 
@@ -512,7 +971,7 @@ void XmlWriter::WriteCharEntity(unsigned int codePoint) {
     elementStack_.back()->AppendChild(document_.CreateEntityReference(name.str()));
 }
 
-void XmlWriter::WriteEntityRef(const std::string& name) {
+void XmlWriter::WriteEntityRef(std::string_view name) {
     EnsureNoOpenAttribute("write an entity reference");
     EnsureOpenElement("write an entity reference");
     if (name.empty()) {
@@ -529,7 +988,7 @@ void XmlWriter::WriteEntityRef(const std::string& name) {
     elementStack_.back()->AppendChild(document_.CreateEntityReference(name));
 }
 
-void XmlWriter::WriteString(const std::string& text) {
+void XmlWriter::WriteString(std::string_view text) {
     if (currentAttributeName_.has_value()) {
         currentAttributeValue_ += text;
         return;
@@ -547,7 +1006,7 @@ void XmlWriter::WriteString(const std::string& text) {
     elementStack_.back()->AppendChild(document_.CreateTextNode(text));
 }
 
-void XmlWriter::WriteValue(const std::string& value) {
+void XmlWriter::WriteValue(std::string_view value) {
     WriteString(value);
 }
 
@@ -565,14 +1024,14 @@ void XmlWriter::WriteValue(double value) {
     WriteString(stream.str());
 }
 
-void XmlWriter::WriteName(const std::string& name) {
+void XmlWriter::WriteName(std::string_view name) {
     if (!IsValidXmlQualifiedName(name)) {
         throw XmlException("WriteName requires a valid XML name");
     }
     WriteString(name);
 }
 
-void XmlWriter::WriteQualifiedName(const std::string& localName, const std::string& namespaceUri) {
+void XmlWriter::WriteQualifiedName(std::string_view localName, std::string_view namespaceUri) {
     if (!IsValidXmlNameToken(localName)) {
         throw XmlException("WriteQualifiedName requires a valid XML local name");
     }
@@ -590,9 +1049,13 @@ void XmlWriter::WriteQualifiedName(const std::string& localName, const std::stri
         return;
     }
 
-    if (!UsesDirectOutput() && !elementStack_.empty() && LookupNamespaceUriOnElement(elementStack_.back().get(), {}) == namespaceUri) {
-        WriteName(localName);
-        return;
+    if (!UsesDirectOutput() && !elementStack_.empty()) {
+        std::string_view defaultNamespaceUri;
+        if (LookupNamespaceUriOnElementView(elementStack_.back().get(), {}, defaultNamespaceUri)
+            && defaultNamespaceUri == namespaceUri) {
+            WriteName(localName);
+            return;
+        }
     }
 
     if (UsesDirectOutput() && HasDirectNamespaceBinding({}, namespaceUri)) {
@@ -600,10 +1063,10 @@ void XmlWriter::WriteQualifiedName(const std::string& localName, const std::stri
         return;
     }
 
-    throw XmlException("WriteQualifiedName requires a namespace prefix bound to URI: " + namespaceUri);
+    throw XmlException("WriteQualifiedName requires a namespace prefix bound to URI: " + std::string(namespaceUri));
 }
 
-void XmlWriter::WriteWhitespace(const std::string& whitespace) {
+void XmlWriter::WriteWhitespace(std::string_view whitespace) {
     EnsureDocumentOpen("write whitespace");
     EnsureNoOpenAttribute("write whitespace");
     if (UsesDirectOutput()) {
@@ -626,7 +1089,7 @@ void XmlWriter::WriteWhitespace(const std::string& whitespace) {
     }
 }
 
-void XmlWriter::WriteSignificantWhitespace(const std::string& whitespace) {
+void XmlWriter::WriteSignificantWhitespace(std::string_view whitespace) {
     EnsureDocumentOpen("write significant whitespace");
     EnsureNoOpenAttribute("write significant whitespace");
     if (UsesDirectOutput()) {
@@ -649,7 +1112,7 @@ void XmlWriter::WriteSignificantWhitespace(const std::string& whitespace) {
     }
 }
 
-void XmlWriter::WriteCData(const std::string& text) {
+void XmlWriter::WriteCData(std::string_view text) {
     EnsureNoOpenAttribute("write CDATA");
     EnsureOpenElement("write CDATA");
 
@@ -663,7 +1126,7 @@ void XmlWriter::WriteCData(const std::string& text) {
     elementStack_.back()->AppendChild(document_.CreateCDataSection(text));
 }
 
-void XmlWriter::WriteComment(const std::string& text) {
+void XmlWriter::WriteComment(std::string_view text) {
     EnsureDocumentOpen("write a comment");
     EnsureNoOpenAttribute("write a comment");
     if (UsesDirectOutput()) {
@@ -686,7 +1149,7 @@ void XmlWriter::WriteComment(const std::string& text) {
     }
 }
 
-void XmlWriter::WriteProcessingInstruction(const std::string& name, const std::string& text) {
+void XmlWriter::WriteProcessingInstruction(std::string_view name, std::string_view text) {
     EnsureDocumentOpen("write a processing instruction");
     EnsureNoOpenAttribute("write a processing instruction");
     if (UsesDirectOutput()) {
@@ -717,7 +1180,7 @@ void XmlWriter::WriteProcessingInstruction(const std::string& name, const std::s
     }
 }
 
-void XmlWriter::WriteRaw(const std::string& xml) {
+void XmlWriter::WriteRaw(std::string_view xml) {
     EnsureDocumentOpen("write raw XML");
     EnsureNoOpenAttribute("write raw XML");
     if (xml.empty()) {
@@ -725,62 +1188,28 @@ void XmlWriter::WriteRaw(const std::string& xml) {
     }
 
     if (UsesDirectOutput()) {
-        if (!directElementStack_.empty()) {
-            XmlDocument fragmentDocument;
-            auto fragment = fragmentDocument.CreateDocumentFragment();
-            fragment->SetInnerXml(xml);
-            for (const auto& child : fragment->ChildNodes()) {
-                if (child != nullptr) {
-                    WriteNode(*child);
-                }
-            }
-            return;
-        }
-
-        try {
-            XmlDocument scratch;
-            scratch.LoadXml(xml);
-            for (const auto& child : scratch.ChildNodes()) {
-                if (child != nullptr) {
-                    WriteNode(*child);
-                }
-            }
-            return;
-        } catch (const XmlException&) {
-            XmlDocument fragmentDocument;
-            auto fragment = fragmentDocument.CreateDocumentFragment();
-            fragment->SetInnerXml(xml);
-            for (const auto& child : fragment->ChildNodes()) {
-                if (child != nullptr) {
-                    WriteNode(*child);
-                }
-            }
-            return;
-        }
-    }
-
-    if (!elementStack_.empty()) {
-        auto fragment = document_.CreateDocumentFragment();
-        fragment->SetInnerXml(xml);
-        MarkCurrentElementContentStarted();
-        elementStack_.back()->AppendChild(fragment);
+        XmlReaderSettings readerSettings;
+        readerSettings.Conformance = directElementStack_.empty()
+            ? settings_.Conformance
+            : ConformanceLevel::Fragment;
+        auto reader = XmlReader::Create(std::string(xml), readerSettings);
+        WriteNodesFromReader(*this, reader);
         return;
     }
+
+    const auto checkpoint = CaptureInMemoryMutationCheckpoint();
 
     try {
-        XmlDocument scratch;
-        scratch.SetPreserveWhitespace(document_.PreserveWhitespace());
-        scratch.LoadXml(xml);
-        for (const auto& child : scratch.ChildNodes()) {
-            if (child != nullptr) {
-                AppendDocumentLevelNode(document_.ImportNode(*child, true));
-            }
-        }
+        XmlReaderSettings readerSettings;
+        readerSettings.Conformance = checkpoint.elementStack.empty()
+            ? settings_.Conformance
+            : ConformanceLevel::Fragment;
+        auto reader = XmlReader::Create(std::string(xml), readerSettings);
+        WriteNodesFromReader(*this, reader);
         return;
-    } catch (const XmlException&) {
-        auto fragment = document_.CreateDocumentFragment();
-        fragment->SetInnerXml(xml);
-        AppendDocumentLevelNode(fragment);
+    } catch (...) {
+        RollbackInMemoryMutation(checkpoint);
+        throw;
     }
 }
 
@@ -793,7 +1222,7 @@ void XmlWriter::WriteBase64(const unsigned char* data, std::size_t length) {
     WriteString(EncodeBase64(data, length));
 }
 
-void XmlWriter::WriteElementString(const std::string& name, const std::string& value) {
+void XmlWriter::WriteElementString(std::string_view name, std::string_view value) {
     EnsureDocumentOpen("write an element string");
     EnsureNoOpenAttribute("write an element string");
     WriteStartElement(name);
@@ -801,7 +1230,7 @@ void XmlWriter::WriteElementString(const std::string& name, const std::string& v
     WriteEndElement();
 }
 
-void XmlWriter::WriteElementString(const std::string& prefix, const std::string& localName, const std::string& namespaceUri, const std::string& value) {
+void XmlWriter::WriteElementString(std::string_view prefix, std::string_view localName, std::string_view namespaceUri, std::string_view value) {
     EnsureDocumentOpen("write an element string");
     EnsureNoOpenAttribute("write an element string");
     WriteStartElement(prefix, localName, namespaceUri);
@@ -813,7 +1242,39 @@ void XmlWriter::WriteNode(const XmlNode& node) {
     EnsureDocumentOpen("write a node");
     EnsureNoOpenAttribute("write a node");
 
-    if (node.NodeType() == XmlNodeType::Document || node.NodeType() == XmlNodeType::DocumentFragment) {
+    if (node.NodeType() == XmlNodeType::Document) {
+        if (UsesDirectOutput()) {
+            if (!directElementStack_.empty()) {
+                throw XmlException("Cannot write document-level nodes inside an element");
+            }
+            for (const auto& child : node.ChildNodes()) {
+                if (child != nullptr) {
+                    WriteNode(*child);
+                }
+            }
+            return;
+        }
+
+        if (!elementStack_.empty()) {
+            throw XmlException("Cannot write document-level nodes inside an element");
+        }
+
+        const auto checkpoint = CaptureInMemoryMutationCheckpoint();
+        try {
+            for (const auto& child : node.ChildNodes()) {
+                if (child != nullptr) {
+                    WriteNodeInMemory(*child);
+                }
+            }
+        } catch (...) {
+            RollbackInMemoryMutation(checkpoint);
+            throw;
+        }
+
+        return;
+    }
+
+    if (UsesDirectOutput() && node.NodeType() == XmlNodeType::DocumentFragment) {
         for (const auto& child : node.ChildNodes()) {
             if (child != nullptr) {
                 WriteNode(*child);
@@ -824,11 +1285,7 @@ void XmlWriter::WriteNode(const XmlNode& node) {
 
     if (node.NodeType() == XmlNodeType::Attribute) {
         EnsureOpenStartElement("write an attribute node");
-        if (UsesDirectOutput()) {
-            WriteAttributeString(node.Name(), node.Value());
-            return;
-        }
-        elementStack_.back()->SetAttribute(node.Name(), node.Value());
+        WriteAttributeNode(*this, node);
         return;
     }
 
@@ -837,6 +1294,7 @@ void XmlWriter::WriteNode(const XmlNode& node) {
             if (node.NodeType() == XmlNodeType::XmlDeclaration || node.NodeType() == XmlNodeType::DocumentType || node.NodeType() == XmlNodeType::Element
                 || node.NodeType() == XmlNodeType::Comment || node.NodeType() == XmlNodeType::ProcessingInstruction
                 || node.NodeType() == XmlNodeType::Whitespace || node.NodeType() == XmlNodeType::SignificantWhitespace
+                || node.NodeType() == XmlNodeType::Entity || node.NodeType() == XmlNodeType::Notation
                 || node.NodeType() == XmlNodeType::Text || node.NodeType() == XmlNodeType::CDATA || node.NodeType() == XmlNodeType::EntityReference) {
                 WriteDirectTopLevelNode(node);
                 return;
@@ -858,18 +1316,105 @@ void XmlWriter::WriteNode(const XmlNode& node) {
         return;
     }
 
-    auto imported = document_.ImportNode(node, true);
-    if (elementStack_.empty()) {
-        AppendDocumentLevelNode(imported);
-        return;
-    }
-
-    if (node.NodeType() == XmlNodeType::XmlDeclaration || node.NodeType() == XmlNodeType::DocumentType) {
+    if (!elementStack_.empty()
+        && (node.NodeType() == XmlNodeType::XmlDeclaration || node.NodeType() == XmlNodeType::DocumentType)) {
         throw XmlException("Cannot write document-level nodes inside an element");
     }
 
+    const auto checkpoint = CaptureInMemoryMutationCheckpoint();
+    try {
+        WriteNodeInMemory(node);
+    } catch (...) {
+        RollbackInMemoryMutation(checkpoint);
+        throw;
+    }
+}
+
+void XmlWriter::WriteNodeInMemory(const XmlNode& node) {
+    if (!elementStack_.empty()
+        && (node.NodeType() == XmlNodeType::XmlDeclaration || node.NodeType() == XmlNodeType::DocumentType)) {
+        throw XmlException("Cannot write document-level nodes inside an element");
+    }
+
+    switch (node.NodeType()) {
+    case XmlNodeType::XmlDeclaration: {
+        const auto& declaration = static_cast<const XmlDeclaration&>(node);
+        WriteStartDocument(
+            declaration.Version(),
+            declaration.Encoding(),
+            declaration.Standalone());
+        return;
+    }
+    case XmlNodeType::DocumentType: {
+        const auto& documentType = static_cast<const XmlDocumentType&>(node);
+        WriteDocType(
+            documentType.Name(),
+            documentType.PublicId(),
+            documentType.SystemId(),
+            documentType.InternalSubset());
+        return;
+    }
+    case XmlNodeType::Element: {
+        const auto& element = static_cast<const XmlElement&>(node);
+        WriteStartElement(element.Prefix(), element.LocalName(), element.NamespaceURI());
+        WriteAttributes(element);
+        for (const auto& child : element.ChildNodes()) {
+            if (child != nullptr) {
+                WriteNodeInMemory(*child);
+            }
+        }
+        if (element.WritesFullEndElement()) {
+            WriteFullEndElement();
+        } else {
+            WriteEndElement();
+        }
+        return;
+    }
+    case XmlNodeType::DocumentFragment:
+        for (const auto& child : node.ChildNodes()) {
+            if (child != nullptr) {
+                WriteNodeInMemory(*child);
+            }
+        }
+        return;
+    case XmlNodeType::Text:
+        WriteString(node.Value());
+        return;
+    case XmlNodeType::CDATA:
+        WriteCData(node.Value());
+        return;
+    case XmlNodeType::Comment:
+        WriteComment(node.Value());
+        return;
+    case XmlNodeType::ProcessingInstruction: {
+        const auto& instruction = static_cast<const XmlProcessingInstruction&>(node);
+        WriteProcessingInstruction(instruction.Target(), instruction.Data());
+        return;
+    }
+    case XmlNodeType::Whitespace:
+        WriteWhitespace(node.Value());
+        return;
+    case XmlNodeType::SignificantWhitespace:
+        WriteSignificantWhitespace(node.Value());
+        return;
+    case XmlNodeType::EntityReference:
+        WriteEntityRef(node.Name());
+        return;
+    default:
+        break;
+    }
+
+    const auto sameDocumentNode = node.OwnerDocument() == &document_;
+    auto clonedOrImported = sameDocumentNode
+        ? node.CloneNode(true)
+        : document_.ImportNode(node, true);
+    if (elementStack_.empty()) {
+        AppendDocumentLevelNode(clonedOrImported);
+        return;
+    }
+
     MarkCurrentElementContentStarted();
-    elementStack_.back()->AppendChild(imported);
+    elementStack_.back()->AppendChild(clonedOrImported);
 }
 
 void XmlWriter::WriteNode(XmlReader& reader, bool defattr) {
@@ -880,68 +1425,108 @@ void XmlWriter::WriteNode(XmlReader& reader, bool defattr) {
         reader.Read();
     }
 
-    int startDepth = reader.Depth();
-    do {
-        switch (reader.NodeType()) {
-        case XmlNodeType::Element: {
-            WriteStartElement(reader.Name());
-            if (defattr && reader.MoveToFirstAttribute()) {
-                do {
-                    WriteAttributeString(reader.Name(), reader.Value());
-                } while (reader.MoveToNextAttribute());
-                reader.MoveToElement();
-            }
-            if (reader.IsEmptyElement()) {
-                WriteEndElement();
-            }
-            break;
-        }
-        case XmlNodeType::Text:
-            WriteString(reader.Value());
-            break;
-        case XmlNodeType::CDATA:
-            WriteCData(reader.Value());
-            break;
-        case XmlNodeType::Comment:
-            WriteComment(reader.Value());
-            break;
-        case XmlNodeType::ProcessingInstruction:
-            WriteProcessingInstruction(reader.Name(), reader.Value());
-            break;
-        case XmlNodeType::Whitespace:
-            WriteWhitespace(reader.Value());
-            break;
-        case XmlNodeType::SignificantWhitespace:
-            WriteSignificantWhitespace(reader.Value());
-            break;
-        case XmlNodeType::EntityReference:
-            WriteEntityRef(reader.Name());
-            break;
-        case XmlNodeType::EndElement:
-            WriteFullEndElement();
-            break;
-        case XmlNodeType::XmlDeclaration: {
-            std::string version = reader.GetAttribute("version");
-            std::string encoding = reader.GetAttribute("encoding");
-            std::string standalone = reader.GetAttribute("standalone");
-            WriteStartDocument(
-                version.empty() ? "1.0" : version,
-                encoding,
-                standalone);
-            break;
-        }
-        case XmlNodeType::DocumentType:
-            // DocumentType cannot be written via WriteNode from reader inside elements
-            break;
-        default:
-            break;
-        }
-    } while (reader.Read() && reader.Depth() > startDepth);
+    const bool canRollback = !UsesDirectOutput();
+    const auto checkpoint = canRollback ? CaptureInMemoryMutationCheckpoint() : InMemoryMutationCheckpoint{};
 
-    // If we stopped at the EndElement that matches startDepth, close the element
-    if (reader.NodeType() == XmlNodeType::EndElement && reader.Depth() == startDepth) {
-        WriteFullEndElement();
-        reader.Read(); // advance past the end element
+    try {
+        int startDepth = reader.Depth();
+        do {
+            switch (reader.NodeType()) {
+            case XmlNodeType::Element: {
+                WriteStartElement(reader.Prefix(), reader.LocalName(), reader.NamespaceURI());
+                if (defattr && reader.MoveToFirstAttribute()) {
+                    do {
+                        if (IsNamespaceDeclarationName(reader.Name())) {
+                            WriteAttributeString(std::string_view(reader.Name()), std::string_view(reader.Value()));
+                        } else {
+                            WriteAttributeString(
+                                std::string_view(reader.Prefix()),
+                                std::string_view(reader.LocalName()),
+                                std::string_view(reader.NamespaceURI()),
+                                std::string_view(reader.Value()));
+                        }
+                    } while (reader.MoveToNextAttribute());
+                    reader.MoveToElement();
+                }
+                if (reader.IsEmptyElement()) {
+                    WriteEndElement();
+                }
+                break;
+            }
+            case XmlNodeType::Text:
+                WriteString(reader.Value());
+                break;
+            case XmlNodeType::CDATA:
+                WriteCData(reader.Value());
+                break;
+            case XmlNodeType::Comment:
+                WriteComment(reader.Value());
+                break;
+            case XmlNodeType::ProcessingInstruction:
+                WriteProcessingInstruction(reader.Name(), reader.Value());
+                break;
+            case XmlNodeType::Whitespace:
+                WriteWhitespace(reader.Value());
+                break;
+            case XmlNodeType::SignificantWhitespace:
+                WriteSignificantWhitespace(reader.Value());
+                break;
+            case XmlNodeType::EntityReference:
+                WriteEntityRef(reader.Name());
+                {
+                    int openEntityCount = 1;
+                    while (openEntityCount > 0 && reader.Read()) {
+                        if (reader.NodeType() == XmlNodeType::EntityReference) {
+                            ++openEntityCount;
+                        } else if (reader.NodeType() == XmlNodeType::EndEntity) {
+                            --openEntityCount;
+                        }
+                    }
+                }
+                break;
+            case XmlNodeType::EndElement:
+                WriteFullEndElement();
+                break;
+            case XmlNodeType::XmlDeclaration: {
+                std::string version = reader.GetAttribute("version");
+                std::string encoding = reader.GetAttribute("encoding");
+                std::string standalone = reader.GetAttribute("standalone");
+                WriteStartDocument(
+                    version.empty() ? "1.0" : version,
+                    encoding,
+                    standalone);
+                break;
+            }
+            case XmlNodeType::DocumentType:
+                if (UsesDirectOutput() ? !directElementStack_.empty() : !elementStack_.empty()) {
+                    throw XmlException("Cannot write document-level nodes inside an element");
+                }
+
+                {
+                    const auto declaration = ParseDocumentTypeDeclaration(reader.ReadOuterXml());
+                    WriteDocType(
+                        declaration.name,
+                        declaration.publicId,
+                        declaration.systemId,
+                        declaration.internalSubset);
+                }
+                break;
+            default:
+                break;
+            }
+        } while (reader.Read() && reader.Depth() > startDepth);
+
+        if (reader.NodeType() == XmlNodeType::EndElement && reader.Depth() == startDepth) {
+            WriteFullEndElement();
+            reader.Read();
+        }
+    } catch (...) {
+        if (!canRollback) {
+            throw;
+        }
+
+        RollbackInMemoryMutation(checkpoint);
+        throw;
     }
 }
 
@@ -951,6 +1536,13 @@ void XmlWriter::AppendDocumentLevelNode(const std::shared_ptr<XmlNode>& node) {
     }
 
     if (node->NodeType() == XmlNodeType::DocumentFragment) {
+        if (node->OwnerDocument() == &document_) {
+            while (node->FirstChild() != nullptr) {
+                AppendDocumentLevelNode(node->RemoveChild(node->FirstChild()));
+            }
+            return;
+        }
+
         for (const auto& child : node->ChildNodes()) {
             if (child != nullptr) {
                 AppendDocumentLevelNode(document_.ImportNode(*child, true));
@@ -966,7 +1558,7 @@ void XmlWriter::AppendDocumentLevelNode(const std::shared_ptr<XmlNode>& node) {
         if (node->NodeType() == XmlNodeType::DocumentType) {
             throw XmlException("DOCTYPE is only allowed in document conformance mode");
         }
-        fragmentRoot_->AppendChild(node);
+        EnsureFragmentRoot()->AppendChild(node);
         return;
     }
 
@@ -1063,7 +1655,7 @@ std::string XmlWriter::GetString() const {
         return stringStream->str();
     }
     return settings_.Conformance == ConformanceLevel::Fragment
-        ? fragmentRoot_->InnerXml(settings_)
+        ? EnsureFragmentRoot()->InnerXml(settings_)
         : document_.ToString(settings_);
 }
 
@@ -1077,7 +1669,7 @@ void XmlWriter::Save(std::ostream& stream) const {
         return;
     }
     if (settings_.Conformance == ConformanceLevel::Fragment) {
-        WriteToStream(*fragmentRoot_, stream, settings_);
+        WriteToStream(*EnsureFragmentRoot(), stream, settings_);
         return;
     }
     WriteToStream(document_, stream, settings_);

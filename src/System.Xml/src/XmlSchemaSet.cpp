@@ -2,7 +2,7 @@
 
 namespace System::Xml {
 
-void XmlSchemaSet::AddXml(const std::string& xml) {
+void XmlSchemaSet::AddXml(std::string_view xml) {
     static const std::string kSchemaNamespace = "http://www.w3.org/2001/XMLSchema";
 
     const auto document = XmlDocument::Parse(xml);
@@ -4305,100 +4305,100 @@ bool XmlSchemaSet::HasIdentityConstraints() const noexcept {
     return !identityConstraints_.empty();
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindSchemaAnnotation(const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindSchemaAnnotation(std::string_view namespaceUri) const {
     return FindStoredSchemaAnnotation(namespaceUri);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindElementAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindElementAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto* rule = FindElementRule(localName, namespaceUri);
     return rule == nullptr ? nullptr : std::addressof(rule->annotation);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindSimpleTypeAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindSimpleTypeAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto* rule = FindSimpleTypeRule(localName, namespaceUri);
     return rule == nullptr ? nullptr : std::addressof(rule->annotation);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindComplexTypeAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindComplexTypeAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto* rule = FindComplexTypeRule(localName, namespaceUri);
     return rule == nullptr ? nullptr : std::addressof(rule->annotation);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindAttributeAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindAttributeAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto* rule = FindAttributeRule(localName, namespaceUri);
     return rule == nullptr ? nullptr : std::addressof(rule->annotation);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     return FindStoredGroupAnnotation(localName, namespaceUri);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindAttributeGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindAttributeGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     return FindStoredAttributeGroupAnnotation(localName, namespaceUri);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindIdentityConstraintAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindIdentityConstraintAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto* constraint = FindIdentityConstraint(localName, namespaceUri);
     return constraint == nullptr ? nullptr : std::addressof(constraint->annotation);
 }
 
-const XmlSchemaSet::ElementRule* XmlSchemaSet::FindElementRule(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::ElementRule* XmlSchemaSet::FindElementRule(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(elements_.begin(), elements_.end(), [&](const auto& rule) {
         return rule.name == localName && rule.namespaceUri == namespaceUri;
     });
     return found == elements_.end() ? nullptr : std::addressof(*found);
 }
 
-const XmlSchemaSet::SimpleTypeRule* XmlSchemaSet::FindSimpleTypeRule(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::SimpleTypeRule* XmlSchemaSet::FindSimpleTypeRule(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(simpleTypes_.begin(), simpleTypes_.end(), [&](const auto& rule) {
         return rule.name == localName && rule.namespaceUri == namespaceUri;
     });
     return found == simpleTypes_.end() ? nullptr : std::addressof(found->rule);
 }
 
-const XmlSchemaSet::ComplexTypeRule* XmlSchemaSet::FindComplexTypeRule(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::ComplexTypeRule* XmlSchemaSet::FindComplexTypeRule(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(complexTypes_.begin(), complexTypes_.end(), [&](const auto& rule) {
         return rule.name == localName && rule.namespaceUri == namespaceUri;
     });
     return found == complexTypes_.end() ? nullptr : std::addressof(found->rule);
 }
 
-const XmlSchemaSet::AttributeUse* XmlSchemaSet::FindAttributeRule(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::AttributeUse* XmlSchemaSet::FindAttributeRule(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& rule) {
         return rule.name == localName && rule.namespaceUri == namespaceUri;
     });
     return found == attributes_.end() ? nullptr : std::addressof(found->rule);
 }
 
-const XmlSchemaSet::Particle* XmlSchemaSet::FindGroupRule(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Particle* XmlSchemaSet::FindGroupRule(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(groupRules_.begin(), groupRules_.end(), [&](const auto& rule) {
         return rule.name == localName && rule.namespaceUri == namespaceUri;
     });
     return found == groupRules_.end() ? nullptr : std::addressof(found->rule);
 }
 
-const XmlSchemaSet::AttributeGroupRule* XmlSchemaSet::FindAttributeGroupRule(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::AttributeGroupRule* XmlSchemaSet::FindAttributeGroupRule(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(attributeGroupRules_.begin(), attributeGroupRules_.end(), [&](const auto& rule) {
         return rule.name == localName && rule.namespaceUri == namespaceUri;
     });
     return found == attributeGroupRules_.end() ? nullptr : std::addressof(found->rule);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredSchemaAnnotation(const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredSchemaAnnotation(std::string_view namespaceUri) const {
     const auto found = std::find_if(schemaAnnotations_.begin(), schemaAnnotations_.end(), [&](const auto& annotation) {
         return annotation.namespaceUri == namespaceUri;
     });
     return found == schemaAnnotations_.end() ? nullptr : std::addressof(found->annotation);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(groups_.begin(), groups_.end(), [&](const auto& annotation) {
         return annotation.name == localName && annotation.namespaceUri == namespaceUri;
     });
     return found == groups_.end() ? nullptr : std::addressof(found->annotation);
 }
 
-const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredAttributeGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const {
+const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredAttributeGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const {
     const auto found = std::find_if(attributeGroups_.begin(), attributeGroups_.end(), [&](const auto& annotation) {
         return annotation.name == localName && annotation.namespaceUri == namespaceUri;
     });
@@ -4406,8 +4406,8 @@ const XmlSchemaSet::Annotation* XmlSchemaSet::FindStoredAttributeGroupAnnotation
 }
 
 const XmlSchemaSet::ElementRule::IdentityConstraint* XmlSchemaSet::FindIdentityConstraint(
-    const std::string& localName,
-    const std::string& namespaceUri) const {
+    std::string_view localName,
+    std::string_view namespaceUri) const {
     const auto found = std::find_if(identityConstraints_.begin(), identityConstraints_.end(), [&](const auto& constraint) {
         return constraint.name == localName && constraint.namespaceUri == namespaceUri;
     });

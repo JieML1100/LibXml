@@ -1,4 +1,4 @@
-#include "XmlInternal.h"
+#include "XmlNamespaceManager.h"
 
 namespace System::Xml {
 
@@ -21,11 +21,11 @@ bool XmlNamespaceManager::PopScope() {
     return true;
 }
 
-void XmlNamespaceManager::AddNamespace(const std::string& prefix, const std::string& uri) {
-    scopes_.back()[prefix] = uri;
+void XmlNamespaceManager::AddNamespace(std::string_view prefix, std::string_view uri) {
+    scopes_.back()[std::string(prefix)] = std::string(uri);
 }
 
-std::string XmlNamespaceManager::LookupNamespace(const std::string& prefix) const {
+std::string XmlNamespaceManager::LookupNamespace(std::string_view prefix) const {
     if (prefix == "xml") {
         return "http://www.w3.org/XML/1998/namespace";
     }
@@ -33,8 +33,9 @@ std::string XmlNamespaceManager::LookupNamespace(const std::string& prefix) cons
         return "http://www.w3.org/2000/xmlns/";
     }
 
+    const std::string prefixStr(prefix);
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-        const auto found = it->find(prefix);
+        const auto found = it->find(prefixStr);
         if (found != it->end()) {
             return found->second;
         }
@@ -43,7 +44,7 @@ std::string XmlNamespaceManager::LookupNamespace(const std::string& prefix) cons
     return {};
 }
 
-std::string XmlNamespaceManager::LookupPrefix(const std::string& uri) const {
+std::string XmlNamespaceManager::LookupPrefix(std::string_view uri) const {
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
         const auto found = std::find_if(it->begin(), it->end(), [&uri](const auto& pair) {
             return pair.second == uri;
@@ -56,7 +57,7 @@ std::string XmlNamespaceManager::LookupPrefix(const std::string& uri) const {
     return {};
 }
 
-bool XmlNamespaceManager::HasNamespace(const std::string& prefix) const {
+bool XmlNamespaceManager::HasNamespace(std::string_view prefix) const {
     return !LookupNamespace(prefix).empty();
 }
 

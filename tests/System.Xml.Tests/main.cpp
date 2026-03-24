@@ -5,9 +5,13 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace System::Xml;
 
@@ -25,14 +29,351 @@ void Assert(bool condition, const std::string& message) {
 
 class TestResolver final : public XmlResolver {
 public:
-    std::string ResolveUri(const std::string& baseUri, const std::string& relativeUri) const override {
+    std::string ResolveUri(std::string_view baseUri, std::string_view relativeUri) const override {
         return XmlUrlResolver().ResolveUri(baseUri, relativeUri);
     }
 
-    std::string GetEntity(const std::string& absoluteUri) const override {
+    std::string GetEntity(std::string_view absoluteUri) const override {
         return XmlUrlResolver().GetEntity(absoluteUri);
     }
 };
+
+struct XmlConfCase {
+    std::string id;
+    std::string type;
+    std::string entities;
+    std::string version;
+    std::string xmlNamespaceMode;
+    std::filesystem::path inputPath;
+    std::filesystem::path outputPath;
+};
+
+struct XmlConfRunOptions {
+    std::filesystem::path manifestPath;
+    std::size_t limit = 0;
+    std::string typeFilter;
+};
+
+struct XmlConfRunSummary {
+    std::size_t discovered = 0;
+    std::size_t executed = 0;
+    std::size_t passed = 0;
+    std::size_t failed = 0;
+    std::size_t skippedUnsupportedType = 0;
+    std::size_t skippedUnsupportedVersion = 0;
+    std::size_t skippedUnsupportedNamespaceMode = 0;
+    std::size_t skippedUnsupportedOutput = 0;
+    std::size_t skippedMissingFile = 0;
+};
+
+bool XmlConfTokenListContains(const std::string& tokenList, std::string_view target) {
+    std::istringstream stream(tokenList);
+    std::string token;
+    while (stream >> token) {
+        if (token == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::filesystem::path ResolveXmlConfPath(const std::filesystem::path& basePath, const std::string& relativePath) {
+    const std::filesystem::path candidate(relativePath);
+    if (candidate.is_absolute()) {
+        return candidate.lexically_normal();
+    }
+    return (basePath / candidate).lexically_normal();
+}
+
+std::string ReadXmlConfFileText(const std::filesystem::path& manifestPath) {
+    std::ifstream stream(manifestPath, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("Unable to open xmlconf manifest: " + manifestPath.string());
+    }
+
+    return std::string((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+}
+
+std::string StripLeadingXmlDeclaration(std::string content) {
+    const std::regex declarationPattern(R"(^\s*<\?xml[^?]*\?>)");
+    return std::regex_replace(content, declarationPattern, std::string{}, std::regex_constants::format_first_only);
+}
+
+std::unordered_map<std::string, std::filesystem::path> LoadXmlConfEntityManifestMap(
+    const std::filesystem::path& manifestPath, const std::string& content) {
+    const std::regex entityPattern(R"(<!ENTITY\s+([A-Za-z_][A-Za-z0-9._:-]*)\s+SYSTEM\s+["']([^"']+)["']\s*>)");
+
+    std::unordered_map<std::string, std::filesystem::path> entityManifestMap;
+    for (std::sregex_iterator iterator(content.begin(), content.end(), entityPattern), end; iterator != end; ++iterator) {
+        entityManifestMap.emplace((*iterator)[1].str(), ResolveXmlConfPath(manifestPath.parent_path(), (*iterator)[2].str()));
+    }
+
+    return entityManifestMap;
+}
+
+void AppendXmlConfCases(const std::filesystem::path& manifestPath, std::vector<XmlConfCase>& cases,
+    std::unordered_set<std::string>& visitedManifests) {
+    const std::string normalizedManifestPath = manifestPath.lexically_normal().string();
+    if (!visitedManifests.insert(normalizedManifestPath).second) {
+        return;
+    }
+    const std::string manifestContent = ReadXmlConfFileText(manifestPath);
+    const auto entityManifestMap = LoadXmlConfEntityManifestMap(manifestPath, manifestContent);
+
+    auto parseManifest = [&](ConformanceLevel conformance, std::vector<XmlConfCase>& directCases,
+                             std::vector<std::filesystem::path>& nestedManifests) {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>();
+        settings.Conformance = conformance;
+
+        auto reader = conformance == ConformanceLevel::Fragment
+            ? XmlReader::Create(StripLeadingXmlDeclaration(manifestContent), settings)
+            : XmlReader::CreateFromFile(manifestPath.string(), settings);
+        std::vector<std::filesystem::path> baseStack{manifestPath.parent_path()};
+        std::vector<int> testcaseDepths;
+
+        while (reader.Read()) {
+            if (reader.NodeType() == XmlNodeType::Element && reader.Name() == "TESTCASES") {
+                const std::string xmlBase = reader.GetAttribute("xml:base");
+                const std::filesystem::path resolvedBase = xmlBase.empty()
+                    ? baseStack.back()
+                    : ResolveXmlConfPath(baseStack.back(), xmlBase);
+                baseStack.push_back(resolvedBase);
+                testcaseDepths.push_back(reader.Depth());
+                continue;
+            }
+
+            if (reader.NodeType() == XmlNodeType::EndElement && reader.Name() == "TESTCASES") {
+                if (!testcaseDepths.empty() && testcaseDepths.back() == reader.Depth()) {
+                    testcaseDepths.pop_back();
+                    if (baseStack.size() > 1) {
+                        baseStack.pop_back();
+                    }
+                }
+                continue;
+            }
+
+            if (reader.NodeType() == XmlNodeType::EntityReference && !testcaseDepths.empty()) {
+                const auto entityIt = entityManifestMap.find(reader.Name());
+                if (entityIt != entityManifestMap.end()) {
+                    nestedManifests.push_back(entityIt->second);
+                }
+                continue;
+            }
+
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "TEST") {
+                continue;
+            }
+
+            const std::string uri = reader.GetAttribute("URI");
+            if (uri.empty()) {
+                continue;
+            }
+
+            XmlConfCase testCase;
+            testCase.id = reader.GetAttribute("ID");
+            testCase.type = reader.GetAttribute("TYPE");
+            testCase.entities = reader.GetAttribute("ENTITIES");
+            testCase.version = reader.GetAttribute("VERSION");
+            testCase.xmlNamespaceMode = reader.GetAttribute("NAMESPACE");
+            testCase.inputPath = ResolveXmlConfPath(baseStack.back(), uri);
+
+            const std::string output = reader.GetAttribute("OUTPUT");
+            if (!output.empty()) {
+                testCase.outputPath = ResolveXmlConfPath(baseStack.back(), output);
+            }
+
+            directCases.push_back(std::move(testCase));
+        }
+    };
+
+    std::vector<XmlConfCase> directCases;
+    std::vector<std::filesystem::path> nestedManifests;
+
+    try {
+        parseManifest(ConformanceLevel::Document, directCases, nestedManifests);
+    } catch (const std::exception& exception) {
+        const std::string message = exception.what();
+        if (message.find("Unexpected content after the root element") == std::string::npos) {
+            throw;
+        }
+
+        directCases.clear();
+        nestedManifests.clear();
+        parseManifest(ConformanceLevel::Fragment, directCases, nestedManifests);
+    }
+
+    cases.insert(cases.end(), directCases.begin(), directCases.end());
+    for (const auto& nestedManifest : nestedManifests) {
+        AppendXmlConfCases(nestedManifest, cases, visitedManifests);
+    }
+
+}
+
+std::vector<XmlConfCase> LoadXmlConfCases(const std::filesystem::path& manifestPath) {
+    std::vector<XmlConfCase> cases;
+    std::unordered_set<std::string> visitedManifests;
+    AppendXmlConfCases(manifestPath, cases, visitedManifests);
+
+    return cases;
+}
+
+bool TryRunXmlConfCase(const XmlConfCase& testCase, std::string& failureDetail) {
+    XmlReaderSettings settings;
+    settings.Resolver = std::make_shared<TestResolver>();
+
+    try {
+        auto reader = XmlReader::CreateFromFile(testCase.inputPath.string(), settings);
+        while (reader.Read()) {
+        }
+
+        if (testCase.type == "valid") {
+            return true;
+        }
+
+        failureDetail = testCase.id + " expected not-wf but parsed successfully: " + testCase.inputPath.string();
+        return false;
+    } catch (const std::exception& exception) {
+        if (testCase.type == "not-wf") {
+            return true;
+        }
+
+        failureDetail = testCase.id + " expected valid but threw '" + exception.what() + "': " + testCase.inputPath.string();
+        return false;
+    }
+}
+
+int RunXmlConfTests(const XmlConfRunOptions& options) {
+    const auto testCases = LoadXmlConfCases(options.manifestPath);
+
+    XmlConfRunSummary summary;
+    summary.discovered = testCases.size();
+    std::vector<std::string> failures;
+
+    for (const auto& testCase : testCases) {
+        if (!options.typeFilter.empty() && testCase.type != options.typeFilter) {
+            continue;
+        }
+
+        if (testCase.type != "valid" && testCase.type != "not-wf") {
+            ++summary.skippedUnsupportedType;
+            continue;
+        }
+
+        if (!testCase.version.empty() && !XmlConfTokenListContains(testCase.version, "1.0")) {
+            ++summary.skippedUnsupportedVersion;
+            continue;
+        }
+
+        if (!testCase.xmlNamespaceMode.empty() && testCase.xmlNamespaceMode == "no") {
+            ++summary.skippedUnsupportedNamespaceMode;
+            continue;
+        }
+
+        if (!testCase.outputPath.empty()) {
+            ++summary.skippedUnsupportedOutput;
+            continue;
+        }
+
+        if (!std::filesystem::exists(testCase.inputPath)) {
+            ++summary.skippedMissingFile;
+            continue;
+        }
+
+        if (options.limit != 0 && summary.executed >= options.limit) {
+            break;
+        }
+
+        ++summary.executed;
+        std::string failureDetail;
+        if (TryRunXmlConfCase(testCase, failureDetail)) {
+            ++summary.passed;
+        } else {
+            ++summary.failed;
+            failures.push_back(std::move(failureDetail));
+        }
+    }
+
+    std::cout << "xmlconf manifest: " << options.manifestPath.string() << std::endl;
+    std::cout << "  discovered=" << summary.discovered
+              << ", executed=" << summary.executed
+              << ", passed=" << summary.passed
+              << ", failed=" << summary.failed << std::endl;
+    std::cout << "  skipped: unsupported-type=" << summary.skippedUnsupportedType
+              << ", unsupported-version=" << summary.skippedUnsupportedVersion
+              << ", namespace-mode=" << summary.skippedUnsupportedNamespaceMode
+              << ", output-compare=" << summary.skippedUnsupportedOutput
+              << ", missing-file=" << summary.skippedMissingFile << std::endl;
+
+    for (std::size_t index = 0; index < failures.size() && index < 20; ++index) {
+        std::cout << "  failure[" << index << "]: " << failures[index] << std::endl;
+    }
+
+    if (summary.failed != 0) {
+        throw std::runtime_error("xmlconf run found " + std::to_string(summary.failed) + " failing supported cases");
+    }
+
+    if (summary.executed == 0) {
+        throw std::runtime_error("xmlconf run did not find any supported test cases to execute");
+    }
+
+    return 0;
+}
+
+bool TryParseXmlConfOptions(int argc, char** argv, XmlConfRunOptions& options, std::string& errorMessage) {
+    bool xmlconfMode = false;
+
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        if (argument == "--xmlconf") {
+            if (index + 1 >= argc) {
+                errorMessage = "--xmlconf requires a manifest path";
+                return false;
+            }
+
+            options.manifestPath = argv[++index];
+            xmlconfMode = true;
+            continue;
+        }
+
+        if (argument == "--limit") {
+            if (index + 1 >= argc) {
+                errorMessage = "--limit requires a numeric value";
+                return false;
+            }
+
+            options.limit = static_cast<std::size_t>(std::stoull(argv[++index]));
+            continue;
+        }
+
+        if (argument == "--type") {
+            if (index + 1 >= argc) {
+                errorMessage = "--type requires a value";
+                return false;
+            }
+
+            options.typeFilter = argv[++index];
+            continue;
+        }
+    }
+
+    if (!xmlconfMode) {
+        return false;
+    }
+
+    if (options.manifestPath.empty()) {
+        errorMessage = "--xmlconf requires a manifest path";
+        return false;
+    }
+
+    options.manifestPath = std::filesystem::absolute(options.manifestPath).lexically_normal();
+    if (!std::filesystem::exists(options.manifestPath)) {
+        errorMessage = "xmlconf manifest does not exist: " + options.manifestPath.string();
+        return false;
+    }
+
+    return true;
+}
 
 class NonSeekableStringStreamBuf final : public std::streambuf {
 public:
@@ -443,6 +784,17 @@ void TestParseDocument() {
     const auto mixedValue = std::static_pointer_cast<XmlElement>(mixed->DocumentElement()->SelectSingleNode("value"));
     Assert(mixedValue != nullptr && mixedValue->InnerText() == "A&BC",
         "DOM parser should preserve decoded mixed entity text semantics");
+
+    const auto stylesheetDocument = XmlDocument::Parse(
+        "<?xml version=\"1.0\"?>"
+        "<?xml-stylesheet href=\"xmlconf.xml\" type=\"text/xsl\"?>"
+        "<root/>");
+    Assert(stylesheetDocument->ChildNodes().size() == 3,
+        "DOM parser should keep xml-stylesheet as a document-level processing instruction");
+    Assert(stylesheetDocument->ChildNodes()[1]->NodeType() == XmlNodeType::ProcessingInstruction,
+        "xml-stylesheet should not be misclassified as an XML declaration");
+    Assert(stylesheetDocument->ChildNodes()[1]->Name() == "xml-stylesheet",
+        "xml-stylesheet processing instruction name mismatch");
 }
 
 void TestDocumentTypeDeclarations() {
@@ -545,8 +897,8 @@ void TestDocumentTypeBoundaries() {
 
 void TestInvalidDtdInputs() {
     // DTD support boundary: PUBLIC/SYSTEM DOCTYPE headers plus ENTITY/NOTATION declarations are supported;
-    // ELEMENT/ATTLIST declarations are accepted and preserved in InternalSubset, while parameter entities
-    // and conditional sections remain explicitly unsupported.
+    // ELEMENT/ATTLIST declarations, parameter entity declarations, and conditional sections are accepted
+    // and preserved in InternalSubset; ENTITY/NOTATION extraction should continue to work around them.
     auto expectXmlExceptionContaining = [](const std::string& xml, const std::string& expectedMessage, const std::string& label) {
         bool threw = false;
         try {
@@ -584,15 +936,38 @@ void TestInvalidDtdInputs() {
             "Accepted ELEMENT/ATTLIST declarations should not interfere with document parsing");
     }
 
-    expectXmlExceptionContaining(
-        "<!DOCTYPE root [<!ENTITY % pe 'value'>]><root/>",
-        "Unsupported DTD declaration: parameter entity",
-        "Unsupported parameter entity declarations should report a stable XmlException");
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ENTITY % pe 'value'><!ENTITY label 'ok'>]><root/>");
+        Assert(document->DocumentType() != nullptr,
+            "Parameter entity declarations should be accepted inside the DOCTYPE subset");
+        Assert(document->DocumentType()->InternalSubset().find("<!ENTITY % pe 'value'>") != std::string::npos,
+            "Accepted parameter entity declarations should remain preserved in the internal subset");
+        Assert(document->DocumentType()->Entities().GetNamedItem("label") != nullptr,
+            "Accepting parameter entity declarations should not break general ENTITY declaration parsing");
+    }
 
-    expectXmlExceptionContaining(
-        "<!DOCTYPE root [<![IGNORE[<!ENTITY author 'value'>]]>]><root/>",
-        "Unsupported DTD declaration: conditional section",
-        "Unsupported conditional sections should report a stable XmlException");
+    {
+        const auto ignoreDocument = XmlDocument::Parse(
+            "<!DOCTYPE root [<![IGNORE[<!ENTITY author 'value'>]]><!ENTITY label 'ok'>]><root/>");
+        Assert(ignoreDocument->DocumentType() != nullptr,
+            "IGNORE conditional sections should be accepted inside the DOCTYPE subset");
+        Assert(ignoreDocument->DocumentType()->InternalSubset().find("<![IGNORE[<!ENTITY author 'value'>]]>") != std::string::npos,
+            "Accepted IGNORE conditional sections should remain preserved in the internal subset");
+        Assert(ignoreDocument->DocumentType()->Entities().GetNamedItem("author") == nullptr,
+            "IGNORE conditional sections should not expose skipped ENTITY declarations");
+        Assert(ignoreDocument->DocumentType()->Entities().GetNamedItem("label") != nullptr,
+            "Accepting IGNORE conditional sections should not break following ENTITY declaration parsing");
+
+        const auto includeDocument = XmlDocument::Parse(
+            "<!DOCTYPE root [<![INCLUDE[<!ENTITY author 'value'>]]>]><root>&author;</root>");
+        Assert(includeDocument->DocumentType() != nullptr,
+            "INCLUDE conditional sections should be accepted inside the DOCTYPE subset");
+        Assert(includeDocument->DocumentType()->InternalSubset().find("<![INCLUDE[<!ENTITY author 'value'>]]>") != std::string::npos,
+            "Accepted INCLUDE conditional sections should remain preserved in the internal subset");
+        Assert(includeDocument->DocumentType()->Entities().GetNamedItem("author") != nullptr,
+            "INCLUDE conditional sections should still expose enclosed ENTITY declarations");
+    }
 
     expectXmlExceptionContaining(
         "<!DOCTYPE root [<!ENTITY author SYSTEM>]><root/>",
@@ -9908,7 +10283,7 @@ void TestXmlSchemaIdentityConstraints() {
     Assert(threw, "Schema validation should support descendant wildcard identity constraint selectors");
 
     const std::string predicateSelectorSchemaXml =
-        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-selector\" targetNamespace=\"urn:identity-fallback-selector\">"
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-predicate-selector\" targetNamespace=\"urn:identity-predicate-selector\">"
         "  <xs:element name=\"catalog\">"
         "    <xs:complexType>"
         "      <xs:sequence>"
@@ -9942,7 +10317,7 @@ void TestXmlSchemaIdentityConstraints() {
     predicateSelectorSchemas.AddXml(predicateSelectorSchemaXml);
 
     const auto predicateSelectorValid = XmlDocument::Parse(
-        "<catalog xmlns=\"urn:identity-fallback-selector\">"
+        "<catalog xmlns=\"urn:identity-predicate-selector\">"
         "  <section kind=\"primary\">"
         "    <book id=\"b1\"/>"
         "    <reference bookId=\"b1\"/>"
@@ -9957,7 +10332,7 @@ void TestXmlSchemaIdentityConstraints() {
     threw = false;
     try {
         const auto predicateSelectorInvalid = XmlDocument::Parse(
-            "<catalog xmlns=\"urn:identity-fallback-selector\">"
+            "<catalog xmlns=\"urn:identity-predicate-selector\">"
             "  <section kind=\"primary\">"
             "    <book id=\"b1\"/>"
             "    <reference bookId=\"missing\"/>"
@@ -9975,7 +10350,7 @@ void TestXmlSchemaIdentityConstraints() {
     Assert(threw, "Schema validation should support predicate selector identity constraints");
 
     const std::string predicateFieldSchemaXml =
-        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-field\" targetNamespace=\"urn:identity-fallback-field\">"
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-predicate-field\" targetNamespace=\"urn:identity-predicate-field\">"
         "  <xs:element name=\"catalog\">"
         "    <xs:complexType>"
         "      <xs:sequence>"
@@ -10017,7 +10392,7 @@ void TestXmlSchemaIdentityConstraints() {
     predicateFieldSchemas.AddXml(predicateFieldSchemaXml);
 
     const auto predicateFieldValid = XmlDocument::Parse(
-        "<catalog xmlns=\"urn:identity-fallback-field\">"
+        "<catalog xmlns=\"urn:identity-predicate-field\">"
         "  <section>"
         "    <book>"
         "      <meta kind=\"alternate\" id=\"ignored\"/>"
@@ -10031,7 +10406,7 @@ void TestXmlSchemaIdentityConstraints() {
     threw = false;
     try {
         const auto predicateFieldInvalid = XmlDocument::Parse(
-            "<catalog xmlns=\"urn:identity-fallback-field\">"
+            "<catalog xmlns=\"urn:identity-predicate-field\">"
             "  <section>"
             "    <book>"
             "      <meta kind=\"alternate\" id=\"ignored\"/>"
@@ -10293,7 +10668,7 @@ void TestXmlSchemaIdentityConstraints() {
     Assert(threw, "Schema validation should fall back to DOM XPath for positional selector identity constraints");
 
     const std::string axisFieldSchemaXml =
-        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-axis-field\" targetNamespace=\"urn:identity-fallback-axis-field\">"
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-axis-field\" targetNamespace=\"urn:identity-axis-field\">"
         "  <xs:element name=\"catalog\">"
         "    <xs:complexType>"
         "      <xs:sequence>"
@@ -10326,7 +10701,7 @@ void TestXmlSchemaIdentityConstraints() {
     axisFieldSchemas.AddXml(axisFieldSchemaXml);
 
     const auto axisFieldValid = XmlDocument::Parse(
-        "<catalog xmlns=\"urn:identity-fallback-axis-field\">"
+        "<catalog xmlns=\"urn:identity-axis-field\">"
         "  <section>"
         "    <book token=\"b1\"/>"
         "    <reference tokenRef=\"b1\"/>"
@@ -10337,7 +10712,7 @@ void TestXmlSchemaIdentityConstraints() {
     threw = false;
     try {
         const auto axisFieldInvalid = XmlDocument::Parse(
-            "<catalog xmlns=\"urn:identity-fallback-axis-field\">"
+            "<catalog xmlns=\"urn:identity-axis-field\">"
             "  <section>"
             "    <book token=\"b1\"/>"
             "    <reference tokenRef=\"missing\"/>"
@@ -10351,7 +10726,7 @@ void TestXmlSchemaIdentityConstraints() {
     Assert(threw, "Schema validation should support axis-based field identity constraints");
 
     const std::string ancestorFieldSchemaXml =
-        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-fallback-ancestor-field\" targetNamespace=\"urn:identity-fallback-ancestor-field\">"
+        "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:identity-ancestor-axis-field\" targetNamespace=\"urn:identity-ancestor-axis-field\">"
         "  <xs:element name=\"catalog\">"
         "    <xs:complexType>"
         "      <xs:sequence>"
@@ -10391,7 +10766,7 @@ void TestXmlSchemaIdentityConstraints() {
     ancestorFieldSchemas.AddXml(ancestorFieldSchemaXml);
 
     const auto ancestorFieldValid = XmlDocument::Parse(
-        "<catalog xmlns=\"urn:identity-fallback-ancestor-field\">"
+        "<catalog xmlns=\"urn:identity-ancestor-axis-field\">"
         "  <section>"
         "    <book token=\"b1\">"
         "      <meta marker=\"first\"/>"
@@ -10404,7 +10779,7 @@ void TestXmlSchemaIdentityConstraints() {
     threw = false;
     try {
         const auto ancestorFieldInvalid = XmlDocument::Parse(
-            "<catalog xmlns=\"urn:identity-fallback-ancestor-field\">"
+            "<catalog xmlns=\"urn:identity-ancestor-axis-field\">"
             "  <section>"
             "    <book token=\"b1\">"
             "      <meta marker=\"first\"/>"
@@ -12866,6 +13241,26 @@ void TestXmlExceptionLineInfo() {
 
     AssertXmlExceptionDetails(
         [] {
+            (void)XmlDocument::Parse("<doc><!-- a comment -- another --></doc>");
+        },
+        "Comment may not contain '--'",
+        1,
+        21,
+        "XmlDocument should reject comments that contain embedded double hyphens");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<doc><!-- a comment -- another --></doc>");
+            while (reader.Read()) {
+            }
+        },
+        "Comment may not contain '--'",
+        1,
+        21,
+        "XmlReader should reject comments that contain embedded double hyphens with the same location");
+
+    AssertXmlExceptionDetails(
+        [] {
             (void)XmlDocument::Parse("<root><![CDATA[");
         },
         "Unterminated CDATA section",
@@ -13003,6 +13398,95 @@ void TestXmlExceptionLineInfo() {
         1,
         13,
         "XmlReader should report exact location for missing quoted attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<doc a1=\"A & B\"></doc>");
+        },
+        "Unterminated entity reference",
+        1,
+        16,
+        "XmlDocument should reject unterminated entity references inside attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<doc a1=\"A & B\"></doc>");
+            while (reader.Read()) {
+            }
+        },
+        "Unterminated entity reference",
+        1,
+        16,
+        "XmlReader should reject unterminated entity references inside attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<doc a1=\"<foo>\"></doc>");
+        },
+        "'<' is not allowed in attribute values",
+        1,
+        10,
+        "XmlDocument should reject raw '<' characters inside attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<doc a1=\"<foo>\"></doc>");
+            while (reader.Read()) {
+            }
+        },
+        "'<' is not allowed in attribute values",
+        1,
+        10,
+        "XmlReader should reject raw '<' characters inside attribute values");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<doc>]]></doc>");
+        },
+        "']]>' is not allowed in text content",
+        1,
+        6,
+        "XmlDocument should reject raw ]]> sequences in text content");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<doc>]]></doc>");
+            while (reader.Read()) {
+            }
+        },
+        "']]>' is not allowed in text content",
+        1,
+        6,
+        "XmlReader should reject raw ]]> sequences in text content");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<doc>]]]></doc>");
+        },
+        "']]>' is not allowed in text content",
+        1,
+        7,
+        "XmlDocument should reject shifted raw ]]> sequences in text content");
+
+    AssertXmlExceptionDetails(
+        [] {
+            XmlReader reader = XmlReader::Create("<doc>]]]></doc>");
+            while (reader.Read()) {
+            }
+        },
+        "']]>' is not allowed in text content",
+        1,
+        7,
+        "XmlReader should reject shifted raw ]]> sequences in text content");
+
+    AssertXmlExceptionDetails(
+        [] {
+            (void)XmlDocument::Parse("<doc>\f</doc>");
+        },
+        "Invalid XML character",
+        1,
+        6,
+        "XmlDocument should reject invalid control characters in text content");
 
     AssertXmlExceptionDetails(
         [] {
@@ -13185,9 +13669,11 @@ void TestXPathSelection() {
     Assert(withAttribute.Count() == 3, "Attribute-existence predicates should filter matching elements");
 
     const auto relative = root->SelectNodes("group/item[2]");
-    Assert(relative.Count() == 1, "Relative XPath should honor positional predicates");
+    Assert(relative.Count() == 2, "Relative XPath should honor positional predicates");
     Assert(relative.Item(0) != nullptr && static_cast<XmlElement*>(relative.Item(0).get())->GetAttribute("id") == "2",
         "Relative XPath positional result mismatch");
+    Assert(relative.Item(1) != nullptr && static_cast<XmlElement*>(relative.Item(1).get())->GetAttribute("id") == "3",
+        "Relative XPath positional second result mismatch");
 
     const auto chained = root->SelectSingleNode("group/item[@id][2]");
     Assert(chained != nullptr && chained->NodeType() == XmlNodeType::Element,
@@ -13198,32 +13684,95 @@ void TestXPathSelection() {
     const auto lastItem = root->SelectSingleNode("group/item[last()]");
     Assert(lastItem != nullptr && lastItem->NodeType() == XmlNodeType::Element,
         "last() should select the last node in the current result set");
-    Assert(static_cast<XmlElement*>(lastItem.get())->GetAttribute("id") == "3",
+    Assert(static_cast<XmlElement*>(lastItem.get())->GetAttribute("id") == "2",
         "last() result mismatch");
+    const auto lastItems = root->SelectNodes("group/item[last()]");
+    Assert(lastItems.Count() == 2
+            && lastItems.Item(0) != nullptr
+            && static_cast<XmlElement*>(lastItems.Item(0).get())->GetAttribute("id") == "2"
+            && lastItems.Item(1) != nullptr
+            && static_cast<XmlElement*>(lastItems.Item(1).get())->GetAttribute("id") == "3",
+        "last() should be evaluated per input context node");
 
     const auto positioned = root->SelectSingleNode("group/item[position()=2]");
     Assert(positioned != nullptr && positioned->NodeType() == XmlNodeType::Element,
         "position()=n should select by 1-based result position");
     Assert(static_cast<XmlElement*>(positioned.get())->GetAttribute("id") == "2",
         "position() predicate result mismatch");
+    const auto positionedItems = root->SelectNodes("group/item[position()=2]");
+    Assert(positionedItems.Count() == 2
+            && positionedItems.Item(0) != nullptr
+            && static_cast<XmlElement*>(positionedItems.Item(0).get())->GetAttribute("id") == "2"
+            && positionedItems.Item(1) != nullptr
+            && static_cast<XmlElement*>(positionedItems.Item(1).get())->GetAttribute("id") == "3",
+        "position() should be evaluated independently for each parent context");
 
     const auto positionedRange = root->SelectNodes("group/item[position()>1]");
-    Assert(positionedRange.Count() == 3,
+    Assert(positionedRange.Count() == 2,
         "position() comparisons should support greater-than filters");
     Assert(positionedRange.Item(0) != nullptr && static_cast<XmlElement*>(positionedRange.Item(0).get())->GetAttribute("id") == "2",
         "position()>1 first result mismatch");
+    Assert(positionedRange.Item(1) != nullptr && static_cast<XmlElement*>(positionedRange.Item(1).get())->GetAttribute("id") == "3",
+        "position()>1 second result mismatch");
 
     const auto arithmeticPositionMatch = root->SelectSingleNode("group/item[position()+2=last()]");
-    Assert(arithmeticPositionMatch != nullptr && arithmeticPositionMatch->NodeType() == XmlNodeType::Element,
+    Assert(arithmeticPositionMatch == nullptr,
         "last() should participate in arithmetic comparisons");
-    Assert(static_cast<XmlElement*>(arithmeticPositionMatch.get())->GetAttribute("id") == "2",
-        "last()-1 arithmetic predicate result mismatch");
 
     const auto oddPositions = root->SelectNodes("group/item[position() mod 2 = 1]");
     Assert(oddPositions.Count() == 2,
         "position() should participate in modulo expressions");
     Assert(oddPositions.Item(0) != nullptr && static_cast<XmlElement*>(oddPositions.Item(0).get())->GetAttribute("id") == "1",
         "position() modulo first result mismatch");
+
+    const auto decimalPosition = root->SelectSingleNode("group/item[2.0]");
+    Assert(decimalPosition != nullptr && decimalPosition->NodeType() == XmlNodeType::Element,
+        "Numeric predicate literals should use XPath positional semantics even when written as decimals");
+    Assert(static_cast<XmlElement*>(decimalPosition.get())->GetAttribute("id") == "2",
+        "Decimal numeric predicate result mismatch");
+
+    const auto groupedNumericPosition = root->SelectSingleNode("group/item[(2)]");
+    Assert(groupedNumericPosition != nullptr && groupedNumericPosition->NodeType() == XmlNodeType::Element,
+        "Parenthesized numeric predicate literals should preserve XPath positional semantics");
+    Assert(static_cast<XmlElement*>(groupedNumericPosition.get())->GetAttribute("id") == "2",
+        "Parenthesized numeric predicate result mismatch");
+
+    const auto siblingCountPosition = root->SelectSingleNode("group/item[count(preceding-sibling::item)+1]");
+    Assert(siblingCountPosition != nullptr && siblingCountPosition->NodeType() == XmlNodeType::Element,
+        "Numeric predicate expressions should compare their result against the current XPath position");
+    Assert(static_cast<XmlElement*>(siblingCountPosition.get())->GetAttribute("id") == "1",
+        "Numeric predicate expression positional result mismatch");
+
+    const auto penultimateByNumber = root->SelectSingleNode("group/item[last()-1]");
+    Assert(penultimateByNumber != nullptr && penultimateByNumber->NodeType() == XmlNodeType::Element,
+        "Numeric arithmetic predicates should select the node whose position matches the computed number");
+    Assert(static_cast<XmlElement*>(penultimateByNumber.get())->GetAttribute("id") == "1",
+        "Numeric arithmetic predicate result mismatch");
+    const auto penultimateItems = root->SelectNodes("group/item[last()-1]");
+    Assert(penultimateItems.Count() == 2
+            && penultimateItems.Item(0) != nullptr
+            && static_cast<XmlElement*>(penultimateItems.Item(0).get())->GetAttribute("id") == "1"
+            && penultimateItems.Item(1) != nullptr
+            && static_cast<XmlElement*>(penultimateItems.Item(1).get())->GetAttribute("id").empty(),
+        "Numeric arithmetic positional predicates should be evaluated per input context node");
+
+    const auto groupedArithmeticPosition = root->SelectSingleNode("group/item[(position()+2)=last()]");
+    Assert(groupedArithmeticPosition == nullptr,
+        "Parenthesized predicate targets should support grouped arithmetic expressions");
+    const auto nearestPrecedingSiblings = root->SelectNodes("group/item/preceding-sibling::item[1]");
+    Assert(nearestPrecedingSiblings.Count() == 2
+            && nearestPrecedingSiblings.Item(0) != nullptr
+            && static_cast<XmlElement*>(nearestPrecedingSiblings.Item(0).get())->GetAttribute("id") == "1"
+            && nearestPrecedingSiblings.Item(1) != nullptr
+            && static_cast<XmlElement*>(nearestPrecedingSiblings.Item(1).get())->GetAttribute("id").empty(),
+        "Reverse-axis positional predicates should be evaluated per originating context node");
+    const auto nearestFollowingSiblings = root->SelectNodes("group/item/following-sibling::item[1]");
+    Assert(nearestFollowingSiblings.Count() == 2
+            && nearestFollowingSiblings.Item(0) != nullptr
+            && static_cast<XmlElement*>(nearestFollowingSiblings.Item(0).get())->GetAttribute("id") == "2"
+            && nearestFollowingSiblings.Item(1) != nullptr
+            && static_cast<XmlElement*>(nearestFollowingSiblings.Item(1).get())->GetAttribute("id") == "3",
+        "Forward-axis positional predicates should also be evaluated per originating context node");
 
     const auto attribute = document->SelectSingleNode("/root/@id");
     Assert(attribute != nullptr && attribute->NodeType() == XmlNodeType::Attribute,
@@ -13234,6 +13783,70 @@ void TestXPathSelection() {
     Assert(textNode != nullptr && textNode->NodeType() == XmlNodeType::Text,
         "text() should return text child nodes");
     Assert(textNode->Value() == "beta", "text() value mismatch");
+
+    const auto itemAttribute = document->SelectSingleNode("/root/group/item[@id='2']/@id");
+    Assert(itemAttribute != nullptr && itemAttribute->NodeType() == XmlNodeType::Attribute,
+        "Attribute selection should produce a reusable attribute node context");
+    const auto attributeSelf = itemAttribute->SelectSingleNode("self::node()");
+    Assert(attributeSelf != nullptr && attributeSelf.get() == itemAttribute.get(),
+        "XPath from an attribute node should preserve the attribute as the current context");
+    const auto attributeStringSelf = itemAttribute->SelectSingleNode("self::node()[string(.)='2']");
+    Assert(attributeStringSelf != nullptr && attributeStringSelf.get() == itemAttribute.get(),
+        "string(.) from an attribute context should use the attribute string-value");
+    const auto attributeParent = itemAttribute->SelectSingleNode("parent::item");
+    Assert(attributeParent != nullptr && attributeParent->NodeType() == XmlNodeType::Element,
+        "XPath from an attribute node should resolve parent:: against the owning element");
+    Assert(static_cast<XmlElement*>(attributeParent.get())->GetAttribute("id") == "2",
+        "Attribute-context parent:: result mismatch");
+    const auto attributeAncestor = itemAttribute->SelectSingleNode("ancestor::root");
+    Assert(attributeAncestor != nullptr && attributeAncestor->Name() == "root",
+        "XPath from an attribute node should resolve ancestor:: against element ancestors");
+    const auto attributeAncestorOrSelfElements = itemAttribute->SelectNodes("ancestor-or-self::*");
+    Assert(attributeAncestorOrSelfElements.Count() == 3
+            && attributeAncestorOrSelfElements.Item(0) != nullptr && attributeAncestorOrSelfElements.Item(0)->Name() == "root"
+            && attributeAncestorOrSelfElements.Item(1) != nullptr && attributeAncestorOrSelfElements.Item(1)->Name() == "group"
+            && attributeAncestorOrSelfElements.Item(2) != nullptr && attributeAncestorOrSelfElements.Item(2)->Name() == "item",
+        "XPath from an attribute node should exclude the attribute itself from ancestor-or-self::*");
+    const auto attributeAncestorOrSelfNodes = itemAttribute->SelectNodes("ancestor-or-self::node()");
+    Assert(attributeAncestorOrSelfNodes.Count() == 5
+            && attributeAncestorOrSelfNodes.Item(0) != nullptr && attributeAncestorOrSelfNodes.Item(0)->NodeType() == XmlNodeType::Document
+            && attributeAncestorOrSelfNodes.Item(1) != nullptr && attributeAncestorOrSelfNodes.Item(1)->Name() == "root"
+            && attributeAncestorOrSelfNodes.Item(2) != nullptr && attributeAncestorOrSelfNodes.Item(2)->Name() == "group"
+            && attributeAncestorOrSelfNodes.Item(3) != nullptr && attributeAncestorOrSelfNodes.Item(3)->Name() == "item"
+            && attributeAncestorOrSelfNodes.Item(4) != nullptr && attributeAncestorOrSelfNodes.Item(4)->NodeType() == XmlNodeType::Attribute,
+        "XPath from an attribute node should include the attribute in ancestor-or-self::node()");
+    Assert(itemAttribute->SelectNodes("child::node()").Count() == 0,
+        "XPath from an attribute node should expose an empty child::node() axis");
+    Assert(itemAttribute->SelectNodes("self::*").Count() == 0,
+        "XPath from an attribute node should not match self::*");
+
+    const auto textSelf = textNode->SelectSingleNode("self::node()");
+    Assert(textSelf != nullptr && textSelf.get() == textNode.get(),
+        "XPath from a text node should preserve the text node as the current context");
+    const auto textStringSelf = textNode->SelectSingleNode("self::node()[string(.)='beta']");
+    Assert(textStringSelf != nullptr && textStringSelf.get() == textNode.get(),
+        "string(.) from a text context should use the text node string-value");
+    const auto textParent = textNode->SelectSingleNode("parent::item");
+    Assert(textParent != nullptr && textParent->NodeType() == XmlNodeType::Element,
+        "XPath from a text node should resolve parent:: against the owning element");
+    Assert(static_cast<XmlElement*>(textParent.get())->GetAttribute("id") == "2",
+        "Text-context parent:: result mismatch");
+    Assert(textNode->SelectNodes("self::*").Count() == 0,
+        "XPath from a text node should not match self::*");
+    const auto textAncestorElements = textNode->SelectNodes("ancestor::*");
+    Assert(textAncestorElements.Count() == 3
+            && textAncestorElements.Item(0) != nullptr && textAncestorElements.Item(0)->Name() == "root"
+            && textAncestorElements.Item(1) != nullptr && textAncestorElements.Item(1)->Name() == "group"
+            && textAncestorElements.Item(2) != nullptr && textAncestorElements.Item(2)->Name() == "item",
+        "XPath from a text node should enumerate ancestor::* in document order");
+    const auto textAncestorOrSelfElements = textNode->SelectNodes("ancestor-or-self::*");
+    Assert(textAncestorOrSelfElements.Count() == 3
+            && textAncestorOrSelfElements.Item(0) != nullptr && textAncestorOrSelfElements.Item(0)->Name() == "root"
+            && textAncestorOrSelfElements.Item(1) != nullptr && textAncestorOrSelfElements.Item(1)->Name() == "group"
+            && textAncestorOrSelfElements.Item(2) != nullptr && textAncestorOrSelfElements.Item(2)->Name() == "item",
+        "XPath from a text node should exclude the text node itself from ancestor-or-self::*");
+    Assert(textNode->SelectNodes("child::node()").Count() == 0,
+        "XPath from a text node should expose an empty child::node() axis");
 
     const auto textFiltered = document->SelectSingleNode("//item[text()='beta']");
     Assert(textFiltered != nullptr && textFiltered->NodeType() == XmlNodeType::Element,
@@ -13322,6 +13935,10 @@ void TestXPathSelection() {
     Assert(numericCompared.Count() == 2,
         "XPath numeric comparisons and != should compose with existing predicates");
 
+    const auto groupedLengthMatch = document->SelectNodes("//item[(string-length(@id)) = 1]");
+    Assert(groupedLengthMatch.Count() == 3,
+        "Parenthesized function targets should participate in XPath comparisons");
+
     const auto countedRoot = document->SelectSingleNode("/root[count(group)=2 and count(group/item)=4]");
     Assert(countedRoot != nullptr && countedRoot->NodeType() == XmlNodeType::Element,
         "count() predicates should support counting child paths");
@@ -13341,6 +13958,41 @@ void TestXPathSelection() {
         "concat(), translate(), and string() should compose inside predicates");
     Assert(static_cast<XmlElement*>(functionTargetMatched.get())->GetAttribute("id") == "7",
         "concat()/translate()/string() predicate result mismatch");
+
+    const auto namedChildMatched = childTextDocument->SelectSingleNode(
+        "/root/item[name(title)='title' and local-name(title)='title' and title='Beta' and string-length(name(text()))=0]");
+    Assert(namedChildMatched != nullptr && namedChildMatched->NodeType() == XmlNodeType::Element,
+        "name()/local-name() should accept optional node-set arguments and nameless text nodes should coerce to empty names");
+    Assert(static_cast<XmlElement*>(namedChildMatched.get())->GetAttribute("id") == "7",
+        "name()/local-name() optional-argument predicate result mismatch");
+
+    const auto reverseAxisFunctionDocument = XmlDocument::Parse(
+        "<root xmlns:lib='urn:lib'>"
+        "  <lib:alpha>A</lib:alpha>"
+        "  <container><lib:beta>B</lib:beta></container>"
+        "  <tail/>"
+        "</root>");
+    const auto reverseAxisTail = reverseAxisFunctionDocument->SelectSingleNode("/root/tail");
+    Assert(reverseAxisTail != nullptr && reverseAxisTail->NodeType() == XmlNodeType::Element,
+        "Reverse-axis function test tail node missing");
+    Assert(reverseAxisTail->SelectSingleNode(
+               "self::tail[name(preceding::*)='lib:alpha' and local-name(preceding::*)='alpha' and namespace-uri(preceding::*)='urn:lib' and string(preceding::*)='A']")
+            != nullptr,
+        "name()/local-name()/namespace-uri()/string() should use the first node in document order for reverse-axis node-sets");
+
+    const auto reverseAxisNumericDocument = XmlDocument::Parse(
+        "<root>"
+        "  <value>10</value>"
+        "  <group><value>20</value></group>"
+        "  <tail/>"
+        "</root>");
+    const auto reverseAxisNumericTail = reverseAxisNumericDocument->SelectSingleNode("/root/tail");
+    Assert(reverseAxisNumericTail != nullptr && reverseAxisNumericTail->NodeType() == XmlNodeType::Element,
+        "Reverse-axis numeric test tail node missing");
+    Assert(reverseAxisNumericTail->SelectSingleNode(
+               "self::tail[number(preceding::value)=10 and number(preceding::value) + 5 = 15 and string(preceding::value)='10']")
+            != nullptr,
+        "number() and arithmetic on reverse-axis node-sets should use the first node in document order");
 
     const auto booleanTargetMatched = childTextDocument->SelectSingleNode(
         "/root/item[boolean(@id) and not(boolean(@missing))]");
@@ -13420,9 +14072,10 @@ void TestXPathNamespaces() {
     Assert(literalPrefixWildcard.Count() == 5,
         "Prefixed wildcard XPath without XmlNamespaceManager should only match nodes with the same literal prefix");
 
-    const auto filteredTitles = document->SelectNodes("//bk:book[@m:id]/bk:title[2]", namespaces);
-    Assert(filteredTitles.Count() == 1, "Namespace-aware chained predicates should be supported");
-    Assert(filteredTitles.Item(0) != nullptr && filteredTitles.Item(0)->InnerText() == "Two",
+    const auto filteredTitles = document->SelectNodes("//bk:book[@m:id]/bk:title[1]", namespaces);
+    Assert(filteredTitles.Count() == 2, "Namespace-aware chained predicates should be supported");
+    Assert(filteredTitles.Item(0) != nullptr && filteredTitles.Item(0)->InnerText() == "One"
+            && filteredTitles.Item(1) != nullptr && filteredTitles.Item(1)->InnerText() == "Two",
         "Namespace-aware chained predicate result mismatch");
 
     const auto lastTitle = document->SelectSingleNode("//bk:title[last()]", namespaces);
@@ -13476,6 +14129,20 @@ void TestXPathNamespaces() {
             && static_cast<XmlElement*>(namespaceArithmeticPosition.get())->GetAttributeNode("meta:id")->Value() == "b1",
         "Namespace-aware last()/position() arithmetic result mismatch");
 
+    const auto namespaceDecimalPosition = document->SelectSingleNode("/bk:catalog/bk:book[2.0]", namespaces);
+    Assert(namespaceDecimalPosition != nullptr && namespaceDecimalPosition->NodeType() == XmlNodeType::Element,
+        "Namespace-aware numeric predicate literals should keep XPath positional semantics");
+    Assert(static_cast<XmlElement*>(namespaceDecimalPosition.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(namespaceDecimalPosition.get())->GetAttributeNode("meta:id")->Value() == "b2",
+        "Namespace-aware decimal numeric predicate result mismatch");
+
+    const auto namespaceSiblingCountPosition = document->SelectSingleNode("/bk:catalog/bk:book[count(preceding-sibling::bk:book)+1]", namespaces);
+    Assert(namespaceSiblingCountPosition != nullptr && namespaceSiblingCountPosition->NodeType() == XmlNodeType::Element,
+        "Namespace-aware numeric predicate expressions should compare against the current position");
+    Assert(static_cast<XmlElement*>(namespaceSiblingCountPosition.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(namespaceSiblingCountPosition.get())->GetAttributeNode("meta:id")->Value() == "b1",
+        "Namespace-aware numeric predicate expression result mismatch");
+
     const auto attribute = document->SelectSingleNode("/bk:catalog/bk:book[1]/@m:id", namespaces);
     Assert(attribute != nullptr && attribute->NodeType() == XmlNodeType::Attribute,
         "Namespace-aware XPath should return prefixed attribute nodes");
@@ -13516,6 +14183,15 @@ void TestXPathNamespaces() {
         "name() and nested string-length(normalize-space()) predicates should be supported");
     Assert(nameMatch->InnerText() == "One",
         "name()/string-length(normalize-space()) predicate result mismatch");
+
+    const auto namedAttributeBook = document->SelectSingleNode(
+        "/bk:catalog/bk:book[name(@m:id)='meta:id' and local-name(@m:id)='id' and namespace-uri(@m:id)='urn:meta']",
+        namespaces);
+    Assert(namedAttributeBook != nullptr && namedAttributeBook->NodeType() == XmlNodeType::Element,
+        "name()/local-name()/namespace-uri() should accept namespace-qualified attribute node-set arguments");
+    Assert(static_cast<XmlElement*>(namedAttributeBook.get())->GetAttributeNode("meta:id") != nullptr
+            && static_cast<XmlElement*>(namedAttributeBook.get())->GetAttributeNode("meta:id")->Value() == "b1",
+        "Attribute name-function optional-argument result mismatch");
 
     const auto countedNamespaceBook = document->SelectSingleNode(
         "/bk:catalog[count(bk:book)=2 and count(*)=2]",
@@ -13617,9 +14293,32 @@ void TestXPathBoundaries() {
     Assert(namespaceWildcard.Count() == 5,
         "Namespace wildcard XPath should match all elements in the resolved namespace");
 
+    const auto allNamespaceDocumentAttributes = namespaceDocument->SelectNodes("//@*");
+    Assert(allNamespaceDocumentAttributes.Count() == 2,
+        "XPath attribute axes should exclude xmlns namespace declaration attributes");
+    Assert(allNamespaceDocumentAttributes.Item(0) != nullptr && allNamespaceDocumentAttributes.Item(0)->Name() == "meta:id"
+            && allNamespaceDocumentAttributes.Item(1) != nullptr && allNamespaceDocumentAttributes.Item(1)->Name() == "meta:id",
+        "XPath attribute-axis document order should remain stable after excluding xmlns declarations");
+    const auto namespaceFirstAttributes = namespaceDocument->SelectNodes("//bk:book/@*[1]", namespaces);
+    Assert(namespaceFirstAttributes.Count() == 2,
+        "Attribute positional predicates should skip xmlns declarations before computing first visible attributes");
+    Assert(namespaceFirstAttributes.Item(0) != nullptr && namespaceFirstAttributes.Item(0)->Name() == "meta:id",
+        "Attribute positional predicates should return meta:id as the first visible attribute on the first element");
+    Assert(namespaceFirstAttributes.Item(1) != nullptr && namespaceFirstAttributes.Item(1)->Name() == "meta:id",
+        "Attribute positional predicates should return meta:id as the first visible attribute on the second element");
+    Assert(namespaceDocument->SelectNodes("/bk:catalog/@*", namespaces).Count() == 0,
+        "XPath attribute axes on an element with only xmlns declarations should return no attribute nodes");
+    Assert(namespaceDocument->SelectSingleNode("/bk:catalog[count(@*)=0]", namespaces) != nullptr,
+        "count(@*) should also exclude xmlns namespace declaration attributes");
+
     const auto namespaceAttributeWildcard = namespaceDocument->SelectNodes("//@m:*", namespaces);
     Assert(namespaceAttributeWildcard.Count() == 2,
         "Namespace wildcard attribute XPath should match all attributes in the resolved namespace");
+    const auto namespaceAttributeNodeTest = namespaceDocument->SelectNodes("//bk:book/attribute::node()", namespaces);
+    Assert(namespaceAttributeNodeTest.Count() == 2
+            && namespaceAttributeNodeTest.Item(0) != nullptr && namespaceAttributeNodeTest.Item(0)->Name() == "meta:id"
+            && namespaceAttributeNodeTest.Item(1) != nullptr && namespaceAttributeNodeTest.Item(1)->Name() == "meta:id",
+        "attribute::node() should exclude xmlns declarations from namespaced attribute axes");
 
     const auto defaultNamespaceDocument = XmlDocument::Parse(
         "<catalog xmlns=\"urn:catalog\" id=\"root\">"
@@ -13702,6 +14401,18 @@ void TestXPathHighFrequencyFunctions() {
         "lang() should match element-local xml:lang values");
     Assert(static_cast<XmlElement*>(langLocalMatch.get())->GetAttribute("id") == "7",
         "lang() local predicate result mismatch");
+
+    const auto booleanWrappedLangMatch = document->SelectSingleNode("/root/item[boolean(lang('en')) and @id='2']");
+    Assert(booleanWrappedLangMatch != nullptr && booleanWrappedLangMatch->NodeType() == XmlNodeType::Element,
+        "boolean() should accept lang() target expressions without losing inherited xml:lang context");
+    Assert(static_cast<XmlElement*>(booleanWrappedLangMatch.get())->GetAttribute("id") == "2",
+        "boolean(lang()) inherited-context predicate result mismatch");
+
+    const auto booleanWrappedLocalLangMatch = document->SelectSingleNode("/root/item[boolean(lang('fr')) and @id='7']");
+    Assert(booleanWrappedLocalLangMatch != nullptr && booleanWrappedLocalLangMatch->NodeType() == XmlNodeType::Element,
+        "boolean() should accept lang() target expressions with element-local xml:lang values");
+    Assert(static_cast<XmlElement*>(booleanWrappedLocalLangMatch.get())->GetAttribute("id") == "7",
+        "boolean(lang()) local-context predicate result mismatch");
 
     const auto concatMatch = document->SelectSingleNode("/root/item[concat(@id, '-', title)='2-Alpha']");
     Assert(concatMatch != nullptr && concatMatch->NodeType() == XmlNodeType::Element,
@@ -13814,6 +14525,255 @@ void TestXPathHighFrequencyFunctions() {
     Assert(static_cast<XmlElement*>(pathArgumentMatch.get())->GetAttribute("id") == "7",
         "Predicate path terminal attribute/text() result mismatch");
 
+    const auto explicitAxisPathArgumentMatch = pathArgumentDocument->SelectSingleNode(
+        "/root/item[child::meta/attribute::id='m2' and child::meta/child::text()='Beta' and count(child::meta)=1]");
+    Assert(explicitAxisPathArgumentMatch != nullptr && explicitAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept explicit child:: and attribute:: axis aliases");
+    Assert(static_cast<XmlElement*>(explicitAxisPathArgumentMatch.get())->GetAttribute("id") == "7",
+        "Predicate child-path axis-alias result mismatch");
+
+    const auto selfParentAxisPathArgumentMatch = pathArgumentDocument->SelectSingleNode(
+        "/root/item[child::meta/self::meta/attribute::id='m2' and child::meta/parent::item/@id='7']");
+    Assert(selfParentAxisPathArgumentMatch != nullptr && selfParentAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept explicit self::name and parent::name filters");
+    Assert(static_cast<XmlElement*>(selfParentAxisPathArgumentMatch.get())->GetAttribute("id") == "7",
+        "Predicate child-path self::/parent:: result mismatch");
+
+    const auto explicitSelfTextAxisPathArgumentMatch = pathArgumentDocument->SelectSingleNode(
+        "/root/item[child::meta/child::text()/self::text()='Beta']");
+    Assert(explicitSelfTextAxisPathArgumentMatch != nullptr && explicitSelfTextAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept explicit self::text() on text-node path results");
+    Assert(static_cast<XmlElement*>(explicitSelfTextAxisPathArgumentMatch.get())->GetAttribute("id") == "7",
+        "Predicate child-path self::text() result mismatch");
+
+    const auto descendantPathDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><wrapper><meta id='m1'>Alpha</meta></wrapper></item>"
+        "<item id='2'><wrapper><meta id='m2'>Beta</meta></wrapper></item>"
+        "</root>");
+    const auto descendantAxisPathArgumentMatch = descendantPathDocument->SelectSingleNode(
+        "/root/item[descendant::meta/@id='m2' and string(descendant::text())='Beta' and count(descendant::meta)=1 and count(descendant-or-self::item)=1]");
+    Assert(descendantAxisPathArgumentMatch != nullptr && descendantAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept descendant:: and descendant-or-self:: element/text axes");
+    Assert(static_cast<XmlElement*>(descendantAxisPathArgumentMatch.get())->GetAttribute("id") == "2",
+        "Predicate child-path descendant axis result mismatch");
+    const auto ancestorAxisPathArgumentMatch = descendantPathDocument->SelectSingleNode(
+        "/root/item[descendant::meta/ancestor::item/@id='2' and count(descendant::meta/ancestor-or-self::meta)=1 and count(descendant::meta/ancestor::root)=1]");
+    Assert(ancestorAxisPathArgumentMatch != nullptr && ancestorAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept ancestor:: and ancestor-or-self:: element axes");
+    Assert(static_cast<XmlElement*>(ancestorAxisPathArgumentMatch.get())->GetAttribute("id") == "2",
+        "Predicate child-path ancestor axis result mismatch");
+    const auto siblingPathDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><lead>A0</lead><meta id='m1'>Alpha</meta><title>A1</title></item>"
+        "<item id='2'><lead>B0</lead><meta id='m2'>Beta</meta><title>B1</title></item>"
+        "</root>");
+    const auto siblingAxisPathArgumentMatch = siblingPathDocument->SelectSingleNode(
+        "/root/item[meta/following-sibling::title='B1' and title/preceding-sibling::meta/@id='m2']");
+    Assert(siblingAxisPathArgumentMatch != nullptr && siblingAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept following-sibling:: and preceding-sibling:: element axes");
+    Assert(static_cast<XmlElement*>(siblingAxisPathArgumentMatch.get())->GetAttribute("id") == "2",
+        "Predicate child-path sibling axis result mismatch");
+    const auto documentOrderPathDocument = XmlDocument::Parse(
+        "<root>"
+        "<group id='g1'><meta id='m1'>Alpha</meta></group>"
+        "<group id='g2'><meta id='m2'>Beta</meta><tail>T2</tail></group>"
+        "</root>");
+    const auto documentOrderAxisPathArgumentMatch = documentOrderPathDocument->SelectSingleNode(
+        "/root/group[meta/following::tail='T2' and tail/preceding::meta/@id='m2']");
+    Assert(documentOrderAxisPathArgumentMatch != nullptr && documentOrderAxisPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should accept following:: and preceding:: element axes");
+    Assert(static_cast<XmlElement*>(documentOrderAxisPathArgumentMatch.get())->GetAttribute("id") == "g2",
+        "Predicate child-path document-order axis result mismatch");
+
+    const auto predicateNodeTestDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><!--alpha--><?mark go?></item>"
+        "<item id='2'><!--beta--><?mark ready?></item>"
+        "</root>");
+    const auto commentFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(comment())=1 and string(comment())='beta']");
+    Assert(commentFunctionMatch != nullptr && commentFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept comment() node tests as child-path arguments");
+    Assert(static_cast<XmlElement*>(commentFunctionMatch.get())->GetAttribute("id") == "2",
+        "comment() predicate-function result mismatch");
+
+    const auto processingInstructionFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(processing-instruction('mark'))=1 and string(processing-instruction('mark'))='ready' and name(processing-instruction('mark'))='mark']");
+    Assert(processingInstructionFunctionMatch != nullptr && processingInstructionFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept processing-instruction('target') node tests as child-path arguments");
+    Assert(static_cast<XmlElement*>(processingInstructionFunctionMatch.get())->GetAttribute("id") == "2",
+        "processing-instruction() predicate-function result mismatch");
+
+    const auto explicitSelfCommentFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(child::node()/self::comment())=1 and string(child::node()/self::comment())='beta']");
+    Assert(explicitSelfCommentFunctionMatch != nullptr && explicitSelfCommentFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept explicit self::comment() on child-path node-set results");
+    Assert(static_cast<XmlElement*>(explicitSelfCommentFunctionMatch.get())->GetAttribute("id") == "2",
+        "self::comment() predicate-function result mismatch");
+
+    const auto explicitSelfProcessingInstructionFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(child::node()/self::processing-instruction('mark'))=1 and string(child::node()/self::processing-instruction('mark'))='ready' and name(child::node()/self::processing-instruction('mark'))='mark']");
+    Assert(explicitSelfProcessingInstructionFunctionMatch != nullptr && explicitSelfProcessingInstructionFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept explicit self::processing-instruction('target') on child-path node-set results");
+    Assert(static_cast<XmlElement*>(explicitSelfProcessingInstructionFunctionMatch.get())->GetAttribute("id") == "2",
+        "self::processing-instruction() predicate-function result mismatch");
+
+    const auto predicateNodeCoercionDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><a>A</a><b>B</b><!--c--><?p v?>text</item>"
+        "<item id='2'><!--only--></item>"
+        "<item id='3'><?p v?></item>"
+        "<item id='4'>text</item>"
+        "</root>");
+    Assert(predicateNodeCoercionDocument->SelectSingleNode("/root/item[string(*)='A' and count(*)=2 and name(*)='a' and @id='1']") != nullptr,
+        "Predicate functions should coerce wildcard element node-sets using the first node in document order");
+    Assert(predicateNodeCoercionDocument->SelectSingleNode("/root/item[boolean(comment()) and @id='2']") != nullptr,
+        "boolean(comment()) should treat a non-empty comment node-set as true");
+    Assert(predicateNodeCoercionDocument->SelectSingleNode("/root/item[boolean(processing-instruction('p')) and @id='3']") != nullptr,
+        "boolean(processing-instruction()) should treat a non-empty PI node-set as true");
+    Assert(predicateNodeCoercionDocument->SelectSingleNode("/root/item[count(child::node()/self::text())=1 and @id='4']") != nullptr,
+        "count(child::node()/self::text()) should count explicit self::text() results");
+    const auto predicateMixedNodeCoercionDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'>a<?mark one?><child/><!--tail-->b</item>"
+        "<item id='2'><?mark two?></item>"
+        "</root>");
+    const auto directMixedLeadingText = predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[@id='1']/node()[1]");
+    Assert(directMixedLeadingText != nullptr
+            && directMixedLeadingText->NodeType() == XmlNodeType::Text
+            && directMixedLeadingText->SelectSingleNode("self::text()") != nullptr,
+        "self::text() should keep a text node as the current context");
+    const auto directMixedPredicateTextNodes = predicateMixedNodeCoercionDocument->SelectNodes("/root/item[@id='1']/node()[self::text()]");
+    Assert(directMixedPredicateTextNodes.Count() == 2,
+        "node()[self::text()] should preserve only text children in mixed child node-sets, actual=" + std::to_string(directMixedPredicateTextNodes.Count()));
+    const auto directMixedPredicateCommentNodes = predicateMixedNodeCoercionDocument->SelectNodes("/root/item[@id='1']/node()[self::comment()]");
+    Assert(directMixedPredicateCommentNodes.Count() == 1
+            && directMixedPredicateCommentNodes.Item(0) != nullptr
+            && directMixedPredicateCommentNodes.Item(0)->NodeType() == XmlNodeType::Comment
+            && directMixedPredicateCommentNodes.Item(0)->Value() == "tail",
+        "node()[self::comment()] should preserve only comment children in mixed child node-sets");
+    const auto directMixedPredicateProcessingInstructionNodes = predicateMixedNodeCoercionDocument->SelectNodes("/root/item[@id='1']/node()[self::processing-instruction('mark')]");
+    Assert(directMixedPredicateProcessingInstructionNodes.Count() == 1
+            && directMixedPredicateProcessingInstructionNodes.Item(0) != nullptr
+            && directMixedPredicateProcessingInstructionNodes.Item(0)->NodeType() == XmlNodeType::ProcessingInstruction
+            && directMixedPredicateProcessingInstructionNodes.Item(0)->Value() == "one",
+        "node()[self::processing-instruction()] should preserve only matching PI children in mixed child node-sets");
+    const auto directMixedPredicateElementNodes = predicateMixedNodeCoercionDocument->SelectNodes("/root/item[@id='1']/node()[self::*]");
+    Assert(directMixedPredicateElementNodes.Count() == 1
+            && directMixedPredicateElementNodes.Item(0) != nullptr
+            && directMixedPredicateElementNodes.Item(0)->NodeType() == XmlNodeType::Element
+            && directMixedPredicateElementNodes.Item(0)->Name() == "child",
+        "node()[self::*] should preserve only element children in mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectNodes("/root/item[@id='1']/node()[self::node()]").Count() == 5,
+        "node()[self::node()] should preserve all visible mixed child nodes");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[count(node()[self::text()])=2 and @id='1']") != nullptr,
+        "Predicate child paths should allow count(node()[self::text()]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[string(node()[last()])='b' and @id='1']") != nullptr,
+        "Predicate child paths should allow string(node()[last()]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[name(node()[position()=2])='mark' and @id='1']") != nullptr,
+        "Predicate child paths should allow name(node()[position()=2]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[string(node()[self::comment()])='tail' and @id='1']") != nullptr,
+        "Predicate child paths should allow string(node()[self::comment()]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[name(node()[self::processing-instruction('mark')])='mark' and @id='1']") != nullptr,
+        "Predicate child paths should allow name(node()[self::processing-instruction()]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[count(node()[self::*])=1 and @id='1']") != nullptr,
+        "Predicate child paths should allow count(node()[self::*]) over mixed child node-sets");
+    const auto predicateMixedNamespacedNodeCoercionDocument = XmlDocument::Parse(
+        "<root xmlns:ns='urn:test'>"
+        "<item id='1'>10<?mark one?><ns:child/><!--tail-->20</item>"
+        "<item id='2'>5</item>"
+        "</root>");
+    Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[local-name(node()[self::*])='child' and @id='1']") != nullptr,
+        "Predicate child paths should allow local-name(node()[self::*]) over mixed child node-sets");
+    Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[namespace-uri(node()[self::*])='urn:test' and @id='1']") != nullptr,
+        "Predicate child paths should allow namespace-uri(node()[self::*]) over mixed child node-sets");
+    Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[number(node()[self::text()])=10 and @id='1']") != nullptr,
+        "Predicate child paths should allow number(node()[self::text()]) over mixed child node-sets");
+    Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[node()[self::comment()]='tail' and @id='1']") != nullptr,
+        "Predicate child paths should allow equality against node()[self::comment()] over mixed child node-sets");
+    Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[node()[self::processing-instruction('mark')]!='two' and @id='1']") != nullptr,
+        "Predicate child paths should allow inequality against node()[self::processing-instruction()] over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[boolean(node()[self::comment()]) and @id='1']") != nullptr,
+        "Predicate child paths should allow boolean(node()[self::comment()]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[boolean(node()[self::processing-instruction('mark')]) and @id='1']") != nullptr,
+        "Predicate child paths should allow boolean(node()[self::processing-instruction()]) over mixed child node-sets");
+    Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[boolean(node()[self::*]) and @id='1']") != nullptr,
+        "Predicate child paths should allow boolean(node()[self::*]) over mixed child node-sets");
+    Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[count(node()[position() mod 2 = 1])=3 and @id='1']") != nullptr,
+        "Predicate child paths should allow positional arithmetic filters over mixed child node-sets");
+
+    const auto explicitDescendantNodeTestFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(descendant::comment())=1 and string(descendant::comment())='beta' and count(descendant::processing-instruction('mark'))=1 and string(descendant::processing-instruction('mark'))='ready']");
+    Assert(explicitDescendantNodeTestFunctionMatch != nullptr && explicitDescendantNodeTestFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept descendant::comment() and descendant::processing-instruction('target') child-path arguments");
+    Assert(static_cast<XmlElement*>(explicitDescendantNodeTestFunctionMatch.get())->GetAttribute("id") == "2",
+        "descendant::node-test predicate-function result mismatch");
+    const auto explicitAncestorNodeTestFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(child::node()/ancestor-or-self::comment())=1 and string(child::node()/ancestor-or-self::comment())='beta' and count(child::node()/ancestor-or-self::processing-instruction('mark'))=1 and string(child::node()/ancestor-or-self::processing-instruction('mark'))='ready']");
+    Assert(explicitAncestorNodeTestFunctionMatch != nullptr && explicitAncestorNodeTestFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept ancestor-or-self::comment() and ancestor-or-self::processing-instruction('target') on child-path node-set results");
+    Assert(static_cast<XmlElement*>(explicitAncestorNodeTestFunctionMatch.get())->GetAttribute("id") == "2",
+        "ancestor-or-self::node-test predicate-function result mismatch");
+    const auto explicitSiblingNodeTestFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(comment()/following-sibling::processing-instruction('mark'))=1 and string(comment()/following-sibling::processing-instruction('mark'))='ready' and count(processing-instruction('mark')/preceding-sibling::comment())=1 and string(processing-instruction('mark')/preceding-sibling::comment())='beta']");
+    Assert(explicitSiblingNodeTestFunctionMatch != nullptr && explicitSiblingNodeTestFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept following-sibling::processing-instruction() and preceding-sibling::comment() child-path arguments");
+    Assert(static_cast<XmlElement*>(explicitSiblingNodeTestFunctionMatch.get())->GetAttribute("id") == "2",
+        "sibling::node-test predicate-function result mismatch");
+    const auto explicitDocumentOrderNodeTestFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(comment()/following::processing-instruction('mark'))=1 and string(comment()/following::processing-instruction('mark'))='ready' and count(processing-instruction('mark')/preceding::comment())=2 and string(processing-instruction('mark')/preceding::comment())='alpha']");
+    Assert(explicitDocumentOrderNodeTestFunctionMatch != nullptr && explicitDocumentOrderNodeTestFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept following::processing-instruction() and preceding::comment() child-path arguments");
+    Assert(static_cast<XmlElement*>(explicitDocumentOrderNodeTestFunctionMatch.get())->GetAttribute("id") == "2",
+        "document-order::node-test predicate-function result mismatch");
+
+    const auto nodeFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
+        "/root/item[count(node())=2 and string(node())='beta' and name(node())='' and local-name(node())='' and namespace-uri(node())='']");
+    Assert(nodeFunctionMatch != nullptr && nodeFunctionMatch->NodeType() == XmlNodeType::Element,
+        "Predicate functions should accept node() as a child-path node-set argument");
+    Assert(static_cast<XmlElement*>(nodeFunctionMatch.get())->GetAttribute("id") == "2",
+        "node() predicate-function result mismatch");
+
+    const auto nonTerminalPathDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><meta slot='s1'>Alpha</meta></item>"
+        "<item id='2'><meta slot='s2'>Beta</meta></item>"
+        "</root>");
+    Assert(nonTerminalPathDocument->SelectSingleNode("/root/item[meta/text()/id='x']") == nullptr,
+        "Non-terminal text() predicate paths should evaluate to an empty node-set instead of throwing");
+    Assert(nonTerminalPathDocument->SelectSingleNode("/root/item[meta/@slot/id='x']") == nullptr,
+        "Non-terminal attribute predicate paths should evaluate to an empty node-set instead of throwing");
+
+    const auto idFunctionDocument = XmlDocument::Parse(
+        "<!DOCTYPE root [<!ELEMENT root (item*)><!ELEMENT item (#PCDATA)><!ATTLIST item code ID #IMPLIED>]>"
+        "<root>"
+        "<item code='alpha'>Alpha</item>"
+        "<item code='beta'>Beta</item>"
+        "<item xml:id='xml-target'>Xml Target</item>"
+        "</root>");
+    const auto dtdIdMatch = idFunctionDocument->SelectSingleNode(
+        "/root/item[@code='beta' and count(id('alpha beta'))=2 and name(id('beta'))='item' and string(id('beta'))='Beta']");
+    Assert(dtdIdMatch != nullptr && dtdIdMatch->NodeType() == XmlNodeType::Element,
+        "id() should resolve DTD-declared ID attributes, whitespace-separated token lists, and compose with name()/string()");
+    Assert(static_cast<XmlElement*>(dtdIdMatch.get())->GetAttribute("code") == "beta",
+        "id() DTD-ID predicate result mismatch");
+
+    const auto xmlIdMatch = idFunctionDocument->SelectSingleNode(
+        "/root/item[not(@code) and count(id('xml-target'))=1 and name(id('xml-target'))='item' and string(id('xml-target'))='Xml Target']");
+    Assert(xmlIdMatch != nullptr && xmlIdMatch->NodeType() == XmlNodeType::Element,
+        "id() should also resolve xml:id attributes");
+    Assert(static_cast<XmlElement*>(xmlIdMatch.get())->GetAttribute("xml:id") == "xml-target",
+        "id() xml:id predicate result mismatch");
+
+    const auto unparsedEntityDocument = XmlDocument::Parse(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg>]>"
+        "<root><item/></root>");
+    const auto unparsedEntityMatch = unparsedEntityDocument->SelectSingleNode(
+        "/root[unparsed-entity-uri('cover')='cover.jpg' and string-length(unparsed-entity-uri('missing'))=0]");
+    Assert(unparsedEntityMatch != nullptr && unparsedEntityMatch->NodeType() == XmlNodeType::Element,
+        "unparsed-entity-uri() should expose unparsed entity system identifiers and return empty strings for misses");
+
     const auto namespacedDocument = XmlDocument::Parse(
         "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\" xml:lang=\"en\">"
         "<lib:book meta:id=\"b1\" meta:rank=\"1\"><lib:title>One</lib:title><lib:code>O-b1</lib:code><lib:amount>1</lib:amount></lib:book>"
@@ -13875,6 +14835,23 @@ void TestXPathHighFrequencyFunctions() {
     Assert(static_cast<XmlElement*>(namespacedLang.get())->GetAttribute("meta:id") == "b2",
         "Namespace-aware lang()/additive predicate result mismatch");
 
+    const auto nestedNoArgumentFunctionDocument = XmlDocument::Parse(
+        "<root><item id='2'>beta</item><item id='7'>gamma delta</item></root>");
+    const auto nestedNoArgumentFunctionMatch = nestedNoArgumentFunctionDocument->SelectSingleNode(
+        "/root/item[boolean(normalize-space()) and concat(normalize-space(), '-', string-length())='gamma delta-11' and @id='7']");
+    Assert(nestedNoArgumentFunctionMatch != nullptr && nestedNoArgumentFunctionMatch->NodeType() == XmlNodeType::Element,
+        "No-argument normalize-space() and string-length() should keep the current context node when nested inside other functions");
+    Assert(static_cast<XmlElement*>(nestedNoArgumentFunctionMatch.get())->GetAttribute("id") == "7",
+        "Nested no-argument normalize-space()/string-length() predicate result mismatch");
+
+    const auto namespacedBooleanWrappedLangMatch = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[boolean(lang('fr')) and @m:id='b2']",
+        namespaces);
+    Assert(namespacedBooleanWrappedLangMatch != nullptr && namespacedBooleanWrappedLangMatch->NodeType() == XmlNodeType::Element,
+        "Namespace-aware boolean() should accept lang() target expressions");
+    Assert(static_cast<XmlElement*>(namespacedBooleanWrappedLangMatch.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware boolean(lang()) predicate result mismatch");
+
     const auto namespacedArithmetic = namespacedDocument->SelectSingleNode(
         "/bk:catalog/bk:book[number(@m:rank) * 2 = 2 and false() = false() and @m:id='b1']",
         namespaces);
@@ -13895,6 +14872,107 @@ void TestXPathHighFrequencyFunctions() {
         "Namespace-aware predicate paths should support terminal attribute/text() segments plus count(.)");
     Assert(static_cast<XmlElement*>(namespacedPathArgument.get())->GetAttribute("meta:id") == "b2",
         "Namespace-aware predicate path terminal attribute/text() result mismatch");
+
+    const auto filteredPathArgumentDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><meta kind='secondary' slot='s1'><title>One</title></meta></item>"
+        "<item id='2'><meta kind='canonical' slot='s2'><title>Two</title></meta></item>"
+        "</root>");
+    const auto filteredPathArgumentMatch = filteredPathArgumentDocument->SelectSingleNode(
+        "/root/item[meta[@kind='canonical']/@slot='s2' and string(meta[@kind='canonical']/title)='Two' and name(meta[@kind='canonical']/title)='title']");
+    Assert(filteredPathArgumentMatch != nullptr && filteredPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should support per-segment predicates inside function arguments and comparisons");
+    Assert(static_cast<XmlElement*>(filteredPathArgumentMatch.get())->GetAttribute("id") == "2",
+        "Predicate child-path per-segment predicate result mismatch");
+
+    const auto namespacedFilteredPathArgument = namespacedPathArgumentDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[bk:meta[@m:slot='s2']/bk:title='Two' and local-name(bk:meta[@m:slot='s2']/bk:title)='title' and namespace-uri(bk:meta[@m:slot='s2']/bk:title)='urn:lib']",
+        namespaces);
+    Assert(namespacedFilteredPathArgument != nullptr && namespacedFilteredPathArgument->NodeType() == XmlNodeType::Element,
+        "Namespace-aware predicate child paths should support per-segment predicates");
+    Assert(static_cast<XmlElement*>(namespacedFilteredPathArgument.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware predicate child-path per-segment predicate result mismatch");
+
+    const auto descendantShortcutPathArgument = filteredPathArgumentDocument->SelectSingleNode(
+        "/root/item[string(meta//title)='Two' and count(meta//title)=1 and local-name(meta//title)='title']");
+    Assert(descendantShortcutPathArgument != nullptr && descendantShortcutPathArgument->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should support // descendant shortcuts inside function arguments and comparisons");
+    Assert(static_cast<XmlElement*>(descendantShortcutPathArgument.get())->GetAttribute("id") == "2",
+        "Predicate child-path // shortcut result mismatch");
+
+    const auto namespacedDescendantShortcutPathArgument = namespacedPathArgumentDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[string(bk:meta//bk:title)='Two' and count(bk:meta//bk:title)=1 and namespace-uri(bk:meta//bk:title)='urn:lib']",
+        namespaces);
+    Assert(namespacedDescendantShortcutPathArgument != nullptr && namespacedDescendantShortcutPathArgument->NodeType() == XmlNodeType::Element,
+        "Namespace-aware predicate child paths should support // descendant shortcuts");
+    Assert(static_cast<XmlElement*>(namespacedDescendantShortcutPathArgument.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware predicate child-path // shortcut result mismatch");
+
+    const auto unionPathArgumentDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'><meta><title>One</title><code>ONE</code></meta></item>"
+        "<item id='2'><meta><title>Two</title><code>TWO</code></meta></item>"
+        "</root>");
+    const auto unionPathArgumentMatch = unionPathArgumentDocument->SelectSingleNode(
+        "/root/item[@id='2' and count(meta/title | meta/code)=2 and string(meta/title | meta/code)='Two']");
+    Assert(unionPathArgumentMatch != nullptr && unionPathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should support union expressions inside function arguments and comparisons");
+    Assert(static_cast<XmlElement*>(unionPathArgumentMatch.get())->GetAttribute("id") == "2",
+        "Predicate child-path union result mismatch");
+
+    const auto absolutePathArgumentMatch = filteredPathArgumentDocument->SelectSingleNode(
+        "/root/item[@id='2' and string(/root/item[@id='2']/meta/title)='Two' and count(/root/item/meta/title)=2]");
+    Assert(absolutePathArgumentMatch != nullptr && absolutePathArgumentMatch->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should support absolute-path expressions inside function arguments and comparisons");
+    Assert(static_cast<XmlElement*>(absolutePathArgumentMatch.get())->GetAttribute("id") == "2",
+        "Predicate child-path absolute-path result mismatch");
+
+    const auto unaryMinusDocument = XmlDocument::Parse(
+        "<root><item id='1' rank='1'/><item id='2' rank='2'/></root>");
+    const auto unaryMinusMatch = unaryMinusDocument->SelectSingleNode(
+        "/root/item[-@rank = -2 and -number(@rank) = -2]");
+    Assert(unaryMinusMatch != nullptr && unaryMinusMatch->NodeType() == XmlNodeType::Element,
+        "XPath predicates should support unary minus on node-set and function numeric expressions");
+    Assert(static_cast<XmlElement*>(unaryMinusMatch.get())->GetAttribute("id") == "2",
+        "XPath unary-minus predicate result mismatch");
+
+    const auto namespacedUnaryMinusMatch = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[-@m:rank = -2 and round(-@m:rank) = -2]",
+        namespaces);
+    Assert(namespacedUnaryMinusMatch != nullptr && namespacedUnaryMinusMatch->NodeType() == XmlNodeType::Element,
+        "Namespace-aware XPath predicates should support unary minus");
+    Assert(static_cast<XmlElement*>(namespacedUnaryMinusMatch.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware unary-minus predicate result mismatch");
+
+    const auto booleanContainsMatch = unaryMinusDocument->SelectSingleNode(
+        "/root/item[boolean(contains(@id, '2')) and boolean(starts-with(@rank, '2')) and boolean(ends-with(@id, '2'))]");
+    Assert(booleanContainsMatch != nullptr && booleanContainsMatch->NodeType() == XmlNodeType::Element,
+        "XPath string functions should be usable as boolean()-consumed target expressions");
+    Assert(static_cast<XmlElement*>(booleanContainsMatch.get())->GetAttribute("id") == "2",
+        "XPath string-function target boolean() result mismatch");
+
+    const auto namespacedBooleanContainsMatch = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[boolean(contains(@m:id, 'b2')) and boolean(starts-with(string(bk:title), 'Tw')) and boolean(ends-with(@m:id, '2'))]",
+        namespaces);
+    Assert(namespacedBooleanContainsMatch != nullptr && namespacedBooleanContainsMatch->NodeType() == XmlNodeType::Element,
+        "Namespace-aware XPath string functions should be usable as boolean()-consumed target expressions");
+    Assert(static_cast<XmlElement*>(namespacedBooleanContainsMatch.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware string-function target boolean() result mismatch");
+
+    const auto booleanPredicateExpressionMatch = unaryMinusDocument->SelectSingleNode(
+        "/root/item[boolean(@id='2') and boolean(@id='2' and @rank='2')]");
+    Assert(booleanPredicateExpressionMatch != nullptr && booleanPredicateExpressionMatch->NodeType() == XmlNodeType::Element,
+        "boolean() should accept full predicate expressions such as comparisons and logical conjunctions");
+    Assert(static_cast<XmlElement*>(booleanPredicateExpressionMatch.get())->GetAttribute("id") == "2",
+        "boolean(predicate-expression) result mismatch");
+
+    const auto namespacedBooleanPredicateExpressionMatch = namespacedDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[boolean(@m:id='b2') and boolean(@m:id='b2' and bk:title='Two')]",
+        namespaces);
+    Assert(namespacedBooleanPredicateExpressionMatch != nullptr && namespacedBooleanPredicateExpressionMatch->NodeType() == XmlNodeType::Element,
+        "Namespace-aware boolean() should accept full predicate expressions");
+    Assert(static_cast<XmlElement*>(namespacedBooleanPredicateExpressionMatch.get())->GetAttribute("meta:id") == "b2",
+        "Namespace-aware boolean(predicate-expression) result mismatch");
 }
 
 void TestInvalidXPathInputs() {
@@ -13939,10 +15017,8 @@ void TestInvalidXPathInputs() {
         "Unsupported XPath feature: predicate [contains('a', 'b', 'c')]",
         "XPath predicate functions should reject extra arguments with a stable XmlException");
 
-    expectXPathExceptionMessage(
-        "/root/item[meta/text()/id='x']",
-        "Unsupported XPath feature: predicate path [meta/text()/id]",
-        "Unsupported predicate paths with non-terminal text() should throw a stable XmlException");
+    Assert(document->SelectSingleNode("/root/item[meta/text()/id='x']") == nullptr,
+        "Non-terminal text() predicate paths should no longer throw and should evaluate to an empty node-set");
 }
 
 void TestXPathErrorBoundaries() {
@@ -13969,12 +15045,8 @@ void TestXPathErrorBoundaries() {
         "Unsupported XPath feature: predicate [boolean(@id, @id)]",
         "Unsupported XPath function arity should report the unsupported-feature category");
 
-    AssertXmlExceptionMessage(
-        [&] {
-            (void)document->SelectNodes("/root/item[meta/text()/id='x']");
-        },
-        "Unsupported XPath feature: predicate path [meta/text()/id]",
-        "Unsupported XPath path shapes should report the unsupported-feature category");
+    Assert(document->SelectNodes("/root/item[meta/text()/id='x']").Count() == 0,
+        "Non-terminal text() predicate paths should stay in the empty-result category rather than unsupported-feature");
 
     XmlNamespaceManager namespaces;
     namespaces.AddNamespace("ok", "urn:ok");
@@ -14011,9 +15083,37 @@ void TestDomEditing() {
     Assert(removed == first, "RemoveChild should return the removed node");
     Assert(first->ParentNode() == nullptr, "Removed child should be detached");
     Assert(root->FirstChild() == replacement, "Remaining first child mismatch after removal");
+    Assert(replacement->PreviousSibling() == nullptr, "New first child should not have a previous sibling after removal");
+    Assert(replacement->NextSibling() == third, "Sibling chain should remain intact after head removal");
 
-    root->InsertBefore(document.CreateElement("head"), root->FirstChild());
+    auto head = document.CreateElement("head");
+    root->InsertBefore(head, root->FirstChild());
     Assert(root->FirstChild()->Name() == "head", "InsertBefore should place node ahead of reference child");
+    Assert(head->NextSibling() == replacement, "Inserted head should point at the former first child");
+    Assert(replacement->PreviousSibling() == head, "Former first child should point back to inserted head");
+
+    auto tail = document.CreateElement("tail");
+    root->AppendChild(tail);
+    Assert(third->NextSibling() == tail, "AppendChild should update the previous tail's next sibling");
+    Assert(tail->PreviousSibling() == third, "Appended child should point back to the prior tail");
+
+    XmlDocument pendingAttributeDocument;
+    pendingAttributeDocument.LoadXml("<pending alpha=\"1\" beta=\"2\"/>");
+    auto pendingRoot = pendingAttributeDocument.DocumentElement();
+    Assert(pendingRoot != nullptr && pendingRoot->GetAttribute("alpha") == "1",
+        "Pending exact-name attribute lookup should return the stored value");
+    const auto materializedBeta = pendingRoot->GetAttributeNode("beta");
+    Assert(materializedBeta != nullptr && materializedBeta->Value() == "2",
+        "GetAttributeNode should materialize pending exact-name attributes");
+    Assert(pendingRoot->GetAttribute("beta") == "2",
+        "Exact-name lookup should still succeed after pending attribute materialization");
+    Assert(pendingRoot->RemoveAttribute("alpha"),
+        "RemoveAttribute should remove pending exact-name attributes after indexed lookup");
+    Assert(!pendingRoot->HasAttribute("alpha"),
+        "Removed pending exact-name attribute should no longer be reported");
+    pendingRoot->SetAttribute("gamma", "3");
+    Assert(pendingRoot->GetAttribute("gamma") == "3",
+        "Exact-name lookup should find newly added materialized attributes after index rebuild");
 
     root->SetAttribute("a", "1");
     root->SetAttribute("b", "2");
@@ -15742,6 +16842,73 @@ void TestXmlWriterWriteNode() {
     Assert(xml.find("<payload id=\"42\">&amp;tail</payload>") != std::string::npos,
         "WriteNode should preserve imported entity references and child content");
 
+    XmlWriter wholeDocumentWriter;
+    wholeDocumentWriter.WriteNode(source);
+    Assert(wholeDocumentWriter.GetString() == xml,
+        "WriteNode should serialize XmlDocument nodes by replaying their children through writer APIs");
+
+    std::ostringstream wholeDocumentStream;
+    XmlWriter directWholeDocumentWriter(wholeDocumentStream);
+    directWholeDocumentWriter.WriteNode(source);
+    Assert(wholeDocumentStream.str() == xml,
+        "Direct-output WriteNode should serialize XmlDocument nodes by replaying their children");
+
+    auto declarationSource = XmlDocument::Parse(
+        "<!DOCTYPE catalog [<!ENTITY label \"copy\"><!NOTATION txt SYSTEM \"text/plain\">]><catalog/>"
+    );
+    const auto labelEntity = declarationSource->DocumentType()->Entities().GetNamedItem("label");
+    const auto txtNotation = declarationSource->DocumentType()->Notations().GetNamedItem("txt");
+    Assert(labelEntity != nullptr && txtNotation != nullptr,
+        "Entity/Notation declaration nodes should be available for WriteNode tests");
+
+    XmlWriterSettings fragmentSettings;
+    fragmentSettings.Conformance = ConformanceLevel::Fragment;
+
+    XmlWriter declarationWriter(fragmentSettings);
+    declarationWriter.WriteNode(*labelEntity);
+    declarationWriter.WriteNode(*txtNotation);
+    const std::string declarationXml = declarationWriter.GetString();
+    Assert(declarationXml == "<!ENTITY label \"copy\"><!NOTATION txt SYSTEM \"text/plain\">",
+        "Fragment-conformance WriteNode should preserve entity and notation declaration serialization");
+    Assert(declarationSource->DocumentType()->Entities().GetNamedItem("label") == labelEntity,
+        "In-memory WriteNode should not detach same-document entity declaration nodes from the source document");
+    Assert(declarationSource->DocumentType()->Notations().GetNamedItem("txt") == txtNotation,
+        "In-memory WriteNode should not detach same-document notation declaration nodes from the source document");
+
+    std::ostringstream declarationStream;
+    XmlWriter directDeclarationWriter(declarationStream, fragmentSettings);
+    directDeclarationWriter.WriteNode(*labelEntity);
+    directDeclarationWriter.WriteNode(*txtNotation);
+    Assert(declarationStream.str() == declarationXml,
+        "Direct-output fragment WriteNode should match in-memory serialization for entity and notation declaration nodes");
+
+    XmlDocument mixedSource;
+    auto mixed = mixedSource.CreateElement("mixed");
+    mixed->SetAttribute("flag", "1");
+    mixed->AppendChild(mixedSource.CreateComment("lead"));
+    mixed->AppendChild(mixedSource.CreateProcessingInstruction("pi", "go"));
+    mixed->AppendChild(mixedSource.CreateTextNode("tail"));
+
+    XmlWriter mixedWriter;
+    mixedWriter.WriteNode(*mixed);
+    Assert(mixedWriter.GetString() == "<mixed flag=\"1\"><!--lead--><?pi go?>tail</mixed>",
+        "WriteNode should preserve element children when replaying through writer APIs instead of ImportNode");
+
+    auto inheritedNamespaceSource = XmlDocument::Parse(
+        "<root xmlns=\"urn:default\" xmlns:p=\"urn:pfx\"><child p:code=\"42\"/></root>");
+    const auto inheritedNamespaceChild = inheritedNamespaceSource->DocumentElement()->FirstChild();
+    Assert(inheritedNamespaceChild != nullptr,
+        "Inherited-namespace child should exist for WriteNode tests");
+
+    XmlWriter inheritedNamespaceWriter;
+    inheritedNamespaceWriter.WriteNode(*inheritedNamespaceChild);
+    auto inheritedNamespaceRoundTrip = XmlDocument::Parse(inheritedNamespaceWriter.GetString());
+    Assert(inheritedNamespaceRoundTrip->DocumentElement() != nullptr
+            && inheritedNamespaceRoundTrip->DocumentElement()->NamespaceURI() == "urn:default",
+        "WriteNode should preserve inherited default namespaces when replaying isolated element nodes");
+    Assert(inheritedNamespaceRoundTrip->DocumentElement()->GetAttribute("code", "urn:pfx") == "42",
+        "WriteNode should preserve inherited prefixed attribute namespaces when replaying isolated element nodes");
+
     auto fragment = source.CreateDocumentFragment();
     fragment->AppendChild(source.CreateElement("a"));
     fragment->AppendChild(source.CreateTextNode("mid"));
@@ -15754,6 +16921,34 @@ void TestXmlWriterWriteNode() {
     Assert(fragmentWriter.GetString() == "<root><a/>mid<b/></root>",
         "WriteNode should inline document fragment children inside the current element");
 
+    XmlDocument topLevelFragmentSource;
+    auto topLevelFragment = topLevelFragmentSource.CreateDocumentFragment();
+    topLevelFragment->AppendChild(topLevelFragmentSource.CreateComment("lead"));
+    topLevelFragment->AppendChild(topLevelFragmentSource.CreateElement("root"));
+
+    XmlWriter topLevelFragmentWriter;
+    topLevelFragmentWriter.WriteNode(*topLevelFragment);
+    Assert(topLevelFragmentWriter.GetString() == "<!--lead--><root/>",
+        "WriteNode should inline top-level document fragment children without re-importing them through a second fragment clone");
+
+    XmlDocument rollbackSource;
+    auto rollbackFragment = rollbackSource.CreateDocumentFragment();
+    rollbackFragment->AppendChild(rollbackSource.CreateElement("ok"));
+    rollbackFragment->AppendChild(rollbackSource.CreateDocumentType("root", {}, "root.dtd", {}));
+
+    XmlWriter rollbackWriter;
+    rollbackWriter.WriteStartElement("root");
+    bool rollbackThrew = false;
+    try {
+        rollbackWriter.WriteNode(*rollbackFragment);
+    } catch (const XmlException&) {
+        rollbackThrew = true;
+    }
+    Assert(rollbackThrew, "WriteNode should reject fragment content that introduces document-level nodes inside an element");
+    rollbackWriter.WriteEndElement();
+    Assert(rollbackWriter.GetString() == "<root/>",
+        "Failed in-memory WriteNode(const XmlNode&) should roll back partial DOM mutations before rethrowing");
+
     bool threw = false;
     try {
         XmlWriter invalidWriter;
@@ -15763,6 +16958,16 @@ void TestXmlWriterWriteNode() {
         threw = true;
     }
     Assert(threw, "WriteNode should reject document-level nodes inside elements");
+
+    threw = false;
+    try {
+        XmlWriter documentNodeWriter;
+        documentNodeWriter.WriteStartElement("root");
+        documentNodeWriter.WriteNode(source);
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteNode should reject XmlDocument nodes inside elements");
 
     threw = false;
     try {
@@ -15802,6 +17007,19 @@ void TestXmlWriterWriteRaw() {
     Assert(fullDocumentXml.find("<root>&label;</root>") != std::string::npos,
         "WriteRaw should preserve parsed entity references from full-document input");
 
+    std::ostringstream streamFullDocumentOutput;
+    XmlWriter streamFullDocumentWriter(streamFullDocumentOutput);
+    streamFullDocumentWriter.WriteRaw(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<!DOCTYPE root [<!ENTITY label \"value\">]>"
+        "<root>&label;</root>");
+    Assert(streamFullDocumentOutput.str().find("<?xml version=\"1.0\" encoding=\"utf-8\"?>") == 0,
+        "Stream-backed WriteRaw should preserve document-level XML declarations when parsing full documents");
+    Assert(streamFullDocumentOutput.str().find("<!DOCTYPE root [<!ENTITY label \"value\">]>") != std::string::npos,
+        "Stream-backed WriteRaw should preserve document-level DOCTYPE declarations when parsing full documents");
+    Assert(streamFullDocumentOutput.str().find("<root>&label;</root>") != std::string::npos,
+        "Stream-backed WriteRaw should preserve parsed entity references from full-document input");
+
     XmlWriter stagedDocumentWriter;
     stagedDocumentWriter.WriteRaw("<!--lead-->");
     stagedDocumentWriter.WriteRaw("<root/>");
@@ -15817,6 +17035,31 @@ void TestXmlWriterWriteRaw() {
         threw = true;
     }
     Assert(threw, "WriteRaw should reject embedded XML declarations inside element content");
+
+    XmlWriter rollbackWriter;
+    rollbackWriter.WriteStartElement("root");
+    rollbackWriter.WriteElementString("stable", "ok");
+    threw = false;
+    try {
+        rollbackWriter.WriteRaw("<temp/><broken></other>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "WriteRaw should still reject malformed raw fragments");
+    rollbackWriter.WriteEndElement();
+    Assert(rollbackWriter.GetString() == "<root><stable>ok</stable></root>",
+        "Failed in-memory WriteRaw should roll back partial DOM mutations before rethrowing");
+
+    threw = false;
+    try {
+        std::ostringstream output;
+        XmlWriter streamInvalidWriter(output);
+        streamInvalidWriter.WriteStartElement("root");
+        streamInvalidWriter.WriteRaw("<?xml version=\"1.0\"?><child/>");
+    } catch (const XmlException&) {
+        threw = true;
+    }
+    Assert(threw, "Stream-backed WriteRaw should reject embedded XML declarations inside element content");
 
     threw = false;
     try {
@@ -16090,19 +17333,8 @@ void TestXmlExceptionClassification() {
         "Unsupported XPath feature: predicate [boolean(@id, @id)]",
         "Unsupported XPath function arity should stay in the unsupported XmlException category");
 
-    expectXmlExceptionContaining(
-        [&] {
-            (void)document->SelectNodes("/root/item[meta/text()/id='x']");
-        },
-        "Unsupported XPath feature: predicate path [meta/text()/id]",
-        "Unsupported XPath path shapes should stay in the unsupported XmlException category");
-
-    expectXmlExceptionContaining(
-        [] {
-            (void)XmlDocument::Parse("<!DOCTYPE root [<!ENTITY % pe 'value'>]><root/>");
-        },
-        "Unsupported DTD declaration: parameter entity",
-        "Unsupported DTD declarations should stay in the unsupported XmlException category");
+    Assert(document->SelectNodes("/root/item[meta/text()/id='x']").Count() == 0,
+        "Non-terminal text() predicate paths should stay in the empty-result category in broad exception coverage tests");
 
     expectXmlExceptionContaining(
         [] {
@@ -16202,6 +17434,19 @@ void TestXmlReaderConfiguration() {
         "IgnoreProcessingInstructions should suppress processing instruction nodes");
 
     {
+        auto stylesheetReader = XmlReader::Create(
+            "<?xml version=\"1.0\"?><?xml-stylesheet href=\"xmlconf.xml\" type=\"text/xsl\"?><root/>");
+        Assert(stylesheetReader.Read() && stylesheetReader.NodeType() == XmlNodeType::XmlDeclaration,
+            "Reader should expose the XML declaration first when xml-stylesheet follows it");
+        Assert(stylesheetReader.Read() && stylesheetReader.NodeType() == XmlNodeType::ProcessingInstruction,
+            "Reader should classify xml-stylesheet as a processing instruction");
+        Assert(stylesheetReader.Name() == "xml-stylesheet",
+            "xml-stylesheet processing instruction name mismatch in XmlReader");
+        Assert(stylesheetReader.Read() && stylesheetReader.NodeType() == XmlNodeType::Element && stylesheetReader.Name() == "root",
+            "Reader should continue to the root element after xml-stylesheet");
+    }
+
+    {
         XmlReaderSettings settings;
         settings.DtdProcessing = DtdProcessing::Prohibit;
         bool threw = false;
@@ -16236,6 +17481,29 @@ void TestXmlReaderConfiguration() {
             threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
         }
         Assert(threw, "MaxCharactersInDocument should stop oversized input");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:maxchars-string\">"
+            "  <xs:element name=\"root\" type=\"xs:string\"/>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+        settings.MaxCharactersInDocument = 5;
+
+        bool threw = false;
+        try {
+            auto limited = XmlReader::Create("<root xmlns=\"urn:maxchars-string\">123456</root>", settings);
+            while (limited.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
+        }
+        Assert(threw, "Schema-validating string reader should still stop oversized input");
     }
 
     {
@@ -16311,6 +17579,62 @@ void TestXmlReaderConfiguration() {
                 && static_cast<std::size_t>(consumedBeforeFailure) < streamXml.size(),
             "MaxCharactersInDocument should not force full stream consumption before failing");
         Assert(threw, "Stream-backed MaxCharactersInDocument should still stop oversized input without fully consuming the stream");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:maxchars-stream\">"
+            "  <xs:element name=\"root\" type=\"xs:string\"/>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+        settings.MaxCharactersInDocument = 5;
+
+        std::string payload(100000, 'x');
+        std::string streamXml = "<root xmlns=\"urn:maxchars-stream\">" + payload + "</root>";
+        std::istringstream stream(streamXml);
+        bool threw = false;
+        try {
+            auto limited = XmlReader::Create(stream, settings);
+            while (limited.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
+        }
+        const auto consumedBeforeFailure = stream.tellg();
+        Assert(consumedBeforeFailure != std::streampos(-1)
+                && static_cast<std::size_t>(consumedBeforeFailure) < streamXml.size(),
+            "Schema-validating seekable stream reader should not force full stream consumption before failing MaxCharactersInDocument");
+        Assert(threw, "Schema-validating seekable stream reader should still stop oversized input");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:maxchars-nonseek\">"
+            "  <xs:element name=\"root\" type=\"xs:string\"/>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+        settings.MaxCharactersInDocument = 5;
+
+        std::string payload(100000, 'x');
+        NonSeekableStringStream stream(
+            "<root xmlns=\"urn:maxchars-nonseek\">" + payload + "</root>");
+        bool threw = false;
+        try {
+            auto limited = XmlReader::Create(stream, settings);
+            while (limited.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
+        }
+        Assert(threw, "Schema-validating non-seekable stream reader should still stop oversized input");
     }
 
     {
@@ -16963,7 +18287,7 @@ void TestXmlReaderConfiguration() {
 
         const auto predicateSelectorIdentitySchemas = std::make_shared<XmlSchemaSet>();
         predicateSelectorIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-selector\" targetNamespace=\"urn:reader-identity-fallback-selector\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-predicate-selector\" targetNamespace=\"urn:reader-identity-predicate-selector\">"
             "  <xs:element name=\"catalog\">"
             "    <xs:complexType>"
             "      <xs:sequence>"
@@ -16998,7 +18322,7 @@ void TestXmlReaderConfiguration() {
         predicateSelectorIdentitySettings.Schemas = predicateSelectorIdentitySchemas;
 
         auto predicateSelectorIdentityReader = XmlReader::Create(
-            "<catalog xmlns=\"urn:reader-identity-fallback-selector\">"
+            "<catalog xmlns=\"urn:reader-identity-predicate-selector\">"
             "  <section kind=\"primary\">"
             "    <book id=\"b1\"/>"
             "    <reference bookId=\"b1\"/>"
@@ -17015,7 +18339,7 @@ void TestXmlReaderConfiguration() {
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<catalog xmlns=\"urn:reader-identity-fallback-selector\">"
+                "<catalog xmlns=\"urn:reader-identity-predicate-selector\">"
                 "  <section kind=\"primary\">"
                 "    <book id=\"b1\"/>"
                 "    <reference bookId=\"missing\"/>"
@@ -17034,7 +18358,7 @@ void TestXmlReaderConfiguration() {
 
         const auto predicateFieldIdentitySchemas = std::make_shared<XmlSchemaSet>();
         predicateFieldIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-field\" targetNamespace=\"urn:reader-identity-fallback-field\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-predicate-field\" targetNamespace=\"urn:reader-identity-predicate-field\">"
             "  <xs:element name=\"catalog\">"
             "    <xs:complexType>"
             "      <xs:sequence>"
@@ -17077,7 +18401,7 @@ void TestXmlReaderConfiguration() {
         predicateFieldIdentitySettings.Schemas = predicateFieldIdentitySchemas;
 
         auto predicateFieldIdentityReader = XmlReader::Create(
-            "<catalog xmlns=\"urn:reader-identity-fallback-field\">"
+            "<catalog xmlns=\"urn:reader-identity-predicate-field\">"
             "  <section>"
             "    <book>"
             "      <meta kind=\"alternate\" id=\"ignored\"/>"
@@ -17093,7 +18417,7 @@ void TestXmlReaderConfiguration() {
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<catalog xmlns=\"urn:reader-identity-fallback-field\">"
+                "<catalog xmlns=\"urn:reader-identity-predicate-field\">"
                 "  <section>"
                 "    <book>"
                 "      <meta kind=\"alternate\" id=\"ignored\"/>"
@@ -17372,7 +18696,7 @@ void TestXmlReaderConfiguration() {
 
         const auto axisFieldIdentitySchemas = std::make_shared<XmlSchemaSet>();
         axisFieldIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-axis-field\" targetNamespace=\"urn:reader-identity-fallback-axis-field\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-axis-field\" targetNamespace=\"urn:reader-identity-axis-field\">"
             "  <xs:element name=\"catalog\">"
             "    <xs:complexType>"
             "      <xs:sequence>"
@@ -17406,7 +18730,7 @@ void TestXmlReaderConfiguration() {
         axisFieldIdentitySettings.Schemas = axisFieldIdentitySchemas;
 
         auto axisFieldIdentityReader = XmlReader::Create(
-            "<catalog xmlns=\"urn:reader-identity-fallback-axis-field\">"
+            "<catalog xmlns=\"urn:reader-identity-axis-field\">"
             "  <section>"
             "    <book token=\"b1\"/>"
             "    <reference tokenRef=\"b1\"/>"
@@ -17419,7 +18743,7 @@ void TestXmlReaderConfiguration() {
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<catalog xmlns=\"urn:reader-identity-fallback-axis-field\">"
+                "<catalog xmlns=\"urn:reader-identity-axis-field\">"
                 "  <section>"
                 "    <book token=\"b1\"/>"
                 "    <reference tokenRef=\"missing\"/>"
@@ -17434,7 +18758,7 @@ void TestXmlReaderConfiguration() {
 
         const auto ancestorFieldIdentitySchemas = std::make_shared<XmlSchemaSet>();
         ancestorFieldIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-ancestor-field\" targetNamespace=\"urn:reader-identity-fallback-ancestor-field\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-ancestor-axis-field\" targetNamespace=\"urn:reader-identity-ancestor-axis-field\">"
             "  <xs:element name=\"catalog\">"
             "    <xs:complexType>"
             "      <xs:sequence>"
@@ -17475,7 +18799,7 @@ void TestXmlReaderConfiguration() {
         ancestorFieldIdentitySettings.Schemas = ancestorFieldIdentitySchemas;
 
         auto ancestorFieldIdentityReader = XmlReader::Create(
-            "<catalog xmlns=\"urn:reader-identity-fallback-ancestor-field\">"
+            "<catalog xmlns=\"urn:reader-identity-ancestor-axis-field\">"
             "  <section>"
             "    <book token=\"b1\">"
             "      <meta marker=\"first\"/>"
@@ -17490,7 +18814,7 @@ void TestXmlReaderConfiguration() {
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<catalog xmlns=\"urn:reader-identity-fallback-ancestor-field\">"
+                "<catalog xmlns=\"urn:reader-identity-ancestor-axis-field\">"
                 "  <section>"
                 "    <book token=\"b1\">"
                 "      <meta marker=\"first\"/>"
@@ -17908,7 +19232,7 @@ void TestXmlReaderConfiguration() {
 
         const auto wildcardFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
         wildcardFallbackIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-wildcard\" targetNamespace=\"urn:reader-identity-fallback-wildcard\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-positional-fallback-wildcard\" targetNamespace=\"urn:reader-identity-positional-fallback-wildcard\">"
             "  <xs:element name=\"container\">"
             "    <xs:complexType>"
             "      <xs:sequence>"
@@ -17949,7 +19273,7 @@ void TestXmlReaderConfiguration() {
         wildcardFallbackIdentitySettings.Schemas = wildcardFallbackIdentitySchemas;
 
         auto wildcardFallbackIdentityReader = XmlReader::Create(
-            "<container xmlns=\"urn:reader-identity-fallback-wildcard\">"
+            "<container xmlns=\"urn:reader-identity-positional-fallback-wildcard\">"
             "  <catalog>"
             "    <section>"
             "      <book id=\"ignored\"/>"
@@ -17960,12 +19284,12 @@ void TestXmlReaderConfiguration() {
             "</container>",
             wildcardFallbackIdentitySettings);
         Assert(wildcardFallbackIdentityReader.Read() && wildcardFallbackIdentityReader.Name() == "container",
-            "Schema-valid wildcard-reachable unsupported identity-constraint reader input should fall back and still create a working reader");
+            "Schema-valid wildcard-reachable positional-selector identity-constraint reader input should fall back and still create a working reader");
 
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<container xmlns=\"urn:reader-identity-fallback-wildcard\">"
+                "<container xmlns=\"urn:reader-identity-positional-fallback-wildcard\">"
                 "  <catalog>"
                 "    <section>"
                 "      <book id=\"ignored\"/>"
@@ -17979,11 +19303,11 @@ void TestXmlReaderConfiguration() {
             threw = std::string(exception.what()).find("posBookRef") != std::string::npos
                 && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
         }
-        Assert(threw, "Schema-invalid wildcard-reachable unsupported identity-constraint reader input should fail during DOM fallback validation");
+        Assert(threw, "Schema-invalid wildcard-reachable positional-selector identity-constraint reader input should fail during DOM fallback validation");
 
         const auto xsiTypeFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
         xsiTypeFallbackIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-xsitype\" targetNamespace=\"urn:reader-identity-fallback-xsitype\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-positional-fallback-xsitype\" targetNamespace=\"urn:reader-identity-positional-fallback-xsitype\">"
             "  <xs:complexType name=\"BaseRootType\">"
             "    <xs:sequence/>"
             "  </xs:complexType>"
@@ -18030,7 +19354,7 @@ void TestXmlReaderConfiguration() {
         xsiTypeFallbackIdentitySettings.Schemas = xsiTypeFallbackIdentitySchemas;
 
         auto xsiTypeFallbackIdentityReader = XmlReader::Create(
-            "<dynamicRoot xmlns=\"urn:reader-identity-fallback-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DerivedRootType\">"
+            "<dynamicRoot xmlns=\"urn:reader-identity-positional-fallback-xsitype\" xmlns:tns=\"urn:reader-identity-positional-fallback-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DerivedRootType\">"
             "  <catalog>"
             "    <section>"
             "      <book id=\"ignored\"/>"
@@ -18041,12 +19365,12 @@ void TestXmlReaderConfiguration() {
             "</dynamicRoot>",
             xsiTypeFallbackIdentitySettings);
         Assert(xsiTypeFallbackIdentityReader.Read() && xsiTypeFallbackIdentityReader.Name() == "dynamicRoot",
-            "Schema-valid root xsi:type-reachable unsupported identity-constraint reader input should fall back and still create a working reader");
+            "Schema-valid root xsi:type-reachable positional-selector identity-constraint reader input should fall back and still create a working reader");
 
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<dynamicRoot xmlns=\"urn:reader-identity-fallback-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DerivedRootType\">"
+                "<dynamicRoot xmlns=\"urn:reader-identity-positional-fallback-xsitype\" xmlns:tns=\"urn:reader-identity-positional-fallback-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"tns:DerivedRootType\">"
                 "  <catalog>"
                 "    <section>"
                 "      <book id=\"ignored\"/>"
@@ -18060,11 +19384,11 @@ void TestXmlReaderConfiguration() {
             threw = std::string(exception.what()).find("xsiTypePosBookRef") != std::string::npos
                 && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
         }
-        Assert(threw, "Schema-invalid root xsi:type-reachable unsupported identity-constraint reader input should fail during DOM fallback validation");
+        Assert(threw, "Schema-invalid root xsi:type-reachable positional-selector identity-constraint reader input should fail during DOM fallback validation");
 
         const auto nestedXsiTypeFallbackIdentitySchemas = std::make_shared<XmlSchemaSet>();
         nestedXsiTypeFallbackIdentitySchemas->AddXml(
-            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" targetNamespace=\"urn:reader-identity-fallback-nested-xsitype\">"
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:tns=\"urn:reader-identity-positional-fallback-nested-xsitype\" targetNamespace=\"urn:reader-identity-positional-fallback-nested-xsitype\">"
             "  <xs:complexType name=\"BasePayloadType\">"
             "    <xs:sequence/>"
             "  </xs:complexType>"
@@ -18117,7 +19441,7 @@ void TestXmlReaderConfiguration() {
         nestedXsiTypeFallbackIdentitySettings.Schemas = nestedXsiTypeFallbackIdentitySchemas;
 
         auto nestedXsiTypeFallbackIdentityReader = XmlReader::Create(
-            "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+            "<root xmlns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
             "  <payload xsi:type=\"tns:DerivedPayloadType\">"
             "    <catalog>"
             "      <section>"
@@ -18130,12 +19454,12 @@ void TestXmlReaderConfiguration() {
             "</root>",
             nestedXsiTypeFallbackIdentitySettings);
         Assert(nestedXsiTypeFallbackIdentityReader.Read() && nestedXsiTypeFallbackIdentityReader.Name() == "root",
-            "Schema-valid nested xsi:type-reachable unsupported identity-constraint reader input should fall back and still create a working reader");
+            "Schema-valid nested xsi:type-reachable positional-selector identity-constraint reader input should fall back and still create a working reader");
 
         threw = false;
         try {
             (void)XmlReader::Create(
-                "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+                "<root xmlns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
                 "  <payload xsi:type=\"tns:DerivedPayloadType\">"
                 "    <catalog>"
                 "      <section>"
@@ -18151,10 +19475,10 @@ void TestXmlReaderConfiguration() {
             threw = std::string(exception.what()).find("nestedXsiTypePosBookRef") != std::string::npos
                 && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
         }
-        Assert(threw, "Schema-invalid nested xsi:type-reachable unsupported identity-constraint reader input should fail during DOM fallback validation");
+        Assert(threw, "Schema-invalid nested xsi:type-reachable positional-selector identity-constraint reader input should fail during DOM fallback validation");
 
         auto positionedNestedXsiTypeFallbackReader = XmlReader::Create(
-            "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+            "<root xmlns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
             "  <payload xsi:type=\"tns:DerivedPayloadType\">"
             "    <catalog>"
             "      <section>"
@@ -18166,13 +19490,13 @@ void TestXmlReaderConfiguration() {
             "  </payload>"
             "</root>");
         Assert(positionedNestedXsiTypeFallbackReader.Read() && positionedNestedXsiTypeFallbackReader.Name() == "root",
-            "Positioned nested xsi:type fallback setup reader should reach the root element before validation");
+            "Positioned nested xsi:type positional fallback setup reader should reach the root element before validation");
         ValidateXmlReaderInputAgainstSchemas(positionedNestedXsiTypeFallbackReader, nestedXsiTypeFallbackIdentitySettings);
 
         threw = false;
         try {
             auto invalidPositionedNestedXsiTypeFallbackReader = XmlReader::Create(
-                "<root xmlns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+                "<root xmlns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:tns=\"urn:reader-identity-positional-fallback-nested-xsitype\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
                 "  <payload xsi:type=\"tns:DerivedPayloadType\">"
                 "    <catalog>"
                 "      <section>"
@@ -18184,13 +19508,13 @@ void TestXmlReaderConfiguration() {
                 "  </payload>"
                 "</root>");
             Assert(invalidPositionedNestedXsiTypeFallbackReader.Read() && invalidPositionedNestedXsiTypeFallbackReader.Name() == "root",
-                "Invalid positioned nested xsi:type fallback setup reader should reach the root element before validation");
+                "Invalid positioned nested xsi:type positional fallback setup reader should reach the root element before validation");
             ValidateXmlReaderInputAgainstSchemas(invalidPositionedNestedXsiTypeFallbackReader, nestedXsiTypeFallbackIdentitySettings);
         } catch (const XmlException& exception) {
             threw = std::string(exception.what()).find("nestedXsiTypePosBookRef") != std::string::npos
                 && std::string(exception.what()).find("no matching key/unique tuple") != std::string::npos;
         }
-        Assert(threw, "Schema-invalid positioned nested xsi:type fallback input should still fail during DOM fallback validation");
+        Assert(threw, "Schema-invalid positioned nested xsi:type positional fallback input should still fail during DOM fallback validation");
 
         const auto listUnionSchemas = std::make_shared<XmlSchemaSet>();
         listUnionSchemas->AddXml(
@@ -18447,6 +19771,32 @@ void TestXmlDocumentStreamsAndEvents() {
     }
 
     {
+        const auto path = std::filesystem::temp_directory_path() / "libxml-document-load-path.xml";
+        {
+            std::ofstream stream(path, std::ios::binary);
+            stream
+                << "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                << "<!DOCTYPE root [<!ENTITY label \"copy\">]>"
+                << "<root>&label;</root>";
+        }
+
+        XmlDocument document;
+        document.Load(path.string());
+
+        Assert(document.Declaration() != nullptr && document.Declaration()->Encoding() == "utf-8",
+            "Document path load should preserve the XML declaration");
+        Assert(document.DocumentType() != nullptr
+                && document.DocumentType()->Entities().GetNamedItem("label") != nullptr,
+            "Document path load should preserve DOCTYPE entity declarations");
+        Assert(document.DocumentElement() != nullptr
+                && document.DocumentElement()->FirstChild() != nullptr
+                && document.DocumentElement()->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+            "Document path load should preserve entity references in element content");
+
+        std::filesystem::remove(path);
+    }
+
+    {
         std::istringstream input("<root>  <child/>  </root>");
         XmlDocument document;
         document.SetPreserveWhitespace(true);
@@ -18633,7 +19983,9 @@ void TestXPathAxes() {
         "  </group>"
         "  <group id=\"g2\">"
         "    <item id=\"d\">delta</item>"
+        "    <!--gap-->"
         "    <extra>bonus</extra>"
+        "    <?mark ready?>"
         "    <item id=\"e\">epsilon</item>"
         "  </group>"
         "</root>");
@@ -18690,6 +20042,36 @@ void TestXPathAxes() {
     const auto precedingSiblings = static_cast<XmlElement*>(lastItem.get())->SelectNodes("preceding-sibling::item");
     Assert(precedingSiblings.Count() == 2,
         "preceding-sibling::item should find 2 siblings before item c");
+    Assert(static_cast<XmlElement*>(precedingSiblings.Item(0).get())->GetAttribute("id") == "a"
+            && static_cast<XmlElement*>(precedingSiblings.Item(1).get())->GetAttribute("id") == "b",
+        "preceding-sibling::item should enumerate in document order");
+
+    const auto g1Attribute = root->SelectSingleNode("group[@id='g1']/@id");
+    Assert(g1Attribute != nullptr && g1Attribute->NodeType() == XmlNodeType::Attribute,
+        "XPath axes g1 attribute missing");
+    Assert(g1Attribute->SelectNodes("following-sibling::node()").Count() == 0,
+        "following-sibling axis from an attribute should be empty");
+    Assert(g1Attribute->SelectNodes("preceding-sibling::node()").Count() == 0,
+        "preceding-sibling axis from an attribute should be empty");
+    const auto attributeFollowingItems = g1Attribute->SelectNodes("following::item");
+    Assert(attributeFollowingItems.Count() == 5,
+        "following::item from a group attribute should include the group's descendants and later items");
+    Assert(static_cast<XmlElement*>(attributeFollowingItems.Item(0).get())->GetAttribute("id") == "a"
+            && static_cast<XmlElement*>(attributeFollowingItems.Item(1).get())->GetAttribute("id") == "b"
+            && static_cast<XmlElement*>(attributeFollowingItems.Item(2).get())->GetAttribute("id") == "c"
+            && static_cast<XmlElement*>(attributeFollowingItems.Item(3).get())->GetAttribute("id") == "d"
+            && static_cast<XmlElement*>(attributeFollowingItems.Item(4).get())->GetAttribute("id") == "e",
+        "following axis from an attribute should preserve document order");
+    const auto g2Attribute = root->SelectSingleNode("group[@id='g2']/@id");
+    Assert(g2Attribute != nullptr && g2Attribute->NodeType() == XmlNodeType::Attribute,
+        "XPath axes g2 attribute missing");
+    const auto attributePrecedingItems = g2Attribute->SelectNodes("preceding::item");
+    Assert(attributePrecedingItems.Count() == 3,
+        "preceding::item from a group attribute should exclude the group's own descendants");
+    Assert(static_cast<XmlElement*>(attributePrecedingItems.Item(0).get())->GetAttribute("id") == "a"
+            && static_cast<XmlElement*>(attributePrecedingItems.Item(1).get())->GetAttribute("id") == "b"
+            && static_cast<XmlElement*>(attributePrecedingItems.Item(2).get())->GetAttribute("id") == "c",
+        "preceding axis from an attribute should enumerate in document order");
 
     // following axis
     const auto g1 = root->SelectSingleNode("group[@id='g1']");
@@ -18708,11 +20090,172 @@ void TestXPathAxes() {
     const auto precedingItems = static_cast<XmlElement*>(e.get())->SelectNodes("preceding::item");
     Assert(precedingItems.Count() >= 3,
         "preceding::item from e should find items a, b, c, and d");
+    Assert(precedingItems.Item(0) != nullptr
+            && static_cast<XmlElement*>(precedingItems.Item(0).get())->GetAttribute("id") == "a"
+            && precedingItems.Item(1) != nullptr
+            && static_cast<XmlElement*>(precedingItems.Item(1).get())->GetAttribute("id") == "b"
+            && precedingItems.Item(2) != nullptr
+            && static_cast<XmlElement*>(precedingItems.Item(2).get())->GetAttribute("id") == "c"
+            && precedingItems.Item(3) != nullptr
+            && static_cast<XmlElement*>(precedingItems.Item(3).get())->GetAttribute("id") == "d",
+        "preceding::item should enumerate in document order");
+    const auto nestedChild = root->SelectSingleNode("group[@id='g1']/item[@id='a']/text()");
+    Assert(nestedChild != nullptr, "XPath axes nested text node missing");
+    const auto ancestorNodes = nestedChild->SelectNodes("ancestor::node()");
+    Assert(ancestorNodes.Count() == 4
+            && ancestorNodes.Item(0) != nullptr
+            && ancestorNodes.Item(0)->NodeType() == XmlNodeType::Document
+            && ancestorNodes.Item(1) != nullptr
+            && ancestorNodes.Item(1)->Name() == "root"
+            && ancestorNodes.Item(2) != nullptr
+            && ancestorNodes.Item(2)->Name() == "group"
+            && ancestorNodes.Item(3) != nullptr
+            && ancestorNodes.Item(3)->Name() == "item",
+        "ancestor::node() should enumerate ancestors in document order");
 
     // node() test
     const auto allNodes = root->SelectNodes("group[@id='g2']/node()");
     Assert(allNodes.Count() >= 3,
         "node() should match all child nodes including text, elements, etc.");
+
+    const auto commentNodes = root->SelectNodes("group[@id='g2']/comment()");
+    Assert(commentNodes.Count() == 1,
+        "comment() node tests should match comment children");
+    Assert(commentNodes.Item(0) != nullptr
+            && commentNodes.Item(0)->NodeType() == XmlNodeType::Comment
+            && commentNodes.Item(0)->Value() == "gap",
+        "comment() node test result mismatch");
+    const auto commentNode = commentNodes.Item(0);
+    Assert(commentNode->SelectSingleNode("self::comment()") != nullptr,
+        "comment nodes should preserve self::comment() as the current context");
+    Assert(commentNode->SelectSingleNode("parent::group") != nullptr
+            && static_cast<XmlElement*>(commentNode->SelectSingleNode("parent::group").get())->GetAttribute("id") == "g2",
+        "comment nodes should resolve parent:: against the owning element");
+    Assert(commentNode->SelectSingleNode("following-sibling::processing-instruction('mark')") != nullptr
+            && commentNode->SelectSingleNode("following-sibling::processing-instruction('mark')")->NodeType() == XmlNodeType::ProcessingInstruction,
+        "comment nodes should resolve following-sibling::processing-instruction() directly");
+
+    const auto processingInstructions = root->SelectNodes("group[@id='g2']/processing-instruction()");
+    Assert(processingInstructions.Count() == 1,
+        "processing-instruction() node tests should match PI children");
+    Assert(processingInstructions.Item(0) != nullptr
+            && processingInstructions.Item(0)->NodeType() == XmlNodeType::ProcessingInstruction
+            && processingInstructions.Item(0)->Name() == "mark"
+            && processingInstructions.Item(0)->Value() == "ready",
+        "processing-instruction() node test result mismatch");
+    const auto processingInstructionNode = processingInstructions.Item(0);
+    Assert(processingInstructionNode->SelectSingleNode("self::processing-instruction('mark')") != nullptr,
+        "processing instruction nodes should preserve self::processing-instruction('target') as the current context");
+    Assert(processingInstructionNode->SelectSingleNode("preceding-sibling::comment()") != nullptr
+            && processingInstructionNode->SelectSingleNode("preceding-sibling::comment()")->NodeType() == XmlNodeType::Comment,
+        "processing instruction nodes should resolve preceding-sibling::comment() directly");
+    Assert(processingInstructionNode->SelectSingleNode("parent::group") != nullptr
+            && static_cast<XmlElement*>(processingInstructionNode->SelectSingleNode("parent::group").get())->GetAttribute("id") == "g2",
+        "processing instruction nodes should resolve parent:: against the owning element");
+
+    const auto targetedProcessingInstructions = root->SelectNodes("group[@id='g2']/processing-instruction('mark')");
+    Assert(targetedProcessingInstructions.Count() == 1,
+        "processing-instruction('target') should filter PI nodes by target");
+    Assert(root->SelectNodes("group[@id='g2']/processing-instruction('other')").Count() == 0,
+        "processing-instruction('target') should return an empty result for non-matching targets");
+
+    const auto mixedSiblingDocument = XmlDocument::Parse(
+        "<root><item>a<?mark mid?><child/><!--tail-->b</item></root>");
+    const auto mixedLeadingText = mixedSiblingDocument->SelectSingleNode("/root/item/text()[1]");
+    const auto mixedProcessingInstruction = mixedSiblingDocument->SelectSingleNode("/root/item/processing-instruction('mark')");
+    const auto mixedComment = mixedSiblingDocument->SelectSingleNode("/root/item/comment()");
+    const auto mixedTrailingText = mixedSiblingDocument->SelectSingleNode("/root/item/text()[2]");
+    Assert(mixedLeadingText != nullptr && mixedProcessingInstruction != nullptr && mixedComment != nullptr && mixedTrailingText != nullptr,
+        "Mixed sibling-axis test nodes should all be present");
+    const auto leadingTextFollowingSiblings = mixedLeadingText->SelectNodes("following-sibling::node()");
+    Assert(leadingTextFollowingSiblings.Count() == 4
+            && leadingTextFollowingSiblings.Item(0) != nullptr && leadingTextFollowingSiblings.Item(0)->NodeType() == XmlNodeType::ProcessingInstruction
+            && leadingTextFollowingSiblings.Item(1) != nullptr && leadingTextFollowingSiblings.Item(1)->NodeType() == XmlNodeType::Element
+            && leadingTextFollowingSiblings.Item(2) != nullptr && leadingTextFollowingSiblings.Item(2)->NodeType() == XmlNodeType::Comment
+            && leadingTextFollowingSiblings.Item(3) != nullptr && leadingTextFollowingSiblings.Item(3)->NodeType() == XmlNodeType::Text
+            && leadingTextFollowingSiblings.Item(3)->Value() == "b",
+        "following-sibling::node() from a text node should keep mixed sibling node types in document order");
+    const auto processingInstructionPrecedingSiblings = mixedProcessingInstruction->SelectNodes("preceding-sibling::node()");
+    Assert(processingInstructionPrecedingSiblings.Count() == 1
+            && processingInstructionPrecedingSiblings.Item(0) != nullptr
+            && processingInstructionPrecedingSiblings.Item(0)->NodeType() == XmlNodeType::Text
+            && processingInstructionPrecedingSiblings.Item(0)->Value() == "a",
+        "preceding-sibling::node() from a processing instruction should keep prior text siblings");
+    const auto commentPrecedingSiblings = mixedComment->SelectNodes("preceding-sibling::node()");
+    Assert(commentPrecedingSiblings.Count() == 3
+            && commentPrecedingSiblings.Item(0) != nullptr && commentPrecedingSiblings.Item(0)->NodeType() == XmlNodeType::Text
+            && commentPrecedingSiblings.Item(1) != nullptr && commentPrecedingSiblings.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction
+            && commentPrecedingSiblings.Item(2) != nullptr && commentPrecedingSiblings.Item(2)->NodeType() == XmlNodeType::Element,
+        "preceding-sibling::node() from a comment should preserve mixed sibling order");
+    const auto trailingTextPrecedingSiblings = mixedTrailingText->SelectNodes("preceding-sibling::node()");
+    Assert(trailingTextPrecedingSiblings.Count() == 4
+            && trailingTextPrecedingSiblings.Item(0) != nullptr && trailingTextPrecedingSiblings.Item(0)->NodeType() == XmlNodeType::Text
+            && trailingTextPrecedingSiblings.Item(0)->Value() == "a"
+            && trailingTextPrecedingSiblings.Item(1) != nullptr && trailingTextPrecedingSiblings.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction
+            && trailingTextPrecedingSiblings.Item(2) != nullptr && trailingTextPrecedingSiblings.Item(2)->NodeType() == XmlNodeType::Element
+            && trailingTextPrecedingSiblings.Item(3) != nullptr && trailingTextPrecedingSiblings.Item(3)->NodeType() == XmlNodeType::Comment,
+        "preceding-sibling::node() from a text node should preserve mixed sibling order");
+    Assert(mixedSiblingDocument->SelectSingleNode("/root/item/node()[last()]") != nullptr
+            && mixedSiblingDocument->SelectSingleNode("/root/item/node()[last()]")->NodeType() == XmlNodeType::Text
+            && mixedSiblingDocument->SelectSingleNode("/root/item/node()[last()]")->Value() == "b",
+        "node()[last()] should select the last node in a mixed child node-set");
+    Assert(mixedSiblingDocument->SelectSingleNode("/root/item/node()[position()=2]") != nullptr
+            && mixedSiblingDocument->SelectSingleNode("/root/item/node()[position()=2]")->NodeType() == XmlNodeType::ProcessingInstruction
+            && mixedSiblingDocument->SelectSingleNode("/root/item/node()[position()=2]")->Name() == "mark",
+        "node()[position()=2] should select the second node in a mixed child node-set");
+    Assert(mixedSiblingDocument->SelectSingleNode("/root/item/text()[last()]") != nullptr
+            && mixedSiblingDocument->SelectSingleNode("/root/item/text()[last()]")->NodeType() == XmlNodeType::Text
+            && mixedSiblingDocument->SelectSingleNode("/root/item/text()[last()]")->Value() == "b",
+        "text()[last()] should select the last text child");
+    Assert(mixedSiblingDocument->SelectSingleNode("/root/item/comment()[last()]") != nullptr
+            && mixedSiblingDocument->SelectSingleNode("/root/item/comment()[last()]")->NodeType() == XmlNodeType::Comment
+            && mixedSiblingDocument->SelectSingleNode("/root/item/comment()[last()]")->Value() == "tail",
+        "comment()[last()] should select the last comment child");
+    Assert(mixedSiblingDocument->SelectSingleNode("/root/item/processing-instruction('mark')[last()]") != nullptr
+            && mixedSiblingDocument->SelectSingleNode("/root/item/processing-instruction('mark')[last()]")->NodeType() == XmlNodeType::ProcessingInstruction
+            && mixedSiblingDocument->SelectSingleNode("/root/item/processing-instruction('mark')[last()]")->Value() == "mid",
+        "processing-instruction()[last()] should select the last matching PI child");
+    const auto oddMixedNodes = mixedSiblingDocument->SelectNodes("/root/item/node()[position() mod 2 = 1]");
+    Assert(oddMixedNodes.Count() == 3
+            && oddMixedNodes.Item(0) != nullptr && oddMixedNodes.Item(0)->NodeType() == XmlNodeType::Text && oddMixedNodes.Item(0)->Value() == "a"
+            && oddMixedNodes.Item(1) != nullptr && oddMixedNodes.Item(1)->NodeType() == XmlNodeType::Element && oddMixedNodes.Item(1)->Name() == "child"
+            && oddMixedNodes.Item(2) != nullptr && oddMixedNodes.Item(2)->NodeType() == XmlNodeType::Text && oddMixedNodes.Item(2)->Value() == "b",
+        "position() modulo filters should work over mixed child node-sets");
+    const auto mixedDocumentOrderDocument = XmlDocument::Parse(
+        "<root><a>t1<b/><?p one?><c><!--x--></c></a><d>t2</d><?q two?><e/></root>");
+    const auto mixedDocumentOrderLeadingText = mixedDocumentOrderDocument->SelectSingleNode("/root/a/text()");
+    const auto mixedDocumentOrderComment = mixedDocumentOrderDocument->SelectSingleNode("/root/a/c/comment()");
+    Assert(mixedDocumentOrderLeadingText != nullptr && mixedDocumentOrderComment != nullptr,
+        "Mixed document-order axis test nodes should be present");
+    const auto leadingTextFollowingNodes = mixedDocumentOrderLeadingText->SelectNodes("following::node()");
+    Assert(leadingTextFollowingNodes.Count() == 8
+            && leadingTextFollowingNodes.Item(0) != nullptr && leadingTextFollowingNodes.Item(0)->NodeType() == XmlNodeType::Element && leadingTextFollowingNodes.Item(0)->Name() == "b"
+            && leadingTextFollowingNodes.Item(1) != nullptr && leadingTextFollowingNodes.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction && leadingTextFollowingNodes.Item(1)->Name() == "p"
+            && leadingTextFollowingNodes.Item(2) != nullptr && leadingTextFollowingNodes.Item(2)->NodeType() == XmlNodeType::Element && leadingTextFollowingNodes.Item(2)->Name() == "c"
+            && leadingTextFollowingNodes.Item(3) != nullptr && leadingTextFollowingNodes.Item(3)->NodeType() == XmlNodeType::Comment
+            && leadingTextFollowingNodes.Item(4) != nullptr && leadingTextFollowingNodes.Item(4)->NodeType() == XmlNodeType::Element && leadingTextFollowingNodes.Item(4)->Name() == "d"
+            && leadingTextFollowingNodes.Item(5) != nullptr && leadingTextFollowingNodes.Item(5)->NodeType() == XmlNodeType::Text && leadingTextFollowingNodes.Item(5)->Value() == "t2"
+            && leadingTextFollowingNodes.Item(6) != nullptr && leadingTextFollowingNodes.Item(6)->NodeType() == XmlNodeType::ProcessingInstruction && leadingTextFollowingNodes.Item(6)->Name() == "q"
+            && leadingTextFollowingNodes.Item(7) != nullptr && leadingTextFollowingNodes.Item(7)->NodeType() == XmlNodeType::Element && leadingTextFollowingNodes.Item(7)->Name() == "e",
+        "following::node() should preserve document order across mixed nested content");
+    const auto commentPrecedingNodes = mixedDocumentOrderComment->SelectNodes("preceding::node()");
+    Assert(commentPrecedingNodes.Count() == 3
+            && commentPrecedingNodes.Item(0) != nullptr && commentPrecedingNodes.Item(0)->NodeType() == XmlNodeType::Text && commentPrecedingNodes.Item(0)->Value() == "t1"
+            && commentPrecedingNodes.Item(1) != nullptr && commentPrecedingNodes.Item(1)->NodeType() == XmlNodeType::Element && commentPrecedingNodes.Item(1)->Name() == "b"
+            && commentPrecedingNodes.Item(2) != nullptr && commentPrecedingNodes.Item(2)->NodeType() == XmlNodeType::ProcessingInstruction && commentPrecedingNodes.Item(2)->Name() == "p",
+        "preceding::node() should preserve document order across mixed nested content");
+    const auto leadingTextFollowingText = mixedDocumentOrderLeadingText->SelectNodes("following::text()");
+    Assert(leadingTextFollowingText.Count() == 1
+            && leadingTextFollowingText.Item(0) != nullptr
+            && leadingTextFollowingText.Item(0)->NodeType() == XmlNodeType::Text
+            && leadingTextFollowingText.Item(0)->Value() == "t2",
+        "following::text() should filter mixed following nodes down to text descendants");
+    const auto commentPrecedingPi = mixedDocumentOrderComment->SelectNodes("preceding::processing-instruction('p')");
+    Assert(commentPrecedingPi.Count() == 1
+            && commentPrecedingPi.Item(0) != nullptr
+            && commentPrecedingPi.Item(0)->NodeType() == XmlNodeType::ProcessingInstruction
+            && commentPrecedingPi.Item(0)->Name() == "p",
+        "preceding::processing-instruction() should filter mixed preceding nodes down to matching PI nodes");
 
     // self::element explicit axis with name filter
     const auto selfWithName = static_cast<XmlElement*>(g1.get())->SelectNodes("self::group");
@@ -18731,6 +20274,58 @@ void TestXPathAxes() {
             && attributeAxis.Item(0)->NodeType() == XmlNodeType::Attribute
             && attributeAxis.Item(0)->Value() == "a",
         "attribute::id should return the requested attribute node");
+    const auto attributeNodeTest = static_cast<XmlElement*>(firstItem.get())->SelectNodes("attribute::node()");
+    Assert(attributeNodeTest.Count() == 1
+            && attributeNodeTest.Item(0) != nullptr
+            && attributeNodeTest.Item(0)->NodeType() == XmlNodeType::Attribute
+            && attributeNodeTest.Item(0)->Name() == "id"
+            && attributeNodeTest.Item(0)->Value() == "a",
+        "attribute::node() should match visible attribute nodes");
+    const auto attributePositionDocument = XmlDocument::Parse(
+        "<root>"
+        "  <item a='1' b='2'/>"
+        "  <item a='3' c='4'/>"
+        "</root>");
+    const auto attributePositionRoot = attributePositionDocument->DocumentElement();
+    Assert(attributePositionRoot != nullptr, "Attribute-position test root missing");
+    const auto firstAttributes = attributePositionRoot->SelectNodes("item/@*[1]");
+    Assert(firstAttributes.Count() == 2
+            && firstAttributes.Item(0) != nullptr && firstAttributes.Item(0)->Name() == "a" && firstAttributes.Item(0)->Value() == "1"
+            && firstAttributes.Item(1) != nullptr && firstAttributes.Item(1)->Name() == "a" && firstAttributes.Item(1)->Value() == "3",
+        "Attribute positional predicates should be evaluated per owning element");
+    const auto lastAttributes = attributePositionRoot->SelectNodes("item/@*[last()]");
+    Assert(lastAttributes.Count() == 2
+            && lastAttributes.Item(0) != nullptr && lastAttributes.Item(0)->Name() == "b" && lastAttributes.Item(0)->Value() == "2"
+            && lastAttributes.Item(1) != nullptr && lastAttributes.Item(1)->Name() == "c" && lastAttributes.Item(1)->Value() == "4",
+        "Attribute last() predicates should preserve per-element attribute order");
+    const auto trailingAttributes = attributePositionRoot->SelectNodes("item/@*[position()>1]");
+    Assert(trailingAttributes.Count() == 2
+            && trailingAttributes.Item(0) != nullptr && trailingAttributes.Item(0)->Name() == "b" && trailingAttributes.Item(0)->Value() == "2"
+            && trailingAttributes.Item(1) != nullptr && trailingAttributes.Item(1)->Name() == "c" && trailingAttributes.Item(1)->Value() == "4",
+        "Attribute position() comparisons should preserve document order across elements");
+    const auto attributeChainDocument = XmlDocument::Parse(
+        "<root id='r'>"
+        "  <group id='g1'><item id='a' code='x'>alpha</item><item id='b'/></group>"
+        "  <group id='g2'><item id='c' code='y'/></group>"
+        "</root>");
+    const auto attributeChainRoot = attributeChainDocument->DocumentElement();
+    Assert(attributeChainRoot != nullptr, "Chained attribute-axis test root missing");
+    const auto ancestorAttributeText = attributeChainRoot->SelectSingleNode("group[@id='g1']/item[@id='a']/text()");
+    Assert(ancestorAttributeText != nullptr, "Chained attribute-axis ancestor test text node missing");
+    const auto ancestorLeadingAttributes = ancestorAttributeText->SelectNodes("ancestor-or-self::*/@*[1]");
+    Assert(ancestorLeadingAttributes.Count() == 3
+            && ancestorLeadingAttributes.Item(0) != nullptr && ancestorLeadingAttributes.Item(0)->Name() == "id" && ancestorLeadingAttributes.Item(0)->Value() == "r"
+            && ancestorLeadingAttributes.Item(1) != nullptr && ancestorLeadingAttributes.Item(1)->Name() == "id" && ancestorLeadingAttributes.Item(1)->Value() == "g1"
+            && ancestorLeadingAttributes.Item(2) != nullptr && ancestorLeadingAttributes.Item(2)->Name() == "id" && ancestorLeadingAttributes.Item(2)->Value() == "a",
+        "ancestor-or-self::*/@*[1] should preserve document order across ancestor elements");
+    const auto trailingItem = attributeChainRoot->SelectSingleNode("group[@id='g2']/item[@id='c']");
+    Assert(trailingItem != nullptr, "Chained attribute-axis preceding test item missing");
+    const auto precedingLeadingAttributes = trailingItem->SelectNodes("preceding::*/@*[1]");
+    Assert(precedingLeadingAttributes.Count() == 3
+            && precedingLeadingAttributes.Item(0) != nullptr && precedingLeadingAttributes.Item(0)->Name() == "id" && precedingLeadingAttributes.Item(0)->Value() == "g1"
+            && precedingLeadingAttributes.Item(1) != nullptr && precedingLeadingAttributes.Item(1)->Name() == "id" && precedingLeadingAttributes.Item(1)->Value() == "a"
+            && precedingLeadingAttributes.Item(2) != nullptr && precedingLeadingAttributes.Item(2)->Name() == "id" && precedingLeadingAttributes.Item(2)->Value() == "b",
+        "preceding::*/@*[1] should preserve document order across preceding elements");
 
     const auto descendantAxis = root->SelectNodes("descendant::item");
     Assert(descendantAxis.Count() == 5,
@@ -18769,6 +20364,38 @@ void TestXPathUnionOperator() {
     Assert(docUnion.Item(1)->Name() == "beta",
         "Document union second result should be beta");
 
+    const auto reverseUnion = root->SelectNodes("gamma | alpha");
+    Assert(reverseUnion.Count() == 2,
+        "Reverse-ordered union should still return both nodes");
+    Assert(reverseUnion.Item(0)->Name() == "alpha",
+        "Union results should be normalized to document order");
+    Assert(reverseUnion.Item(1)->Name() == "gamma",
+        "Union results should preserve document order across branches");
+
+    const auto reverseDocUnion = document->SelectNodes("/root/gamma | /root/alpha");
+    Assert(reverseDocUnion.Count() == 2,
+        "Reverse-ordered document union should still return both nodes");
+    Assert(reverseDocUnion.Item(0)->Name() == "alpha",
+        "Document union should normalize branch order to document order");
+    Assert(reverseDocUnion.Item(1)->Name() == "gamma",
+        "Document union should preserve document order across branches");
+
+    const auto wrappedUnion = root->SelectNodes("(alpha | gamma)");
+    Assert(wrappedUnion.Count() == 2,
+        "Parenthesized union expression should evaluate like the unwrapped XPath");
+    Assert(wrappedUnion.Item(0)->Name() == "alpha" && wrappedUnion.Item(1)->Name() == "gamma",
+        "Parenthesized union expression result mismatch");
+
+    const auto wrappedDocUnion = document->SelectNodes("(/root/gamma | /root/alpha)");
+    Assert(wrappedDocUnion.Count() == 2,
+        "Parenthesized document union expression should evaluate like the unwrapped XPath");
+    Assert(wrappedDocUnion.Item(0)->Name() == "alpha" && wrappedDocUnion.Item(1)->Name() == "gamma",
+        "Parenthesized document union expression result mismatch");
+
+    const auto wrappedSinglePath = root->SelectSingleNode("(alpha)");
+    Assert(wrappedSinglePath != nullptr && wrappedSinglePath->Name() == "alpha",
+        "Parenthesized single-path XPath should resolve the underlying location path");
+
     // Union should deduplicate overlapping results
     const auto overlapUnion = root->SelectNodes("alpha | alpha");
     Assert(overlapUnion.Count() == 1,
@@ -18778,6 +20405,24 @@ void TestXPathUnionOperator() {
     const auto tripleUnion = root->SelectNodes("alpha | beta | gamma");
     Assert(tripleUnion.Count() == 3,
         "Triple union should return all three elements");
+
+    const auto mixedUnionDocument = XmlDocument::Parse(
+        "<root>"
+        "  <group id='g1'><item id='a'/><item id='b'/></group>"
+        "  <group id='g2'><item id='c'/></group>"
+        "</root>");
+    const auto mixedUnion = mixedUnionDocument->SelectNodes("/root/group/@id | /root/group/item | /root/group/item/@id");
+    Assert(mixedUnion.Count() == 8,
+        "Union should preserve document order across mixed element and attribute node-sets");
+    Assert(mixedUnion.Item(0) != nullptr && mixedUnion.Item(0)->NodeType() == XmlNodeType::Attribute && mixedUnion.Item(0)->Name() == "id" && mixedUnion.Item(0)->Value() == "g1"
+            && mixedUnion.Item(1) != nullptr && mixedUnion.Item(1)->NodeType() == XmlNodeType::Element && mixedUnion.Item(1)->Name() == "item"
+            && mixedUnion.Item(2) != nullptr && mixedUnion.Item(2)->NodeType() == XmlNodeType::Attribute && mixedUnion.Item(2)->Name() == "id" && mixedUnion.Item(2)->Value() == "a"
+            && mixedUnion.Item(3) != nullptr && mixedUnion.Item(3)->NodeType() == XmlNodeType::Element && mixedUnion.Item(3)->Name() == "item"
+            && mixedUnion.Item(4) != nullptr && mixedUnion.Item(4)->NodeType() == XmlNodeType::Attribute && mixedUnion.Item(4)->Name() == "id" && mixedUnion.Item(4)->Value() == "b"
+            && mixedUnion.Item(5) != nullptr && mixedUnion.Item(5)->NodeType() == XmlNodeType::Attribute && mixedUnion.Item(5)->Name() == "id" && mixedUnion.Item(5)->Value() == "g2"
+            && mixedUnion.Item(6) != nullptr && mixedUnion.Item(6)->NodeType() == XmlNodeType::Element && mixedUnion.Item(6)->Name() == "item"
+            && mixedUnion.Item(7) != nullptr && mixedUnion.Item(7)->NodeType() == XmlNodeType::Attribute && mixedUnion.Item(7)->Name() == "id" && mixedUnion.Item(7)->Value() == "c",
+        "Mixed union result order mismatch");
 
     // Union inside predicates should NOT trigger (pipe in predicates)
     // This tests that | is only split at the top level
@@ -18793,20 +20438,103 @@ void TestXPathNavigatorAndDocument() {
         "<bk:book id=\"b2\"><title>Two</title><author>B</author></bk:book>"
         "</root>");
 
+    const auto relativeRoot = document->SelectSingleNode("root");
+    Assert(relativeRoot != nullptr && relativeRoot->Name() == "root",
+        "Relative XPath from XmlDocument should treat the document node as the context");
+    const auto documentSelf = document->SelectSingleNode(".");
+    Assert(documentSelf != nullptr && documentSelf->NodeType() == XmlNodeType::Document,
+        "'.' from XmlDocument should return the document node itself");
+    const auto documentSelfAxis = document->SelectSingleNode("self::node()");
+    Assert(documentSelfAxis != nullptr && documentSelfAxis->NodeType() == XmlNodeType::Document,
+        "self::node() from XmlDocument should return the document node itself");
+    const auto documentRootPath = document->SelectSingleNode("/");
+    Assert(documentRootPath != nullptr && documentRootPath->NodeType() == XmlNodeType::Document,
+        "'/' from XmlDocument should return the document root node");
+    const auto childAxisRoot = document->SelectSingleNode("child::root");
+    Assert(childAxisRoot != nullptr && childAxisRoot->Name() == "root",
+        "Explicit child::root from XmlDocument should resolve against document children");
+    const auto documentChildren = document->SelectNodes("node()");
+    Assert(documentChildren.Count() == 1 && documentChildren.Item(0) != nullptr && documentChildren.Item(0)->Name() == "root",
+        "node() from XmlDocument should enumerate document child nodes");
+    Assert(document->SelectNodes("child::*").Count() == 1
+            && document->SelectNodes("child::*").Item(0) != nullptr
+            && document->SelectNodes("child::*").Item(0)->Name() == "root",
+        "child::* from XmlDocument should include only element children");
+    Assert(document->SelectNodes("child::node()").Count() == 1
+            && document->SelectNodes("child::node()").Item(0) != nullptr
+            && document->SelectNodes("child::node()").Item(0)->Name() == "root",
+        "child::node() from XmlDocument should enumerate visible document children");
+    Assert(document->SelectNodes("child::node()/self::*").Count() == 1
+            && document->SelectNodes("child::node()/self::*").Item(0) != nullptr
+            && document->SelectNodes("child::node()/self::*").Item(0)->Name() == "root",
+        "child::node()/self::* from XmlDocument should keep only element children");
+    Assert(document->SelectNodes("descendant::*").Count() == 7,
+        "descendant::* from XmlDocument should include only element descendants");
+    Assert(document->SelectNodes("descendant::node()").Count() == 11,
+        "descendant::node() from XmlDocument should include visible descendant nodes");
+    Assert(document->SelectNodes("descendant::node()/self::*").Count() == 7,
+        "descendant::node()/self::* from XmlDocument should keep only element descendants");
+    Assert(document->SelectNodes("self::*").Count() == 0,
+        "self::* from XmlDocument should be empty");
+    Assert(document->SelectNodes("following::node()").Count() == 0,
+        "following::node() from XmlDocument should be empty");
+    Assert(document->SelectNodes("preceding::node()").Count() == 0,
+        "preceding::node() from XmlDocument should be empty");
+    const auto parentDocument = relativeRoot->SelectSingleNode("parent::node()");
+    Assert(parentDocument != nullptr && parentDocument->NodeType() == XmlNodeType::Document,
+        "parent::node() from the document element should return the owning document");
+    const auto rootAbsolutePath = relativeRoot->SelectSingleNode("/");
+    Assert(rootAbsolutePath != nullptr && rootAbsolutePath->NodeType() == XmlNodeType::Document,
+        "'/' from an element context should return the document root node");
+    const auto ancestorOrSelfNodes = relativeRoot->SelectNodes("ancestor-or-self::node()");
+    Assert(ancestorOrSelfNodes.Count() == 2
+            && ancestorOrSelfNodes.Item(0) != nullptr
+            && ancestorOrSelfNodes.Item(0)->NodeType() == XmlNodeType::Document
+            && ancestorOrSelfNodes.Item(1) != nullptr
+            && ancestorOrSelfNodes.Item(1)->NodeType() == XmlNodeType::Element,
+        "ancestor-or-self::node() from the document element should include the element and owning document");
+
     XPathNavigator navigator = document->CreateNavigator();
     Assert(!navigator.IsEmpty() && navigator.NodeType() == XmlNodeType::Document,
         "CreateNavigator on XmlDocument should start at the document node");
+    Assert(navigator.Name().empty() && navigator.LocalName().empty() && navigator.Prefix().empty() && navigator.NamespaceURI().empty(),
+        "Navigator document naming accessors should follow XPath semantics");
+    Assert(navigator.Value() == "OneATwoB",
+        "Navigator document value should expose the XPath document string-value");
+    Assert(!navigator.SelectSingleNode(".").IsEmpty() && navigator.SelectSingleNode(".").NodeType() == XmlNodeType::Document,
+        "Navigator '.' from the document node should preserve the document context");
+    Assert(!navigator.SelectSingleNode("/").IsEmpty() && navigator.SelectSingleNode("/").NodeType() == XmlNodeType::Document,
+        "Navigator '/' from the document node should resolve the document root node");
     Assert(navigator.MoveToFirstChild(), "Navigator should move from document to first child");
     Assert(navigator.Name() == "root", "Navigator should reach the root element");
+    Assert(navigator.Value() == "OneATwoB",
+        "Navigator element value should expose the XPath element string-value");
+    Assert(!navigator.SelectSingleNode("parent::node()").IsEmpty()
+            && navigator.SelectSingleNode("parent::node()").NodeType() == XmlNodeType::Document,
+        "Navigator parent::node() from the document element should reach the owning document");
     Assert(navigator.MoveToFirstAttribute(), "Navigator should navigate to the first attribute");
     Assert(navigator.Name() == "id" && navigator.Value() == "r",
         "Navigator should expose attribute name and value");
-    Assert(navigator.MoveToNextAttribute(), "Navigator should move to the next attribute");
-    Assert(navigator.Name() == "xmlns:bk", "Navigator should walk element attribute sequence");
+    Assert(!navigator.MoveToNextAttribute(),
+        "Navigator attribute traversal should skip xmlns namespace declaration attributes");
     Assert(navigator.MoveToParent() && navigator.Name() == "root",
         "Navigator should move back to the owning element from an attribute");
     Assert(navigator.MoveToFirstChild() && navigator.Name() == "bk:book",
         "Navigator should move to the first child element");
+    Assert(navigator.Value() == "OneA",
+        "Navigator child element value should expose descendant text content");
+    Assert(navigator.MoveToFirstChild() && navigator.Name() == "title",
+        "Navigator should move to nested child elements");
+    Assert(navigator.MoveToFirstChild() && navigator.NodeType() == XmlNodeType::Text && navigator.Value() == "One",
+        "Navigator text node value should expose the text node string-value");
+    Assert(navigator.Name().empty() && navigator.LocalName().empty() && navigator.Prefix().empty() && navigator.NamespaceURI().empty(),
+        "Navigator text-node naming accessors should be empty under XPath semantics");
+    Assert(!navigator.SelectSingleNode("/").IsEmpty() && navigator.SelectSingleNode("/").NodeType() == XmlNodeType::Document,
+        "Navigator '/' from a text node should resolve to the document root node");
+    Assert(navigator.MoveToParent() && navigator.Name() == "title",
+        "Navigator should move back from text to element");
+    Assert(navigator.MoveToParent() && navigator.Name() == "bk:book",
+        "Navigator should move back from nested element to book");
     Assert(navigator.MoveToNext() && navigator.Name() == "bk:book",
         "Navigator should move across siblings");
     Assert(navigator.MoveToPrevious() && navigator.Name() == "bk:book",
@@ -18814,6 +20542,9 @@ void TestXPathNavigatorAndDocument() {
 
     XmlNamespaceManager namespaces;
     namespaces.AddNamespace("bk", "urn:books");
+    XPathNavigator relativeSelected = document->CreateNavigator().SelectSingleNode("root");
+    Assert(!relativeSelected.IsEmpty() && relativeSelected.Name() == "root",
+        "Navigator relative selection from the document node should resolve document children");
     XPathNavigator selected = navigator.SelectSingleNode("title");
     Assert(!selected.IsEmpty() && selected.Name() == "title" && selected.InnerXml() == "One",
         "Navigator should select child nodes through existing XPath support");
@@ -18828,6 +20559,112 @@ void TestXPathNavigatorAndDocument() {
     const auto selectedBooks = docNavigator.Select("book");
     Assert(selectedBooks.size() == 2,
         "XPathDocument navigator should expose XPath selection over the wrapped document");
+
+    const auto navigatorNamespaceDocument = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\">"
+        "<lib:book meta:id=\"b1\" code=\"x\"><lib:title>One</lib:title></lib:book>"
+        "</lib:catalog>");
+    XPathNavigator namespaceNavigator = navigatorNamespaceDocument->CreateNavigator();
+    Assert(namespaceNavigator.MoveToFirstChild() && namespaceNavigator.Name() == "lib:catalog",
+        "Namespace navigator should move to the catalog element");
+    Assert(!namespaceNavigator.MoveToFirstAttribute(),
+        "Navigator attribute traversal should not expose xmlns declaration attributes as XPath attributes");
+    Assert(namespaceNavigator.MoveToFirstChild() && namespaceNavigator.Name() == "lib:book",
+        "Namespace navigator should move to the namespaced child element");
+    Assert(namespaceNavigator.MoveToFirstAttribute() && namespaceNavigator.Name() == "meta:id",
+        "Navigator should expose the first real attribute after skipping xmlns declarations");
+    Assert(namespaceNavigator.MoveToNextAttribute() && namespaceNavigator.Name() == "code",
+        "Navigator should continue across real attributes without surfacing xmlns declarations");
+    Assert(!namespaceNavigator.MoveToNextAttribute(),
+        "Navigator should stop after the last real attribute");
+    Assert(namespaceNavigator.MoveToPrevious() && namespaceNavigator.Name() == "meta:id",
+        "Navigator previous attribute traversal should also skip xmlns declarations");
+
+    const auto prologDocument = XmlDocument::Parse(
+        "<?xml version=\"1.0\"?>"
+        "<!--lead-->"
+        "<!DOCTYPE root>"
+        "<?mark ready?>"
+        "<root/>");
+    const auto prologVisibleNodes = prologDocument->SelectNodes("node()");
+    Assert(prologVisibleNodes.Count() == 3,
+        "XPath node() from document should exclude XML declaration and document type nodes");
+    Assert(prologVisibleNodes.Item(0) != nullptr && prologVisibleNodes.Item(0)->NodeType() == XmlNodeType::Comment,
+        "XPath node() should keep leading comments in document order");
+    Assert(prologVisibleNodes.Item(1) != nullptr && prologVisibleNodes.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction,
+        "XPath node() should keep processing instructions in document order");
+    Assert(prologVisibleNodes.Item(2) != nullptr && prologVisibleNodes.Item(2)->NodeType() == XmlNodeType::Element,
+        "XPath node() should keep the document element after misc prolog nodes");
+    const auto prologChildElements = prologDocument->SelectNodes("child::*");
+    Assert(prologChildElements.Count() == 1
+            && prologChildElements.Item(0) != nullptr
+            && prologChildElements.Item(0)->NodeType() == XmlNodeType::Element
+            && prologChildElements.Item(0)->Name() == "root",
+        "child::* from a prolog document should keep only the document element");
+    const auto prologChildNodes = prologDocument->SelectNodes("child::node()");
+    Assert(prologChildNodes.Count() == 3
+            && prologChildNodes.Item(0) != nullptr && prologChildNodes.Item(0)->NodeType() == XmlNodeType::Comment
+            && prologChildNodes.Item(1) != nullptr && prologChildNodes.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction
+            && prologChildNodes.Item(2) != nullptr && prologChildNodes.Item(2)->NodeType() == XmlNodeType::Element,
+        "child::node() from a prolog document should enumerate visible document children");
+    Assert(prologDocument->SelectNodes("child::node()/self::*").Count() == 1
+            && prologDocument->SelectNodes("child::node()/self::*").Item(0) != nullptr
+            && prologDocument->SelectNodes("child::node()/self::*").Item(0)->Name() == "root",
+        "child::node()/self::* from a prolog document should keep only element children");
+    const auto prologSelfPi = prologDocument->SelectNodes("child::node()/self::processing-instruction('mark')");
+    Assert(prologSelfPi.Count() == 1
+            && prologSelfPi.Item(0) != nullptr
+            && prologSelfPi.Item(0)->NodeType() == XmlNodeType::ProcessingInstruction,
+        "child::node()/self::processing-instruction() from a prolog document should keep PI children");
+    Assert(prologDocument->SelectNodes("self::*").Count() == 0,
+        "self::* from XmlDocument should remain empty even with visible prolog nodes");
+    const auto prologDescendantElements = prologDocument->SelectNodes("descendant::*");
+    Assert(prologDescendantElements.Count() == 1
+            && prologDescendantElements.Item(0) != nullptr
+            && prologDescendantElements.Item(0)->Name() == "root",
+        "descendant::* from a prolog document should exclude comment and PI nodes");
+    const auto absolutePrologNodes = prologDocument->SelectNodes("/node()");
+    Assert(absolutePrologNodes.Count() == 3
+            && absolutePrologNodes.Item(0) != nullptr && absolutePrologNodes.Item(0)->NodeType() == XmlNodeType::Comment
+            && absolutePrologNodes.Item(1) != nullptr && absolutePrologNodes.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction
+            && absolutePrologNodes.Item(2) != nullptr && absolutePrologNodes.Item(2)->NodeType() == XmlNodeType::Element,
+        "Absolute /node() should enumerate visible document children in document order");
+    Assert(prologDocument->SelectSingleNode("/comment()") != nullptr
+            && prologDocument->SelectSingleNode("/comment()")->NodeType() == XmlNodeType::Comment,
+        "Absolute /comment() should reach document-level comments");
+    Assert(prologDocument->SelectSingleNode("/processing-instruction('mark')") != nullptr
+            && prologDocument->SelectSingleNode("/processing-instruction('mark')")->NodeType() == XmlNodeType::ProcessingInstruction,
+        "Absolute /processing-instruction('target') should reach document-level processing instructions");
+    const auto prologFollowingNodes = prologVisibleNodes.Item(0)->SelectNodes("following::node()");
+    Assert(prologFollowingNodes.Count() == 2
+            && prologFollowingNodes.Item(0) != nullptr
+            && prologFollowingNodes.Item(0)->NodeType() == XmlNodeType::ProcessingInstruction
+            && prologFollowingNodes.Item(1) != nullptr
+            && prologFollowingNodes.Item(1)->NodeType() == XmlNodeType::Element,
+        "following::node() from a prolog comment should preserve document order");
+    const auto rootPrecedingNodes = prologVisibleNodes.Item(2)->SelectNodes("preceding::node()");
+    Assert(rootPrecedingNodes.Count() == 2
+            && rootPrecedingNodes.Item(0) != nullptr
+            && rootPrecedingNodes.Item(0)->NodeType() == XmlNodeType::Comment
+            && rootPrecedingNodes.Item(1) != nullptr
+            && rootPrecedingNodes.Item(1)->NodeType() == XmlNodeType::ProcessingInstruction,
+        "preceding::node() from the document element should include visible prolog nodes in document order");
+    Assert(prologVisibleNodes.Item(0)->SelectNodes("descendant::node()").Count() == 0,
+        "descendant::node() from a comment node should be empty");
+    Assert(prologVisibleNodes.Item(1)->SelectNodes("descendant::node()").Count() == 0,
+        "descendant::node() from a processing-instruction node should be empty");
+
+    XPathNavigator prologNavigator = prologDocument->CreateNavigator();
+    Assert(prologNavigator.MoveToFirstChild() && prologNavigator.NodeType() == XmlNodeType::Comment,
+        "Navigator should skip XML declaration and document type when moving to the first child");
+    Assert(prologNavigator.MoveToNext() && prologNavigator.NodeType() == XmlNodeType::ProcessingInstruction,
+        "Navigator should skip document type when moving to the next visible sibling");
+    Assert(prologNavigator.Name() == "mark" && prologNavigator.Value() == "ready",
+        "Navigator should expose PI target and value after skipping invisible prolog nodes");
+    Assert(prologNavigator.MoveToNext() && prologNavigator.NodeType() == XmlNodeType::Element && prologNavigator.Name() == "root",
+        "Navigator should reach the document element after visible prolog nodes");
+    Assert(prologNavigator.MoveToPrevious() && prologNavigator.NodeType() == XmlNodeType::ProcessingInstruction,
+        "Navigator previous-sibling traversal should also skip invisible prolog nodes");
 }
 
 void TestXmlConvert() {
@@ -19646,6 +21483,61 @@ void TestTier1Apis() {
         Assert(via_reader.GetString() == manual.GetString(),
             "WriteNode(XmlReader) output should match manually constructed equivalent");
     }
+    {
+        auto reader = XmlReader::Create("<root xmlns='urn:default' xmlns:p='urn:pfx'><child p:code='42'/></root>");
+        reader.Read(); // root
+        reader.Read(); // child
+
+        XmlWriter writer;
+        writer.WriteNode(reader);
+
+        auto roundTrip = XmlDocument::Parse(writer.GetString());
+        Assert(roundTrip->DocumentElement() != nullptr
+                && roundTrip->DocumentElement()->NamespaceURI() == "urn:default",
+            "WriteNode(XmlReader) should preserve inherited default namespaces when replaying isolated elements");
+        Assert(roundTrip->DocumentElement()->GetAttribute("code", "urn:pfx") == "42",
+            "WriteNode(XmlReader) should preserve inherited prefixed attribute namespaces when replaying isolated elements");
+    }
+    {
+        auto reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ENTITY label \"alpha\">]>"
+            "<root>&label;</root>");
+        reader.Read(); // doctype
+
+        XmlWriter writer;
+        writer.WriteNode(reader);
+        Assert(reader.NodeType() == XmlNodeType::Element,
+            "WriteNode(XmlReader) should advance past a document type node");
+        writer.WriteNode(reader);
+
+        const std::string xml = writer.GetString();
+        Assert(xml.find("<!DOCTYPE root [<!ENTITY label \"alpha\">]>") != std::string::npos,
+            "WriteNode(XmlReader) should preserve DOCTYPE declarations");
+        Assert(xml.find("<root>&label;</root>") != std::string::npos,
+            "WriteNode(XmlReader) should preserve the following root element after a DOCTYPE");
+    }
+    {
+        XmlReaderSettings settings;
+        settings.Conformance = ConformanceLevel::Fragment;
+        auto reader = XmlReader::Create("<wrapper><temp/><broken></other></wrapper>", settings);
+        reader.Read();
+
+        XmlWriter writer;
+        writer.WriteStartElement("root");
+        writer.WriteElementString("stable", "ok");
+
+        bool threw = false;
+        try {
+            writer.WriteNode(reader);
+        } catch (const XmlException&) {
+            threw = true;
+        }
+
+        Assert(threw, "WriteNode(XmlReader) should reject malformed reader content");
+        writer.WriteEndElement();
+        Assert(writer.GetString() == "<root><stable>ok</stable></root>",
+            "Failed in-memory WriteNode(XmlReader) should roll back partial DOM mutations before rethrowing");
+    }
 }
 
 void TestTier2Apis() {
@@ -19948,8 +21840,17 @@ void TestTier3Apis() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        XmlConfRunOptions xmlConfOptions;
+        std::string xmlConfError;
+        if (TryParseXmlConfOptions(argc, argv, xmlConfOptions, xmlConfError)) {
+            return RunXmlConfTests(xmlConfOptions);
+        }
+        if (!xmlConfError.empty()) {
+            throw std::runtime_error(xmlConfError);
+        }
+
         TestParseDocument();
         TestDocumentTypeDeclarations();
         TestDocumentTypeBoundaries();

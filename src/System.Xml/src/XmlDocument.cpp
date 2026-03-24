@@ -2,31 +2,732 @@
 
 namespace System::Xml {
 
-XmlDocument::XmlDocument() : XmlNode(XmlNodeType::Document, "#document") {
+namespace {
+
+std::string ReadFileFullyForXmlDocumentLoad(const std::string& path) {
+    std::ifstream stream(std::filesystem::path(path), std::ios::binary | std::ios::ate);
+    if (!stream) {
+        throw XmlException("Failed to open XML file: " + path);
+    }
+
+    const std::streamoff fileSize = stream.tellg();
+    if (fileSize < 0) {
+        throw XmlException("Failed to determine XML file size: " + path);
+    }
+
+    std::string xml(static_cast<std::size_t>(fileSize), '\0');
+    stream.seekg(0, std::ios::beg);
+    if (!xml.empty()) {
+        stream.read(xml.data(), static_cast<std::streamsize>(xml.size()));
+        if (!stream) {
+            throw XmlException("Failed to read XML file: " + path);
+        }
+    }
+
+    return xml;
+}
+
+std::string ReadStreamFullyForXmlDocumentLoad(std::istream& stream) {
+    const std::streampos startPosition = stream.tellg();
+    if (startPosition != std::streampos(-1)) {
+        stream.seekg(0, std::ios::end);
+        const std::streampos endPosition = stream.tellg();
+        if (endPosition != std::streampos(-1) && endPosition >= startPosition) {
+            std::string xml(static_cast<std::size_t>(endPosition - startPosition), '\0');
+            stream.seekg(startPosition);
+            if (!xml.empty()) {
+                stream.read(xml.data(), static_cast<std::streamsize>(xml.size()));
+                if (!stream) {
+                    throw XmlException("Failed to read XML stream");
+                }
+            }
+            return xml;
+        }
+
+        stream.clear();
+        stream.seekg(startPosition);
+    }
+
+    std::string xml;
+    char chunk[64 * 1024];
+    while (stream) {
+        stream.read(chunk, static_cast<std::streamsize>(sizeof(chunk)));
+        const std::streamsize bytesRead = stream.gcount();
+        if (bytesRead > 0) {
+            xml.append(chunk, static_cast<std::size_t>(bytesRead));
+        }
+    }
+
+    if (!stream.eof()) {
+        throw XmlException("Failed to read XML stream");
+    }
+    return xml;
+}
+
+}  // namespace
+
+class XmlParser final {
+public:
+    enum class MarkupKind {
+        None,
+        XmlDeclaration,
+        Comment,
+        CData,
+        ProcessingInstruction,
+        EndTag,
+        DocumentType,
+        UnsupportedDeclaration,
+        Element,
+    };
+
+    explicit XmlParser(std::string_view input) : input_(input), position_(0) {
+        if (input_.size() >= 3 && input_[0] == '\xEF' && input_[1] == '\xBB' && input_[2] == '\xBF') {
+            position_ = 3;
+        }
+    }
+
+    void ParseInto(XmlDocument& document) {
+        document_ = &document;
+        document.RemoveAll();
+
+        auto appendParsedNode = [this, &document](const std::shared_ptr<XmlNode>& node, std::size_t errorPosition) {
+            try {
+                document.AppendChild(node);
+            } catch (const XmlException& exception) {
+                if (exception.Line() != 0 || exception.Column() != 0) {
+                    throw;
+                }
+
+                const auto [line, column] = ComputeLineColumn(errorPosition);
+                throw XmlException(exception.what(), line, column);
+            }
+        };
+
+        SkipWhitespace();
+        if (ClassifyMarkup() == XmlMarkupKind::XmlDeclaration) {
+            const auto nodeStart = position_;
+            appendParsedNode(ParseDeclaration(document), nodeStart);
+        }
+
+        SkipWhitespace();
+        while (true) {
+            bool consumedMarkup = true;
+            switch (ClassifyMarkup()) {
+            case XmlMarkupKind::Comment: {
+                const auto nodeStart = position_;
+                appendParsedNode(ParseComment(document), nodeStart);
+                break;
+            }
+            case XmlMarkupKind::ProcessingInstruction: {
+                const auto nodeStart = position_;
+                appendParsedNode(ParseProcessingInstruction(document), nodeStart);
+                break;
+            }
+            case XmlMarkupKind::DocumentType: {
+                const auto nodeStart = position_;
+                appendParsedNode(ParseDocumentType(document), nodeStart);
+                break;
+            }
+            default:
+                consumedMarkup = false;
+                break;
+            }
+
+            if (!consumedMarkup) {
+                break;
+            }
+
+            SkipWhitespace();
+        }
+
+        if (Peek() != '<') {
+            Throw("Document root element is missing");
+        }
+
+        if (ClassifyMarkup() == XmlMarkupKind::EndTag) {
+            Consume("</");
+            const std::string closeName = ParseName();
+            Throw("Unexpected closing tag: </" + closeName + ">");
+        }
+
+        if (ClassifyMarkup() == XmlMarkupKind::UnsupportedDeclaration) {
+            Throw("Unsupported markup declaration");
+        }
+
+        const auto rootStart = position_;
+        appendParsedNode(ParseElement(document), rootStart);
+        SkipWhitespace();
+
+        while (!IsEnd()) {
+            switch (ClassifyMarkup()) {
+            case XmlMarkupKind::Comment: {
+                const auto nodeStart = position_;
+                appendParsedNode(ParseComment(document), nodeStart);
+                break;
+            }
+            case XmlMarkupKind::ProcessingInstruction: {
+                const auto nodeStart = position_;
+                appendParsedNode(ParseProcessingInstruction(document), nodeStart);
+                break;
+            }
+            case XmlMarkupKind::DocumentType:
+                Throw("DOCTYPE must appear before the root element");
+                break;
+            default:
+                if (IsWhitespace(Peek())) {
+                    SkipWhitespace();
+                } else {
+                    Throw("Unexpected content after the root element");
+                }
+                break;
+            }
+        }
+    }
+
+private:
+    XmlMarkupKind ClassifyMarkup() const noexcept {
+        return ClassifyXmlMarkupWithCharAt(
+            position_,
+            [this](std::size_t position) noexcept {
+                return position < input_.size() ? input_[position] : '\0';
+            });
+    }
+
+    bool IsEnd() const noexcept {
+        return position_ >= input_.size();
+    }
+
+    char Peek() const noexcept {
+        return IsEnd() ? '\0' : input_[position_];
+    }
+
+    char Read() {
+        if (IsEnd()) {
+            Throw("Unexpected end of XML document");
+        }
+
+        return input_[position_++];
+    }
+
+    bool StartsWith(std::string_view token) const noexcept {
+        return input_.substr(position_, token.size()) == token;
+    }
+
+    void Consume(std::string_view token) {
+        if (!StartsWith(token)) {
+            Throw("Expected '" + std::string(token) + "'");
+        }
+
+        position_ += token.size();
+    }
+
+    void SkipWhitespace() {
+        SkipXmlWhitespaceAt(input_, position_);
+    }
+
+    void Expect(char ch) {
+        if (Read() != ch) {
+            Throw(std::string("Expected '") + ch + "'");
+        }
+    }
+
+    [[noreturn]] void Throw(const std::string& message) const {
+        auto [line, column] = ComputeLineColumn(position_);
+        throw XmlException(message, line, column);
+    }
+
+    std::pair<std::size_t, std::size_t> ComputeLineColumn(std::size_t position) const noexcept {
+        std::size_t line = 1;
+        std::size_t column = 1;
+
+        for (std::size_t index = 0; index < position && index < input_.size(); ++index) {
+            if (input_[index] == '\n') {
+                ++line;
+                column = 1;
+            } else {
+                ++column;
+            }
+        }
+
+        return {line, column};
+    }
+
+    std::string ParseName() {
+        const auto start = position_;
+        const std::string name = ParseNameAt(input_, position_);
+        if (name.empty()) {
+            position_ = start;
+            Throw("Invalid XML name");
+        }
+
+        return name;
+    }
+
+    std::string DecodeEntities(std::string_view value) const {
+        return DecodeEntityText(
+            value,
+            [this](const std::string& entity) {
+                return LookupDocumentInternalEntityDeclaration(document_, entity);
+            },
+            [this](const std::string& message) {
+                auto [line, column] = ComputeLineColumn(position_);
+                throw XmlException(message, line, column);
+            });
+    }
+
+    std::string ParseQuotedValue(bool decodeEntities = true) {
+        const char quote = Read();
+        if (quote != '\"' && quote != '\'') {
+            Throw("Expected quoted value");
+        }
+
+        const auto start = position_;
+        const auto quoteEnd = ScanQuotedValueEndAt(start - 1, [this](std::size_t position) noexcept {
+            return position < input_.size() ? input_[position] : '\0';
+        });
+        if (quoteEnd == std::string::npos) {
+            Throw("Unterminated quoted value");
+        }
+
+        const auto raw = input_.substr(start, quoteEnd - start);
+        position_ = quoteEnd + 1;
+        return decodeEntities ? DecodeEntities(raw) : std::string(raw);
+    }
+
+    std::shared_ptr<XmlDeclaration> ParseDeclaration(XmlDocument& document) {
+        Consume("<?xml");
+
+        std::string version = "1.0";
+        std::string encoding;
+        std::string standalone;
+
+        while (true) {
+            SkipWhitespace();
+            if (StartsWith("?>")) {
+                Consume("?>");
+                break;
+            }
+
+            const std::string name = ParseName();
+            SkipWhitespace();
+            if (Read() != '=') {
+                Throw("Expected '=' in XML declaration");
+            }
+            SkipWhitespace();
+            const std::string value = ParseQuotedValue();
+
+            if (name == "version") {
+                version = value;
+            } else if (name == "encoding") {
+                encoding = value;
+            } else if (name == "standalone") {
+                standalone = value;
+            } else {
+                Throw("Unsupported XML declaration attribute: " + name);
+            }
+        }
+
+        return document.CreateXmlDeclaration(version, encoding, standalone);
+    }
+
+    std::shared_ptr<XmlComment> ParseComment(XmlDocument& document) {
+        Consume("<!--");
+        const auto end = ScanDelimitedSectionEndAt(position_, "-->", [this](std::string_view terminator, std::size_t position) noexcept {
+            return input_.find(terminator, position);
+        });
+        if (end == std::string_view::npos) {
+            Throw("Unterminated comment");
+        }
+
+        for (std::size_t probe = position_; probe < end; ++probe) {
+            if (!XmlConvert::IsXmlChar(input_[probe])) {
+                const auto [line, column] = ComputeLineColumn(probe);
+                throw XmlException("Invalid XML character", line, column);
+            }
+        }
+
+        const auto invalidDoubleHyphen = input_.find("--", position_);
+        if (invalidDoubleHyphen != std::string_view::npos && invalidDoubleHyphen < end) {
+            const auto [line, column] = ComputeLineColumn(invalidDoubleHyphen);
+            throw XmlException("Comment may not contain '--'", line, column);
+        }
+
+        const auto text = std::string(input_.substr(position_, end - position_));
+        position_ = end + 3;
+        return document.CreateComment(text);
+    }
+
+    std::shared_ptr<XmlCDataSection> ParseCData(XmlDocument& document) {
+        Consume("<![CDATA[");
+        const auto end = ScanDelimitedSectionEndAt(position_, "]]>", [this](std::string_view terminator, std::size_t position) noexcept {
+            return input_.find(terminator, position);
+        });
+        if (end == std::string_view::npos) {
+            Throw("Unterminated CDATA section");
+        }
+
+        const auto value = std::string(input_.substr(position_, end - position_));
+        position_ = end + 3;
+        return document.CreateCDataSection(value);
+    }
+
+    std::shared_ptr<XmlProcessingInstruction> ParseProcessingInstruction(XmlDocument& document) {
+        Consume("<?");
+        const std::string target = ParseName();
+        if (target == "xml") {
+            Throw("XML declaration is only allowed at the beginning of the document");
+        }
+
+        std::string data;
+        if (!StartsWith("?>")) {
+            const auto end = ScanDelimitedSectionEndAt(position_, "?>", [this](std::string_view terminator, std::size_t position) noexcept {
+                return input_.find(terminator, position);
+            });
+            if (end == std::string_view::npos) {
+                Throw("Unterminated processing instruction");
+            }
+
+            for (std::size_t probe = position_; probe < end; ++probe) {
+                if (!XmlConvert::IsXmlChar(input_[probe])) {
+                    const auto [line, column] = ComputeLineColumn(probe);
+                    throw XmlException("Invalid XML character", line, column);
+                }
+            }
+
+            data = Trim(std::string(input_.substr(position_, end - position_)));
+            position_ = end;
+        }
+
+        Consume("?>");
+        return document.CreateProcessingInstruction(target, data);
+    }
+
+    std::shared_ptr<XmlDocumentType> ParseDocumentType(XmlDocument& document) {
+        Consume("<!DOCTYPE");
+        SkipWhitespace();
+
+        const std::string name = ParseName();
+        SkipWhitespace();
+
+        std::string publicId;
+        std::string systemId;
+        std::string internalSubset;
+
+        if (StartsWith("PUBLIC")) {
+            Consume("PUBLIC");
+            SkipWhitespace();
+            publicId = ParseQuotedValue(false);
+            SkipWhitespace();
+            systemId = ParseQuotedValue(false);
+            SkipWhitespace();
+        } else if (StartsWith("SYSTEM")) {
+            Consume("SYSTEM");
+            SkipWhitespace();
+            systemId = ParseQuotedValue(false);
+            SkipWhitespace();
+        }
+
+        if (Peek() == '[') {
+            Read();
+            const auto subsetStart = position_;
+            int bracketDepth = 1;
+            bool inQuote = false;
+            char quote = '\0';
+
+            while (!IsEnd() && bracketDepth > 0) {
+                const char ch = Read();
+                if (inQuote) {
+                    if (ch == quote) {
+                        inQuote = false;
+                    }
+                    continue;
+                }
+
+                if (ch == '\"' || ch == '\'') {
+                    inQuote = true;
+                    quote = ch;
+                } else if (ch == '[') {
+                    ++bracketDepth;
+                } else if (ch == ']') {
+                    --bracketDepth;
+                }
+            }
+
+            if (bracketDepth != 0) {
+                Throw("Unterminated DOCTYPE internal subset");
+            }
+
+            internalSubset = Trim(std::string(input_.substr(subsetStart, position_ - subsetStart - 1)));
+            SkipWhitespace();
+        }
+
+        if (Read() != '>') {
+            Throw("Expected '>' after DOCTYPE");
+        }
+        return document.CreateDocumentType(name, publicId, systemId, internalSubset);
+    }
+
+    void AppendParsedCharacterData(XmlDocument& document, XmlElement& element) {
+        std::string textBuffer;
+        std::size_t rawSegmentStart = std::string::npos;
+        bool textBufferMaterialized = false;
+        bool sawEntityReference = false;
+        auto flushText = [&](std::size_t segmentEnd, bool preserveWhitespaceOnly = false) {
+            if (rawSegmentStart == std::string::npos) {
+                return;
+            }
+
+            if (!textBufferMaterialized) {
+                textBuffer.assign(input_.substr(rawSegmentStart, segmentEnd - rawSegmentStart));
+                textBufferMaterialized = true;
+            }
+
+            if (document.PreserveWhitespace() && IsWhitespaceOnly(textBuffer)) {
+                element.AppendChildForOwnedLoad(document.CreateWhitespace(textBuffer));
+            } else if (document.PreserveWhitespace() || !IsWhitespaceOnly(textBuffer) || preserveWhitespaceOnly) {
+                element.AppendChildForOwnedLoad(document.CreateTextNode(textBuffer));
+            }
+            textBuffer.clear();
+            rawSegmentStart = std::string::npos;
+            textBufferMaterialized = false;
+        };
+
+        while (!IsEnd() && Peek() != '<') {
+            if (StartsWith("]]>") ) {
+                Throw("']]>' is not allowed in text content");
+            }
+
+            if (Peek() != '&') {
+                if (!XmlConvert::IsXmlChar(Peek())) {
+                    Throw("Invalid XML character");
+                }
+                if (rawSegmentStart == std::string::npos) {
+                    rawSegmentStart = position_;
+                }
+                if (textBufferMaterialized) {
+                    textBuffer.push_back(Read());
+                } else {
+                    ++position_;
+                }
+                continue;
+            }
+
+            const auto semicolon = input_.find(';', position_);
+            if (semicolon == std::string_view::npos) {
+                Throw("Unterminated entity reference");
+            }
+
+            const auto entityStart = position_;
+            const std::string entity(input_.substr(position_ + 1, semicolon - position_ - 1));
+            position_ = semicolon + 1;
+
+            const auto predefined = ResolvePredefinedEntityReferenceValueView(entity);
+            if (!predefined.empty()) {
+                if (rawSegmentStart == std::string::npos) {
+                    rawSegmentStart = entityStart;
+                }
+                if (!textBufferMaterialized) {
+                    textBuffer.assign(input_.substr(rawSegmentStart, entityStart - rawSegmentStart));
+                    textBufferMaterialized = true;
+                }
+                textBuffer.append(predefined.data(), predefined.size());
+                continue;
+            }
+
+            if (!entity.empty() && entity.front() == '#') {
+                if (rawSegmentStart == std::string::npos) {
+                    rawSegmentStart = entityStart;
+                }
+                if (!textBufferMaterialized) {
+                    textBuffer.assign(input_.substr(rawSegmentStart, entityStart - rawSegmentStart));
+                    textBufferMaterialized = true;
+                }
+                unsigned int codePoint = 0;
+                if (!TryParseNumericEntityReferenceCodePoint(entity, codePoint)) {
+                    Throw("Invalid numeric entity reference: &" + entity + ';');
+                }
+                AppendCodePointUtf8(textBuffer, codePoint);
+                continue;
+            }
+
+            if (!HasDocumentEntityDeclaration(document_, entity)) {
+                Throw("Unknown entity reference: &" + entity + ';');
+            }
+
+            flushText(entityStart, true);
+            sawEntityReference = true;
+            element.AppendChildForOwnedLoad(document.CreateEntityReference(entity));
+        }
+
+        flushText(position_, sawEntityReference);
+    }
+
+    std::shared_ptr<XmlElement> ParseElement(XmlDocument& document) {
+        Expect('<');
+        const std::string name = ParseName();
+        auto element = document.CreateElement(name);
+        const std::string_view text = input_;
+
+        while (true) {
+            SkipWhitespace();
+            bool isEmptyElement = false;
+            if (ConsumeXmlStartTagCloseAt(
+                    position_,
+                    isEmptyElement,
+                    [this](std::size_t position) noexcept {
+                        return position < input_.size() ? input_[position] : '\0';
+                    },
+                    [&text](std::size_t position, std::string_view token) noexcept {
+                        return SubsetStartsWithAt(text, position, token);
+                    })) {
+                if (isEmptyElement) {
+                    return element;
+                }
+                break;
+            }
+
+            std::size_t cursor = position_;
+            const auto attributeToken = ParseXmlAttributeAssignmentAt(
+                cursor,
+                [&text](std::size_t& position) {
+                    return ParseNameAt(text, position);
+                },
+                [&text](std::size_t& position) noexcept {
+                    SkipXmlWhitespaceAt(text, position);
+                },
+                [this](std::size_t position) noexcept {
+                    return position < input_.size() ? input_[position] : '\0';
+                },
+                [this](std::size_t position) noexcept {
+                    return ScanQuotedValueEndAt(position, [this](std::size_t probe) noexcept {
+                        return probe < input_.size() ? input_[probe] : '\0';
+                    });
+                });
+
+            if (attributeToken.name.empty()) {
+                Throw("Invalid XML name");
+            }
+            if (!attributeToken.valid) {
+                position_ = cursor;
+                if (!attributeToken.sawEquals) {
+                    if (!IsEnd()) {
+                        ++position_;
+                    }
+                    Throw("Expected '=' after attribute name");
+                }
+                if (!IsEnd()) {
+                    ++position_;
+                }
+                Throw("Expected quoted value");
+            }
+
+            position_ = cursor;
+            const auto invalidLt = input_.find('<', attributeToken.rawValueStart);
+            if (invalidLt != std::string_view::npos && invalidLt < attributeToken.rawValueEnd) {
+                const auto [line, column] = ComputeLineColumn(invalidLt);
+                throw XmlException("'<' is not allowed in attribute values", line, column);
+            }
+            element->AppendAttributeForLoad(
+                attributeToken.name,
+                DecodeEntities(input_.substr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart)));
+        }
+
+        while (true) {
+            switch (ClassifyMarkup()) {
+            case XmlMarkupKind::EndTag: {
+                Consume("</");
+                const std::string closeName = ParseName();
+                if (closeName != name) {
+                    Throw("Mismatched closing tag. Expected </" + name + "> but found </" + closeName + ">");
+                }
+
+                std::size_t cursor = position_;
+                if (!ConsumeXmlEndTagCloseAt(
+                        cursor,
+                        [&text](std::size_t& position) noexcept {
+                            SkipXmlWhitespaceAt(text, position);
+                        },
+                        [this](std::size_t position) noexcept {
+                            return position < input_.size() ? input_[position] : '\0';
+                        })) {
+                    position_ = cursor;
+                    if (!IsEnd()) {
+                        ++position_;
+                    }
+                    Throw("Expected '>' after closing tag");
+                }
+                position_ = cursor;
+                return element;
+            }
+            case XmlMarkupKind::Comment:
+                element->AppendChildForOwnedLoad(ParseComment(document));
+                break;
+            case XmlMarkupKind::CData:
+                element->AppendChildForOwnedLoad(ParseCData(document));
+                break;
+            case XmlMarkupKind::ProcessingInstruction:
+                element->AppendChildForOwnedLoad(ParseProcessingInstruction(document));
+                break;
+            case XmlMarkupKind::DocumentType:
+                Throw("DOCTYPE is not allowed inside an element");
+                break;
+            case XmlMarkupKind::UnsupportedDeclaration:
+                Throw("Unsupported markup declaration");
+                break;
+            case XmlMarkupKind::Element:
+                element->AppendChildForOwnedLoad(ParseElement(document));
+                break;
+            case XmlMarkupKind::None:
+                if (IsEnd()) {
+                    Throw("Unexpected end of input inside element <" + name + ">");
+                }
+                AppendParsedCharacterData(document, *element);
+                break;
+            case XmlMarkupKind::XmlDeclaration:
+                position_ += 5;
+                Throw("XML declaration is only allowed at the beginning of the document");
+                break;
+            }
+        }
+    }
+
+    std::string_view input_;
+    std::size_t position_;
+    XmlDocument* document_ = nullptr;
+};
+
+std::shared_ptr<XmlDocument> BuildXmlDocumentFromReader(XmlReader& reader) {
+    auto document = std::make_shared<XmlDocument>();
+    LoadXmlDocumentFromReader(reader, *document);
+    return document;
+}
+
+XmlDocument::XmlDocument()
+    : XmlNode(XmlNodeType::Document, "#document"),
+            nodeArenaState_(std::make_shared<NodeArenaState>()) {
     SetOwnerDocumentRecursive(this);
 }
 
-std::shared_ptr<XmlDocument> XmlDocument::Parse(const std::string& xml) {
+XmlDocument::~XmlDocument() {
+    RemoveAllChildren();
+}
+
+std::shared_ptr<XmlDocument> XmlDocument::Parse(std::string_view xml) {
     auto document = std::make_shared<XmlDocument>();
     document->LoadXml(xml);
     return document;
 }
 
-void XmlDocument::LoadXml(const std::string& xml) {
+void XmlDocument::LoadXml(std::string_view xml) {
     XmlParser(xml).ParseInto(*this);
 }
 
 void XmlDocument::Load(const std::string& path) {
-    auto sourceText = std::make_shared<std::string>(ReadFileFully(path));
-    ValidateXmlReaderInputAgainstSchemas(*sourceText, XmlReaderSettings{});
-    XmlReader reader = XmlReader::CreateFromValidatedString(sourceText, XmlReaderSettings{});
-    reader.baseUri_ = std::filesystem::absolute(std::filesystem::path(path)).string();
-    LoadXmlDocumentFromReader(reader, *this);
+    LoadXml(ReadFileFullyForXmlDocumentLoad(path));
 }
 
 void XmlDocument::Load(std::istream& stream) {
-    auto reader = XmlReader::Create(stream);
-    LoadXmlDocumentFromReader(reader, *this);
+    LoadXml(ReadStreamFullyForXmlDocumentLoad(stream));
 }
 
 void XmlDocument::Save(const std::string& path, const XmlWriterSettings& settings) const {
@@ -37,9 +738,9 @@ void XmlDocument::Save(std::ostream& stream, const XmlWriterSettings& settings) 
     XmlWriter::WriteToStream(*this, stream, settings);
 }
 
-std::string NormalizeSchemaSimpleTypeValue(const XmlSchemaSet::SimpleTypeRule& type, const std::string& lexicalValue) {
+std::string NormalizeSchemaSimpleTypeValue(const XmlSchemaSet::SimpleTypeRule& type, std::string_view lexicalValue) {
     if (!type.whiteSpace.has_value() || *type.whiteSpace == "preserve") {
-        return lexicalValue;
+        return std::string(lexicalValue);
     }
 
     std::string normalized;
@@ -87,8 +788,8 @@ std::string LookupNamespaceUriInBindings(
 
 void ValidateSchemaSimpleValueWithQNameResolver(
     const XmlSchemaSet::SimpleTypeRule& type,
-    const std::string& value,
-    const std::string& label,
+    std::string_view value,
+    std::string_view label,
     const std::function<std::string(const std::string&)>& resolveNamespaceUri,
     const std::function<bool(const std::string&)>& hasNotationDeclaration,
     const std::function<bool(const std::string&)>& hasUnparsedEntityDeclaration) {
@@ -446,13 +1147,13 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             const char ch = lexicalValue[index];
             if (ch == '.') {
                 if (seenDecimalPoint) {
-                    throw XmlException("Schema validation failed: " + label + " must use a plain decimal lexical form for digit facets");
+                    throw XmlException("Schema validation failed: " + std::string(label) + " must use a plain decimal lexical form for digit facets");
                 }
                 seenDecimalPoint = true;
                 continue;
             }
             if (!std::isdigit(static_cast<unsigned char>(ch))) {
-                throw XmlException("Schema validation failed: " + label + " must use a plain decimal lexical form for digit facets");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must use a plain decimal lexical form for digit facets");
             }
             hasDigit = true;
             ++info.totalDigits;
@@ -461,7 +1162,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             }
         }
         if (!hasDigit) {
-            throw XmlException("Schema validation failed: " + label + " must use a plain decimal lexical form for digit facets");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must use a plain decimal lexical form for digit facets");
         }
         return info;
     };
@@ -483,20 +1184,20 @@ void ValidateSchemaSimpleValueWithQNameResolver(
         }
 
         if (type.length.has_value() && items.size() != *type.length) {
-            throw XmlException("Schema validation failed: " + label + " must contain exactly " + std::to_string(*type.length) + " list items");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must contain exactly " + std::to_string(*type.length) + " list items");
         }
         if (type.minLength.has_value() && items.size() < *type.minLength) {
-            throw XmlException("Schema validation failed: " + label + " must contain at least " + std::to_string(*type.minLength) + " list items");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must contain at least " + std::to_string(*type.minLength) + " list items");
         }
         if (type.maxLength.has_value() && items.size() > *type.maxLength) {
-            throw XmlException("Schema validation failed: " + label + " must contain at most " + std::to_string(*type.maxLength) + " list items");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must contain at most " + std::to_string(*type.maxLength) + " list items");
         }
 
         for (std::size_t index = 0; index < items.size(); ++index) {
             ValidateSchemaSimpleValueWithQNameResolver(
                 *type.itemType,
                 items[index],
-                label + " list item " + std::to_string(index + 1),
+                std::string(label) + " list item " + std::to_string(index + 1),
                 resolveNamespaceUri,
                 hasNotationDeclaration,
                 hasUnparsedEntityDeclaration);
@@ -524,31 +1225,31 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             }
         }
         if (!matchedMemberType) {
-            throw XmlException("Schema validation failed: " + label + " does not match any declared union member type");
+            throw XmlException("Schema validation failed: " + std::string(label) + " does not match any declared union member type");
         }
     }
 
     if (!type.enumerationValues.empty()
         && std::find(type.enumerationValues.begin(), type.enumerationValues.end(), normalizedValue) == type.enumerationValues.end()) {
-        throw XmlException("Schema validation failed: " + label + " must be one of the declared enumeration values");
+        throw XmlException("Schema validation failed: " + std::string(label) + " must be one of the declared enumeration values");
     }
 
     const bool binaryLengthFamily = type.baseType == "xs:hexBinary" || type.baseType == "xs:base64Binary";
     const std::size_t valueLength = normalizedValue.size();
     if (!listVariety && !binaryLengthFamily && type.length.has_value() && valueLength != *type.length) {
-        throw XmlException("Schema validation failed: " + label + " must have length " + std::to_string(*type.length));
+        throw XmlException("Schema validation failed: " + std::string(label) + " must have length " + std::to_string(*type.length));
     }
     if (!listVariety && !binaryLengthFamily && type.minLength.has_value() && valueLength < *type.minLength) {
-        throw XmlException("Schema validation failed: " + label + " must have length >= " + std::to_string(*type.minLength));
+        throw XmlException("Schema validation failed: " + std::string(label) + " must have length >= " + std::to_string(*type.minLength));
     }
     if (!listVariety && !binaryLengthFamily && type.maxLength.has_value() && valueLength > *type.maxLength) {
-        throw XmlException("Schema validation failed: " + label + " must have length <= " + std::to_string(*type.maxLength));
+        throw XmlException("Schema validation failed: " + std::string(label) + " must have length <= " + std::to_string(*type.maxLength));
     }
 
     if (type.pattern.has_value()) {
         try {
             if (!std::regex_match(normalizedValue, std::regex(*type.pattern))) {
-                throw XmlException("Schema validation failed: " + label + " does not match the declared pattern");
+                throw XmlException("Schema validation failed: " + std::string(label) + " does not match the declared pattern");
             }
         } catch (const std::regex_error&) {
             throw XmlException("Schema validation failed: unsupported pattern facet '" + *type.pattern + "'");
@@ -558,10 +1259,10 @@ void ValidateSchemaSimpleValueWithQNameResolver(
     if (type.totalDigits.has_value() || type.fractionDigits.has_value()) {
         const auto digitInfo = extractDigitInfo(normalizedValue);
         if (type.totalDigits.has_value() && digitInfo.totalDigits > *type.totalDigits) {
-            throw XmlException("Schema validation failed: " + label + " must have at most " + std::to_string(*type.totalDigits) + " total digits");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must have at most " + std::to_string(*type.totalDigits) + " total digits");
         }
         if (type.fractionDigits.has_value() && digitInfo.fractionDigits > *type.fractionDigits) {
-            throw XmlException("Schema validation failed: " + label + " must have at most " + std::to_string(*type.fractionDigits) + " fraction digits");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must have at most " + std::to_string(*type.fractionDigits) + " fraction digits");
         }
     }
 
@@ -579,19 +1280,19 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             }
             if (type.minInclusive.has_value()
                 && ComparePracticalIntegerValues(numericValue, ParsePracticalIntegerOrThrow(*type.minInclusive)) < 0) {
-                throw XmlException("Schema validation failed: " + label + " must be >= " + *type.minInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be >= " + *type.minInclusive);
             }
             if (type.maxInclusive.has_value()
                 && ComparePracticalIntegerValues(numericValue, ParsePracticalIntegerOrThrow(*type.maxInclusive)) > 0) {
-                throw XmlException("Schema validation failed: " + label + " must be <= " + *type.maxInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be <= " + *type.maxInclusive);
             }
             if (type.minExclusive.has_value()
                 && ComparePracticalIntegerValues(numericValue, ParsePracticalIntegerOrThrow(*type.minExclusive)) <= 0) {
-                throw XmlException("Schema validation failed: " + label + " must be > " + *type.minExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be > " + *type.minExclusive);
             }
             if (type.maxExclusive.has_value()
                 && ComparePracticalIntegerValues(numericValue, ParsePracticalIntegerOrThrow(*type.maxExclusive)) >= 0) {
-                throw XmlException("Schema validation failed: " + label + " must be < " + *type.maxExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be < " + *type.maxExclusive);
             }
             return;
         }
@@ -631,32 +1332,32 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             const PracticalDurationValue durationValue = ParsePracticalDurationOrThrow(normalizedValue);
             if (type.minInclusive.has_value()
                 && ComparePracticalDurationValues(durationValue, ParsePracticalDurationOrThrow(*type.minInclusive)) < 0) {
-                throw XmlException("Schema validation failed: " + label + " must be >= " + *type.minInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be >= " + *type.minInclusive);
             }
             if (type.maxInclusive.has_value()
                 && ComparePracticalDurationValues(durationValue, ParsePracticalDurationOrThrow(*type.maxInclusive)) > 0) {
-                throw XmlException("Schema validation failed: " + label + " must be <= " + *type.maxInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be <= " + *type.maxInclusive);
             }
             if (type.minExclusive.has_value()
                 && ComparePracticalDurationValues(durationValue, ParsePracticalDurationOrThrow(*type.minExclusive)) <= 0) {
-                throw XmlException("Schema validation failed: " + label + " must be > " + *type.minExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be > " + *type.minExclusive);
             }
             if (type.maxExclusive.has_value()
                 && ComparePracticalDurationValues(durationValue, ParsePracticalDurationOrThrow(*type.maxExclusive)) >= 0) {
-                throw XmlException("Schema validation failed: " + label + " must be < " + *type.maxExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be < " + *type.maxExclusive);
             }
             return;
         }
         if (type.baseType == "xs:hexBinary" || type.baseType == "xs:base64Binary") {
             const std::size_t binaryValueLength = decodePracticalBinaryValue(type.baseType, normalizedValue).size();
             if (type.length.has_value() && binaryValueLength != *type.length) {
-                throw XmlException("Schema validation failed: " + label + " must have length " + std::to_string(*type.length));
+                throw XmlException("Schema validation failed: " + std::string(label) + " must have length " + std::to_string(*type.length));
             }
             if (type.minLength.has_value() && binaryValueLength < *type.minLength) {
-                throw XmlException("Schema validation failed: " + label + " must have length >= " + std::to_string(*type.minLength));
+                throw XmlException("Schema validation failed: " + std::string(label) + " must have length >= " + std::to_string(*type.minLength));
             }
             if (type.maxLength.has_value() && binaryValueLength > *type.maxLength) {
-                throw XmlException("Schema validation failed: " + label + " must have length <= " + std::to_string(*type.maxLength));
+                throw XmlException("Schema validation failed: " + std::string(label) + " must have length <= " + std::to_string(*type.maxLength));
             }
             return;
         }
@@ -667,25 +1368,25 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             if (type.minInclusive.has_value()) {
                 const PracticalTemporalValue minInclusiveValue = normalizeTemporalValue(type.baseType, *type.minInclusive);
                 if (compareTemporalValues(normalizedTemporalValue, minInclusiveValue) < 0) {
-                    throw XmlException("Schema validation failed: " + label + " must be >= " + *type.minInclusive);
+                    throw XmlException("Schema validation failed: " + std::string(label) + " must be >= " + *type.minInclusive);
                 }
             }
             if (type.maxInclusive.has_value()) {
                 const PracticalTemporalValue maxInclusiveValue = normalizeTemporalValue(type.baseType, *type.maxInclusive);
                 if (compareTemporalValues(normalizedTemporalValue, maxInclusiveValue) > 0) {
-                    throw XmlException("Schema validation failed: " + label + " must be <= " + *type.maxInclusive);
+                    throw XmlException("Schema validation failed: " + std::string(label) + " must be <= " + *type.maxInclusive);
                 }
             }
             if (type.minExclusive.has_value()) {
                 const PracticalTemporalValue minExclusiveValue = normalizeTemporalValue(type.baseType, *type.minExclusive);
                 if (compareTemporalValues(normalizedTemporalValue, minExclusiveValue) <= 0) {
-                    throw XmlException("Schema validation failed: " + label + " must be > " + *type.minExclusive);
+                    throw XmlException("Schema validation failed: " + std::string(label) + " must be > " + *type.minExclusive);
                 }
             }
             if (type.maxExclusive.has_value()) {
                 const PracticalTemporalValue maxExclusiveValue = normalizeTemporalValue(type.baseType, *type.maxExclusive);
                 if (compareTemporalValues(normalizedTemporalValue, maxExclusiveValue) >= 0) {
-                    throw XmlException("Schema validation failed: " + label + " must be < " + *type.maxExclusive);
+                    throw XmlException("Schema validation failed: " + std::string(label) + " must be < " + *type.maxExclusive);
                 }
             }
             return;
@@ -701,7 +1402,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             (void)XmlConvert::VerifyNCName(localName);
             const std::string namespaceUri = resolveNamespaceUri(prefix);
             if (namespaceUri.empty()) {
-                throw XmlException("Schema validation failed: " + label + " must reference a QName prefix declared in scope");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must reference a QName prefix declared in scope");
             }
             return;
         }
@@ -709,11 +1410,11 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyNCName(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
 
             if (!hasNotationDeclaration(normalizedValue)) {
-                throw XmlException("Schema validation failed: " + label + " must reference a declared xs:NOTATION value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must reference a declared xs:NOTATION value");
             }
             return;
         }
@@ -721,27 +1422,27 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyNCName(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
 
             if (!hasUnparsedEntityDeclaration(normalizedValue)) {
-                throw XmlException("Schema validation failed: " + label + " must reference a declared unparsed xs:ENTITY value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must reference a declared unparsed xs:ENTITY value");
             }
             return;
         }
         if (type.baseType == "xs:float") {
             const float numericValue = XmlConvert::ToSingle(normalizedValue);
             if (type.minInclusive.has_value() && numericValue < XmlConvert::ToSingle(*type.minInclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be >= " + *type.minInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be >= " + *type.minInclusive);
             }
             if (type.maxInclusive.has_value() && numericValue > XmlConvert::ToSingle(*type.maxInclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be <= " + *type.maxInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be <= " + *type.maxInclusive);
             }
             if (type.minExclusive.has_value() && numericValue <= XmlConvert::ToSingle(*type.minExclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be > " + *type.minExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be > " + *type.minExclusive);
             }
             if (type.maxExclusive.has_value() && numericValue >= XmlConvert::ToSingle(*type.maxExclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be < " + *type.maxExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be < " + *type.maxExclusive);
             }
             return;
         }
@@ -749,35 +1450,35 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             const PracticalDecimalValue numericValue = ParsePracticalDecimalOrThrow(normalizedValue);
             if (type.minInclusive.has_value()
                 && ComparePracticalDecimalValues(numericValue, ParsePracticalDecimalOrThrow(*type.minInclusive)) < 0) {
-                throw XmlException("Schema validation failed: " + label + " must be >= " + *type.minInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be >= " + *type.minInclusive);
             }
             if (type.maxInclusive.has_value()
                 && ComparePracticalDecimalValues(numericValue, ParsePracticalDecimalOrThrow(*type.maxInclusive)) > 0) {
-                throw XmlException("Schema validation failed: " + label + " must be <= " + *type.maxInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be <= " + *type.maxInclusive);
             }
             if (type.minExclusive.has_value()
                 && ComparePracticalDecimalValues(numericValue, ParsePracticalDecimalOrThrow(*type.minExclusive)) <= 0) {
-                throw XmlException("Schema validation failed: " + label + " must be > " + *type.minExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be > " + *type.minExclusive);
             }
             if (type.maxExclusive.has_value()
                 && ComparePracticalDecimalValues(numericValue, ParsePracticalDecimalOrThrow(*type.maxExclusive)) >= 0) {
-                throw XmlException("Schema validation failed: " + label + " must be < " + *type.maxExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be < " + *type.maxExclusive);
             }
             return;
         }
         if (type.baseType == "xs:double") {
             const double numericValue = XmlConvert::ToDouble(normalizedValue);
             if (type.minInclusive.has_value() && numericValue < XmlConvert::ToDouble(*type.minInclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be >= " + *type.minInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be >= " + *type.minInclusive);
             }
             if (type.maxInclusive.has_value() && numericValue > XmlConvert::ToDouble(*type.maxInclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be <= " + *type.maxInclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be <= " + *type.maxInclusive);
             }
             if (type.minExclusive.has_value() && numericValue <= XmlConvert::ToDouble(*type.minExclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be > " + *type.minExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be > " + *type.minExclusive);
             }
             if (type.maxExclusive.has_value() && numericValue >= XmlConvert::ToDouble(*type.maxExclusive)) {
-                throw XmlException("Schema validation failed: " + label + " must be < " + *type.maxExclusive);
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be < " + *type.maxExclusive);
             }
             return;
         }
@@ -789,7 +1490,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
                     throw XmlException("integer value out of range");
                 }
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -797,7 +1498,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::ToSingle(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -805,7 +1506,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)ParsePracticalDecimalOrThrow(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -813,7 +1514,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::ToDouble(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -821,7 +1522,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::ToBoolean(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -829,7 +1530,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyName(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -837,7 +1538,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyNCName(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -845,7 +1546,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyNCName(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -853,7 +1554,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyNmToken(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -861,18 +1562,18 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)XmlConvert::VerifyNCName(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
         if (type.baseType == "xs:language" || type.baseType == "xs:anyURI") {
-            throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+            throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
         }
         if (type.baseType == "xs:duration") {
             try {
                 (void)ParsePracticalDurationOrThrow(normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -880,7 +1581,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)decodePracticalBinaryValue(type.baseType, normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -890,7 +1591,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
             try {
                 (void)normalizeTemporalValue(type.baseType, normalizedValue);
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -908,7 +1609,7 @@ void ValidateSchemaSimpleValueWithQNameResolver(
                     }
                 }
             } catch (const XmlException&) {
-                throw XmlException("Schema validation failed: " + label + " must be a valid " + type.baseType + " value");
+                throw XmlException("Schema validation failed: " + std::string(label) + " must be a valid " + type.baseType + " value");
             }
             throw;
         }
@@ -919,8 +1620,8 @@ void ValidateSchemaSimpleValueWithQNameResolver(
 
 void ValidateSchemaSimpleValue(
     const XmlSchemaSet::SimpleTypeRule& type,
-    const std::string& value,
-    const std::string& label,
+    std::string_view value,
+    std::string_view label,
     const XmlElement* contextElement) {
     ValidateSchemaSimpleValueWithQNameResolver(
         type,
@@ -941,8 +1642,8 @@ void ValidateSchemaSimpleValue(
 
 void ValidateSchemaSimpleValue(
     const XmlSchemaSet::SimpleTypeRule& type,
-    const std::string& value,
-    const std::string& label,
+    std::string_view value,
+    std::string_view label,
     const std::vector<std::pair<std::string, std::string>>& namespaceBindings,
     const std::unordered_set<std::string>& notationDeclarationNames,
     const std::unordered_set<std::string>& unparsedEntityDeclarationNames) {
@@ -3107,13 +3808,13 @@ std::shared_ptr<XmlElement> XmlDocument::DocumentElement() const {
     return nullptr;
 }
 
-std::vector<std::shared_ptr<XmlElement>> XmlDocument::GetElementsByTagName(const std::string& name) const {
+std::vector<std::shared_ptr<XmlElement>> XmlDocument::GetElementsByTagName(std::string_view name) const {
     std::vector<std::shared_ptr<XmlElement>> results;
     CollectElementsByName(*this, name, results);
     return results;
 }
 
-XmlNodeList XmlDocument::GetElementsByTagNameList(const std::string& name) const {
+XmlNodeList XmlDocument::GetElementsByTagNameList(std::string_view name) const {
     std::vector<std::shared_ptr<XmlNode>> nodes;
     for (const auto& element : GetElementsByTagName(name)) {
         nodes.push_back(element);
@@ -3121,13 +3822,13 @@ XmlNodeList XmlDocument::GetElementsByTagNameList(const std::string& name) const
     return XmlNodeList(std::move(nodes));
 }
 
-std::vector<std::shared_ptr<XmlElement>> XmlDocument::GetElementsByTagName(const std::string& localName, const std::string& namespaceUri) const {
+std::vector<std::shared_ptr<XmlElement>> XmlDocument::GetElementsByTagName(std::string_view localName, std::string_view namespaceUri) const {
     std::vector<std::shared_ptr<XmlElement>> results;
     CollectElementsByNameNS(*this, localName, namespaceUri, results);
     return results;
 }
 
-XmlNodeList XmlDocument::GetElementsByTagNameList(const std::string& localName, const std::string& namespaceUri) const {
+XmlNodeList XmlDocument::GetElementsByTagNameList(std::string_view localName, std::string_view namespaceUri) const {
     std::vector<std::shared_ptr<XmlNode>> nodes;
     for (const auto& element : GetElementsByTagName(localName, namespaceUri)) {
         nodes.push_back(element);
@@ -3136,49 +3837,38 @@ XmlNodeList XmlDocument::GetElementsByTagNameList(const std::string& localName, 
 }
 
 std::shared_ptr<XmlDocumentFragment> XmlDocument::CreateDocumentFragment() const {
-    auto node = std::make_shared<XmlDocumentFragment>();
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+    return AllocateOwnedNode<XmlDocumentFragment>();
 }
 
-std::shared_ptr<XmlElement> XmlDocument::CreateElement(const std::string& name) const {
-    auto node = std::make_shared<XmlElement>(name);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlElement> XmlDocument::CreateElement(std::string_view name) const {
+    return AllocateOwnedNode<XmlElement>(std::string(name));
 }
 
-std::shared_ptr<XmlElement> XmlDocument::CreateElement(const std::string& prefix, const std::string& localName, const std::string& namespaceUri) const {
-    std::string qualifiedName = prefix.empty() ? localName : (prefix + ":" + localName);
-    auto node = std::make_shared<XmlElement>(qualifiedName);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
+std::shared_ptr<XmlElement> XmlDocument::CreateElement(std::string_view prefix, std::string_view localName, std::string_view namespaceUri) const {
+    std::string qualifiedName = prefix.empty() ? std::string(localName) : (std::string(prefix) + ":" + std::string(localName));
+    auto node = AllocateOwnedNode<XmlElement>(std::move(qualifiedName));
     if (!namespaceUri.empty()) {
-        std::string nsAttrName = prefix.empty() ? "xmlns" : ("xmlns:" + prefix);
+        std::string nsAttrName = prefix.empty() ? std::string("xmlns") : ("xmlns:" + std::string(prefix));
         node->SetAttribute(nsAttrName, namespaceUri);
     }
     return node;
 }
 
-std::shared_ptr<XmlAttribute> XmlDocument::CreateAttribute(const std::string& name, const std::string& value) const {
-    auto node = std::make_shared<XmlAttribute>(name, value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlAttribute> XmlDocument::CreateAttribute(std::string_view name, std::string_view value) const {
+    return AllocateOwnedNode<XmlAttribute>(std::string(name), std::string(value));
 }
 
-std::shared_ptr<XmlAttribute> XmlDocument::CreateAttribute(const std::string& prefix, const std::string& localName, const std::string& namespaceUri, const std::string& value) const {
+std::shared_ptr<XmlAttribute> XmlDocument::CreateAttribute(std::string_view prefix, std::string_view localName, std::string_view namespaceUri, std::string_view value) const {
     (void)namespaceUri;
-    std::string qualifiedName = prefix.empty() ? localName : (prefix + ":" + localName);
-    auto node = std::make_shared<XmlAttribute>(qualifiedName, value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+    std::string qualifiedName = prefix.empty() ? std::string(localName) : (std::string(prefix) + ":" + std::string(localName));
+    return AllocateOwnedNode<XmlAttribute>(std::move(qualifiedName), std::string(value));
 }
 
-std::shared_ptr<XmlText> XmlDocument::CreateTextNode(const std::string& value) const {
-    auto node = std::make_shared<XmlText>(value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlText> XmlDocument::CreateTextNode(std::string_view value) const {
+    return AllocateOwnedNode<XmlText>(std::string(value));
 }
 
-std::shared_ptr<XmlEntityReference> XmlDocument::CreateEntityReference(const std::string& name) const {
+std::shared_ptr<XmlEntityReference> XmlDocument::CreateEntityReference(std::string_view name) const {
     if (name.empty()) {
         throw XmlException("CreateEntityReference requires an entity name");
     }
@@ -3186,7 +3876,7 @@ std::shared_ptr<XmlEntityReference> XmlDocument::CreateEntityReference(const std
     std::string resolvedValue = ResolvePredefinedEntityReferenceValue(name);
     if (resolvedValue.empty()) {
         if (const auto declared = LookupDocumentInternalEntityDeclaration(this, name); declared.has_value()) {
-            std::vector<std::string> resolutionStack{name};
+            std::vector<std::string> resolutionStack{std::string(name)};
             resolvedValue = DecodeEntityText(
                 *declared,
                 [this](const std::string& entity) {
@@ -3200,64 +3890,48 @@ std::shared_ptr<XmlEntityReference> XmlDocument::CreateEntityReference(const std
         }
     }
 
-    auto node = std::make_shared<XmlEntityReference>(name, resolvedValue);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+    return AllocateOwnedNode<XmlEntityReference>(std::string(name), std::move(resolvedValue));
 }
 
-std::shared_ptr<XmlWhitespace> XmlDocument::CreateWhitespace(const std::string& value) const {
-    auto node = std::make_shared<XmlWhitespace>(value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlWhitespace> XmlDocument::CreateWhitespace(std::string_view value) const {
+    return AllocateOwnedNode<XmlWhitespace>(std::string(value));
 }
 
-std::shared_ptr<XmlSignificantWhitespace> XmlDocument::CreateSignificantWhitespace(const std::string& value) const {
-    auto node = std::make_shared<XmlSignificantWhitespace>(value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlSignificantWhitespace> XmlDocument::CreateSignificantWhitespace(std::string_view value) const {
+    return AllocateOwnedNode<XmlSignificantWhitespace>(std::string(value));
 }
 
-std::shared_ptr<XmlCDataSection> XmlDocument::CreateCDataSection(const std::string& value) const {
-    auto node = std::make_shared<XmlCDataSection>(value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlCDataSection> XmlDocument::CreateCDataSection(std::string_view value) const {
+    return AllocateOwnedNode<XmlCDataSection>(std::string(value));
 }
 
-std::shared_ptr<XmlComment> XmlDocument::CreateComment(const std::string& value) const {
-    auto node = std::make_shared<XmlComment>(value);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlComment> XmlDocument::CreateComment(std::string_view value) const {
+    return AllocateOwnedNode<XmlComment>(std::string(value));
 }
 
-std::shared_ptr<XmlProcessingInstruction> XmlDocument::CreateProcessingInstruction(const std::string& target, const std::string& data) const {
-    auto node = std::make_shared<XmlProcessingInstruction>(target, data);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+std::shared_ptr<XmlProcessingInstruction> XmlDocument::CreateProcessingInstruction(std::string_view target, std::string_view data) const {
+    return AllocateOwnedNode<XmlProcessingInstruction>(std::string(target), std::string(data));
 }
 
 std::shared_ptr<XmlDeclaration> XmlDocument::CreateXmlDeclaration(
-    const std::string& version,
-    const std::string& encoding,
-    const std::string& standalone) const {
-    auto node = std::make_shared<XmlDeclaration>(version, encoding, standalone);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+    std::string_view version,
+    std::string_view encoding,
+    std::string_view standalone) const {
+    return AllocateOwnedNode<XmlDeclaration>(std::string(version), std::string(encoding), std::string(standalone));
 }
 
 std::shared_ptr<XmlDocumentType> XmlDocument::CreateDocumentType(
-    const std::string& name,
-    const std::string& publicId,
-    const std::string& systemId,
-    const std::string& internalSubset) const {
-    auto node = std::make_shared<XmlDocumentType>(name, publicId, systemId, internalSubset);
-    node->SetOwnerDocument(const_cast<XmlDocument*>(this));
-    return node;
+    std::string_view name,
+    std::string_view publicId,
+    std::string_view systemId,
+    std::string_view internalSubset) const {
+    return AllocateOwnedNode<XmlDocumentType>(std::string(name), std::string(publicId), std::string(systemId), std::string(internalSubset));
 }
 
 std::shared_ptr<XmlNode> XmlDocument::CreateNode(
     XmlNodeType nodeType,
-    const std::string& name,
-    const std::string& value) const {
+    std::string_view name,
+    std::string_view value) const {
     switch (nodeType) {
     case XmlNodeType::Element:
         if (name.empty()) {
@@ -3435,6 +4109,7 @@ void XmlDocument::ValidateChildInsertion(const std::shared_ptr<XmlNode>& child, 
 
 void XmlDocument::ValidateReaderAgainstSchemas(XmlReader& reader, const XmlSchemaSet& schemas) const {
     static const std::string kSchemaInstanceNamespace = "http://www.w3.org/2001/XMLSchema-instance";
+    static const std::unordered_set<std::string> emptyStringSet;
 
     const auto readerCanEvaluateIdentityConstraint = [](const XmlSchemaSet::ElementRule::IdentityConstraint& constraint) {
         if (!constraint.compiledSelectorPath.has_value()) {
@@ -4254,8 +4929,8 @@ void XmlDocument::ValidateReaderAgainstSchemas(XmlReader& reader, const XmlSchem
                         value,
                         label,
                         namespaceBindings,
-                        reader.notationDeclarationNames_,
-                        reader.unparsedEntityDeclarationNames_);
+                        reader.dtdState_ ? reader.dtdState_->notationDeclarationNames : emptyStringSet,
+                        reader.dtdState_ ? reader.dtdState_->unparsedEntityDeclarationNames : emptyStringSet);
                     recordIdentityTypedValue(memberType, value, label, namespaceBindings);
                     return;
                 } catch (const XmlException&) {
@@ -4767,8 +5442,8 @@ void XmlDocument::ValidateReaderAgainstSchemas(XmlReader& reader, const XmlSchem
                     *effectiveAttributeValue,
                     "attribute '" + attributeRule.name + "' on element '" + frame.name + "'",
                     frame.namespaceBindings,
-                    reader.notationDeclarationNames_,
-                    reader.unparsedEntityDeclarationNames_);
+                    reader.dtdState_ ? reader.dtdState_->notationDeclarationNames : emptyStringSet,
+                    reader.dtdState_ ? reader.dtdState_->unparsedEntityDeclarationNames : emptyStringSet);
                 recordIdentityTypedValue(*attributeRule.type, *effectiveAttributeValue,
                     "attribute '" + attributeRule.name + "' on element '" + frame.name + "'", frame.namespaceBindings);
             }
@@ -4931,8 +5606,8 @@ void XmlDocument::ValidateReaderAgainstSchemas(XmlReader& reader, const XmlSchem
                     *effectiveElementValue,
                     "text content of element '" + frame.name + "'",
                     frame.namespaceBindings,
-                    reader.notationDeclarationNames_,
-                    reader.unparsedEntityDeclarationNames_);
+                    reader.dtdState_ ? reader.dtdState_->notationDeclarationNames : emptyStringSet,
+                    reader.dtdState_ ? reader.dtdState_->unparsedEntityDeclarationNames : emptyStringSet);
                 recordIdentityTypedValue(*rule->textType, *effectiveElementValue,
                     "text content of element '" + frame.name + "'", frame.namespaceBindings);
             }
@@ -5032,7 +5707,7 @@ void XmlDocument::ValidateReaderAgainstSchemas(XmlReader& reader, const XmlSchem
     ValidatePendingSchemaIdReferences(identityState);
 }
 
-void ValidateXmlReaderInputAgainstSchemas(const std::string& xml, const XmlReaderSettings& settings) {
+void ValidateXmlReaderInputAgainstSchemas(const std::shared_ptr<const std::string>& xml, const XmlReaderSettings& settings) {
     if (settings.Validation != ValidationType::Schema) {
         return;
     }
@@ -5045,7 +5720,7 @@ void ValidateXmlReaderInputAgainstSchemas(const std::string& xml, const XmlReade
 
     XmlReaderSettings validationSettings = settings;
     validationSettings.Validation = ValidationType::None;
-    auto reader = XmlReader::Create(xml, validationSettings);
+    auto reader = XmlReader::CreateFromValidatedString(xml, validationSettings);
     XmlDocument validationDocument;
     validationDocument.ValidateReaderAgainstSchemas(reader, *settings.Schemas);
 }

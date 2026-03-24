@@ -14,6 +14,11 @@
     <ClInclude Include="include\Xml.h" />
     <ClInclude Include="include\XmlConvert.h" />
     <ClInclude Include="include\XmlDocument.h" />
+    <ClInclude Include="include\XmlInternal.h" />
+    <ClInclude Include="include\XmlSchemaInternal.h" />
+    <ClInclude Include="include\XmlReaderInternal.h" />
+    <ClInclude Include="include\XmlDomInternal.h" />
+    <ClInclude Include="include\XmlUtilityInternal.h" />
     <ClInclude Include="include\XmlNamespaceManager.h" />
     <ClInclude Include="include\XmlNameTable.h" />
     <ClInclude Include="include\XmlNode.h" />
@@ -24,11 +29,11 @@
     <ClInclude Include="include\XmlTypes.h" />
     <ClInclude Include="include\XmlWriter.h" />
     <ClInclude Include="include\XmlXPath.h" />
-    <ClInclude Include="src\XmlInternal.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\XmlConvert.cpp" />
     <ClCompile Include="src\XmlDocument.cpp" />
+    <ClCompile Include="src\XmlInternal.cpp" />
     <ClCompile Include="src\XmlNamespaceManager.cpp" />
     <ClCompile Include="src\XmlNameTable.cpp" />
     <ClCompile Include="src\XmlNode.cpp" />

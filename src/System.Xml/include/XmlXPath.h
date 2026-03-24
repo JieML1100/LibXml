@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace System::Xml {
@@ -37,10 +38,10 @@ public:
     bool MoveToNextAttribute();
     void MoveToRoot();
 
-    XPathNavigator SelectSingleNode(const std::string& xpath) const;
-    XPathNavigator SelectSingleNode(const std::string& xpath, const XmlNamespaceManager& namespaces) const;
-    std::vector<XPathNavigator> Select(const std::string& xpath) const;
-    std::vector<XPathNavigator> Select(const std::string& xpath, const XmlNamespaceManager& namespaces) const;
+    XPathNavigator SelectSingleNode(std::string_view xpath) const;
+    XPathNavigator SelectSingleNode(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
+    std::vector<XPathNavigator> Select(std::string_view xpath) const;
+    std::vector<XPathNavigator> Select(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
 
     const XmlNode* UnderlyingNode() const noexcept;
 
@@ -51,11 +52,11 @@ private:
 class XPathDocument final {
 public:
     XPathDocument();
-    explicit XPathDocument(const std::string& xml);
+    explicit XPathDocument(std::string_view xml);
 
-    static std::shared_ptr<XPathDocument> Parse(const std::string& xml);
+    static std::shared_ptr<XPathDocument> Parse(std::string_view xml);
 
-    void LoadXml(const std::string& xml);
+    void LoadXml(std::string_view xml);
     void Load(const std::string& path);
     void Load(std::istream& stream);
 

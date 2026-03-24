@@ -42,16 +42,16 @@ public:
     int AttributeCount() const noexcept;
     bool HasAttributes() const noexcept;
 
-    std::string GetAttribute(const std::string& name) const;
+    std::string GetAttribute(std::string_view name) const;
     std::string GetAttribute(int index) const;
-    std::string GetAttribute(const std::string& localName, const std::string& namespaceUri) const;
-    bool MoveToAttribute(const std::string& name);
+    std::string GetAttribute(std::string_view localName, std::string_view namespaceUri) const;
+    bool MoveToAttribute(std::string_view name);
     bool MoveToAttribute(int index);
-    bool MoveToAttribute(const std::string& localName, const std::string& namespaceUri);
+    bool MoveToAttribute(std::string_view localName, std::string_view namespaceUri);
     bool MoveToFirstAttribute();
     bool MoveToNextAttribute();
     bool MoveToElement();
-    std::string LookupNamespace(const std::string& prefix) const;
+    std::string LookupNamespace(std::string_view prefix) const;
 
     std::string ReadInnerXml() const;
     std::string ReadOuterXml() const;
@@ -65,17 +65,17 @@ public:
 
     XmlNodeType MoveToContent();
     bool IsStartElement();
-    bool IsStartElement(const std::string& name);
+    bool IsStartElement(std::string_view name);
     void ReadStartElement();
-    void ReadStartElement(const std::string& name);
+    void ReadStartElement(std::string_view name);
     void ReadEndElement();
     std::string ReadElementContentAsString();
     std::string ReadElementString();
-    std::string ReadElementString(const std::string& name);
+    std::string ReadElementString(std::string_view name);
     void Skip();
-    bool ReadToFollowing(const std::string& name);
-    bool ReadToDescendant(const std::string& name);
-    bool ReadToNextSibling(const std::string& name);
+    bool ReadToFollowing(std::string_view name);
+    bool ReadToDescendant(std::string_view name);
+    bool ReadToNextSibling(std::string_view name);
     XmlReader ReadSubtree();
     void Close();
     const XmlNameTable& NameTable() const noexcept;
@@ -86,6 +86,7 @@ public:
 
 private:
     friend class XmlDocument;
+    friend void ValidateXmlReaderInputAgainstSchemas(const std::shared_ptr<const std::string>& xml, const XmlReaderSettings& settings);
 
     struct BufferedNode {
         XmlNodeType nodeType = XmlNodeType::None;
@@ -114,15 +115,23 @@ private:
         unsigned char flags = 0;
     };
 
+    struct DtdState {
+        std::unordered_map<std::string, std::string> entityDeclarations;
+        std::unordered_set<std::string> declaredEntityNames;
+        std::unordered_set<std::string> notationDeclarationNames;
+        std::unordered_set<std::string> unparsedEntityDeclarationNames;
+        std::unordered_map<std::string, std::string> externalEntitySystemIds;
+    };
+
     explicit XmlReader(XmlReaderSettings settings = {});
 
     char Peek() const noexcept;
     char ReadChar();
-    bool StartsWith(const std::string& token) const noexcept;
+    bool StartsWith(std::string_view token) const noexcept;
     void SkipWhitespace();
     std::string ParseName();
     std::string ParseQuotedValue(bool decodeEntities = true);
-    std::string DecodeEntities(const std::string& value) const;
+    std::string DecodeEntities(std::string_view value) const;
     void QueueNode(
         XmlNodeType nodeType,
         std::string name,
@@ -147,7 +156,7 @@ private:
     char SourceCharAt(std::size_t position) const noexcept;
     const char* SourcePtrAt(std::size_t position, std::size_t& available) const noexcept;
     bool HasSourceChar(std::size_t position) const noexcept;
-    std::size_t FindInSource(const std::string& token, std::size_t position) const noexcept;
+    std::size_t FindInSource(std::string_view token, std::size_t position) const noexcept;
     std::string SourceSubstr(std::size_t start, std::size_t count = std::string::npos) const;
     bool SourceRangeContains(std::size_t start, std::size_t end, char value) const noexcept;
     void AppendSourceSubstrTo(std::string& target, std::size_t start, std::size_t count) const;
@@ -157,15 +166,19 @@ private:
     void DecodeAndAppendCurrentBase64(std::vector<unsigned char>& buffer, unsigned int& accumulator, int& bits) const;
     std::size_t EarliestRetainedSourceOffset() const noexcept;
     void MaybeDiscardSourcePrefix() const;
+    DtdState& EnsureDtdState();
     void FinalizeSuccessfulRead();
     std::string CurrentLocalName() const;
     std::string CurrentPrefix() const;
+    const std::string& CurrentAttributeNameRef(std::size_t index) const noexcept;
     std::string CurrentAttributeLocalName(std::size_t index) const;
     std::string CurrentAttributePrefix(std::size_t index) const;
+    const std::string& CurrentNameRef() const noexcept;
     const std::string& CurrentAttributeNamespaceUri(std::size_t index) const;
     const std::string& CurrentAttributeValue(std::size_t index) const;
     void RefreshCurrentEarliestRetainedAttributeValueStart() const noexcept;
     void AppendCurrentAttributesForLoad(XmlElement& element);
+    void MaterializeValue();
     void SetCurrentNode(
         XmlNodeType nodeType,
         std::string name,
@@ -185,8 +198,10 @@ private:
         std::size_t contentStart = std::string::npos,
         std::size_t closeStart = std::string::npos,
         std::size_t closeEnd = std::string::npos);
+    void SetCurrentNameParts(std::string_view prefix, std::string_view localName);
+    void SetCurrentAttributeNameParts(std::vector<std::string> prefixes, std::vector<std::string> localNames);
     std::pair<std::size_t, std::size_t> ComputeLineColumn(std::size_t position) const noexcept;
-    [[noreturn]] void Throw(const std::string& message) const;
+    [[noreturn]] void Throw(std::string_view message) const;
     void ParseDeclaration();
     void ParseDocumentType();
     void ParseProcessingInstruction();
@@ -200,25 +215,37 @@ private:
     std::pair<std::size_t, std::size_t> FindElementXmlBounds(
         std::size_t,
         std::size_t contentStart,
-        const std::string& elementName) const;
+        std::string_view elementName) const;
     std::pair<std::string, std::string> CaptureElementXml(
         std::size_t elementStart,
         std::size_t contentStart) const;
-    std::string LookupNamespaceUri(const std::string& prefix) const;
+    std::string LookupNamespaceUri(std::string_view prefix) const;
     const std::vector<std::pair<std::string, std::string>>& CurrentAttributes() const;
     void InitializeInputState();
-    static XmlReader CreateFromValidatedString(std::shared_ptr<const std::string> xml, const XmlReaderSettings& settings);
+    const std::string& EnsureResolvedBaseUri();
+    static XmlReader CreateFromValidatedString(
+        std::shared_ptr<const std::string> xml,
+        const XmlReaderSettings& settings,
+        bool skipMaxCharactersPrecheck = false);
 
     XmlReaderSettings settings_;
     std::shared_ptr<const XmlReaderInputSource> inputSource_;
     std::size_t position_ = 0;
     XmlNodeType currentNodeType_ = XmlNodeType::None;
     std::string currentName_;
+    const std::string* currentNameInterned_ = nullptr;
     std::string currentNamespaceUri_;
     mutable std::string currentValue_;
     mutable std::string currentInnerXml_;
     mutable std::string currentOuterXml_;
     mutable std::vector<std::pair<std::string, std::string>> currentAttributes_;
+    mutable std::vector<const std::string*> currentAttributeNamesInterned_;
+    mutable std::string currentLocalName_;
+    mutable std::string currentPrefix_;
+    mutable bool currentNamePartsResolved_ = false;
+    mutable std::vector<std::string> currentAttributeLocalNames_;
+    mutable std::vector<std::string> currentAttributePrefixes_;
+    mutable std::vector<unsigned char> currentAttributeNamePartsResolved_;
     mutable std::vector<unsigned char> currentAttributeNamespaceUrisResolved_;
     mutable std::vector<AttributeValueMetadata> currentAttributeValueMetadata_;
     mutable std::vector<std::string> currentAttributeNamespaceUris_;
@@ -237,14 +264,12 @@ private:
     mutable std::size_t currentCloseEnd_ = std::string::npos;
     std::deque<BufferedNode> bufferedNodes_;
     std::vector<std::string> elementStack_;
-    std::vector<std::unordered_map<std::string, std::string>> namespaceScopes_;
+    std::vector<std::vector<std::pair<std::string, std::string>>> namespaceScopes_;
     std::vector<bool> namespaceScopeFramePushedStack_;
     std::vector<bool> xmlSpacePreserveStack_;
     std::vector<bool> xmlSpacePreserveFramePushedStack_;
-    std::unordered_map<std::string, std::string> entityDeclarations_;
-    std::unordered_set<std::string> declaredEntityNames_;
-    std::unordered_set<std::string> notationDeclarationNames_;
-    std::unordered_set<std::string> unparsedEntityDeclarationNames_;
+
+    std::unique_ptr<DtdState> dtdState_;
     std::string pendingEndElementName_;
     int pendingEndElementDepth_ = 0;
     bool pendingEndElement_ = false;
@@ -266,7 +291,7 @@ private:
     mutable std::size_t discardedLineNumber_ = 1;
     mutable std::size_t discardedLinePosition_ = 1;
     std::string baseUri_;
-    std::unordered_map<std::string, std::string> externalEntitySystemIds_;
+    bool baseUriNeedsResolution_ = false;
     XmlNameTable nameTable_;
 
     friend void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document);

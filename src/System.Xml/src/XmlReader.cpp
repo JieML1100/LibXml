@@ -32,29 +32,35 @@ public:
     }
 
     char CharAt(std::size_t position) const noexcept override {
+        std::size_t bufferIndex = 0;
+        if (TryGetBufferedIndex(position, bufferIndex)) {
+            return buffer_[bufferIndex];
+        }
+
         EnsureBufferedThrough(position);
-        if (position >= bufferStartOffset_) {
-            const auto bufferIndex = bufferLogicalStart_ + (position - bufferStartOffset_);
-            return bufferIndex < buffer_.size() ? buffer_[bufferIndex] : '\0';
+        if (TryGetBufferedIndex(position, bufferIndex)) {
+            return buffer_[bufferIndex];
         }
         return ReadReplayCharAt(position);
     }
 
     const char* PtrAt(std::size_t position, std::size_t& available) const noexcept override {
         available = 0;
+        std::size_t bufferIndex = 0;
+        if (TryGetBufferedIndex(position, bufferIndex)) {
+            available = buffer_.size() - bufferIndex;
+            return buffer_.data() + static_cast<std::ptrdiff_t>(bufferIndex);
+        }
+
         EnsureBufferedThrough(position);
-        if (position >= bufferStartOffset_) {
-            const auto bufferIndex = bufferLogicalStart_ + (position - bufferStartOffset_);
-            if (bufferIndex < buffer_.size()) {
-                available = buffer_.size() - bufferIndex;
-                return buffer_.data() + static_cast<std::ptrdiff_t>(bufferIndex);
-            }
-            return nullptr;
+        if (TryGetBufferedIndex(position, bufferIndex)) {
+            available = buffer_.size() - bufferIndex;
+            return buffer_.data() + static_cast<std::ptrdiff_t>(bufferIndex);
         }
         return ReadReplayPtrAt(position, available);
     }
 
-    std::size_t Find(const std::string& token, std::size_t position) const noexcept override {
+    std::size_t Find(std::string_view token, std::size_t position) const noexcept override {
         if (token.empty()) {
             return position;
         }
@@ -131,6 +137,9 @@ public:
             return position;
         }
 
+        const bool textSpecialTokens = tokens == "<&";
+        const bool textLineSpecialTokens = tokens == "\n<&";
+
         if (position < bufferStartOffset_) {
             const std::size_t replaySearchEnd = (std::min)(bufferStartOffset_, replayLength_);
             const std::size_t replayFound = FindFirstOfInReplay(tokens, position, replaySearchEnd);
@@ -145,7 +154,20 @@ public:
             ? bufferLogicalStart_ + (position - bufferStartOffset_)
             : bufferLogicalStart_;
         while (true) {
-            const auto found = buffer_.find_first_of(tokens, searchPosition);
+            std::size_t found = std::string::npos;
+            if (searchPosition < buffer_.size()) {
+                const char* searchData = buffer_.data() + static_cast<std::ptrdiff_t>(searchPosition);
+                const std::size_t searchLength = buffer_.size() - searchPosition;
+                if (textSpecialTokens) {
+                    const std::size_t offset = FindTextSpecialInBuffer(searchData, searchLength);
+                    found = offset == std::string::npos ? std::string::npos : searchPosition + offset;
+                } else if (textLineSpecialTokens) {
+                    const std::size_t offset = FindTextLineSpecialInBuffer(searchData, searchLength);
+                    found = offset == std::string::npos ? std::string::npos : searchPosition + offset;
+                } else {
+                    found = buffer_.find_first_of(tokens, searchPosition);
+                }
+            }
             if (found != std::string::npos) {
                 return bufferStartOffset_ + (found - bufferLogicalStart_);
             }
@@ -178,7 +200,13 @@ public:
             ? bufferLogicalStart_ + (position - bufferStartOffset_)
             : bufferLogicalStart_;
         while (true) {
-            const auto found = buffer_.find_first_of("<&", searchPosition);
+            std::size_t found = std::string::npos;
+            if (searchPosition < buffer_.size()) {
+                const std::size_t offset = FindTextSpecialInBuffer(
+                    buffer_.data() + static_cast<std::ptrdiff_t>(searchPosition),
+                    buffer_.size() - searchPosition);
+                found = offset == std::string::npos ? std::string::npos : searchPosition + offset;
+            }
             if (found != std::string::npos) {
                 return bufferStartOffset_ + (found - bufferLogicalStart_);
             }
@@ -289,6 +317,21 @@ private:
 
     std::size_t ActiveBufferSize() const noexcept {
         return buffer_.size() >= bufferLogicalStart_ ? buffer_.size() - bufferLogicalStart_ : 0;
+    }
+
+    bool TryGetBufferedIndex(std::size_t position, std::size_t& bufferIndex) const noexcept {
+        if (position < bufferStartOffset_) {
+            return false;
+        }
+
+        const std::size_t relative = position - bufferStartOffset_;
+        const std::size_t activeSize = ActiveBufferSize();
+        if (relative >= activeSize) {
+            return false;
+        }
+
+        bufferIndex = bufferLogicalStart_ + relative;
+        return bufferIndex < buffer_.size();
     }
 
     std::size_t BufferedEndOffset() const noexcept {
@@ -466,7 +509,7 @@ private:
         }
     }
 
-    std::size_t FindInReplay(const std::string& token, std::size_t start, std::size_t end) const noexcept {
+    std::size_t FindInReplay(std::string_view token, std::size_t start, std::size_t end) const noexcept {
         if (!HasReplayFile() || start >= end) {
             return std::string::npos;
         }
@@ -668,7 +711,7 @@ public:
         return available == 0 ? nullptr : ptr;
     }
 
-    std::size_t Find(const std::string& token, std::size_t position) const noexcept override {
+    std::size_t Find(std::string_view token, std::size_t position) const noexcept override {
         if (inputSource_ == nullptr) {
             return std::string::npos;
         }
@@ -893,6 +936,35 @@ void SkipXmlWhitespaceAt(std::string_view text, std::size_t& position) noexcept 
         }
         position += 16;
     }
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    const uint8x16_t v_space = vdupq_n_u8(' ');
+    const uint8x16_t v_tab = vdupq_n_u8('\t');
+    const uint8x16_t v_lf = vdupq_n_u8('\n');
+    const uint8x16_t v_cr = vdupq_n_u8('\r');
+
+    while (position + 16 <= size) {
+        const uint8x16_t chunk = vld1q_u8(reinterpret_cast<const std::uint8_t*>(text.data() + position));
+        const uint8x16_t m_space = vceqq_u8(chunk, v_space);
+        const uint8x16_t m_tab = vceqq_u8(chunk, v_tab);
+        const uint8x16_t m_lf = vceqq_u8(chunk, v_lf);
+        const uint8x16_t m_cr = vceqq_u8(chunk, v_cr);
+        const uint8x16_t isWs = vorrq_u8(vorrq_u8(m_space, m_tab), vorrq_u8(m_lf, m_cr));
+
+        alignas(16) std::uint8_t maskBytes[16];
+        vst1q_u8(maskBytes, isWs);
+
+        std::size_t firstNonWhitespace = 0;
+        while (firstNonWhitespace < 16 && maskBytes[firstNonWhitespace] != 0) {
+            ++firstNonWhitespace;
+        }
+
+        if (firstNonWhitespace != 16) {
+            position += firstNonWhitespace;
+            return;
+        }
+
+        position += 16;
+    }
 #endif
     while (position < size && IsWhitespace(text[position])) {
         ++position;
@@ -1110,11 +1182,11 @@ public:
     using QuotedValueToken = XmlQuotedValueToken;
     using EntityReferenceToken = XmlEntityReferenceToken;
 
-    explicit XmlReaderTokenizer(std::shared_ptr<const XmlReaderInputSource> inputSource)
-                : inputSource_(std::move(inputSource)),
-                    stringInputSource_(dynamic_cast<const StringXmlReaderInputSource*>(inputSource_.get())),
-                    streamInputSource_(dynamic_cast<const StreamXmlReaderInputSource*>(inputSource_.get())),
-                    subrangeInputSource_(dynamic_cast<const SubrangeXmlReaderInputSource*>(inputSource_.get())) {
+    explicit XmlReaderTokenizer(const XmlReaderInputSource* inputSource) noexcept
+                : inputSource_(inputSource),
+                    stringInputSource_(dynamic_cast<const StringXmlReaderInputSource*>(inputSource)),
+                    streamInputSource_(dynamic_cast<const StreamXmlReaderInputSource*>(inputSource)),
+                    subrangeInputSource_(dynamic_cast<const SubrangeXmlReaderInputSource*>(inputSource)) {
     }
 
     bool HasChar(std::size_t position) const noexcept {
@@ -1131,23 +1203,23 @@ public:
     }
 
     bool StartsWith(std::size_t position, std::string_view token) const noexcept {
-        return StartsWithAt(inputSource_.get(), position, token);
+        return StartsWithAt(inputSource_, position, token);
     }
 
-    std::size_t Find(const std::string& token, std::size_t position) const noexcept {
+    std::size_t Find(std::string_view token, std::size_t position) const noexcept {
         return inputSource_ == nullptr ? std::string::npos : inputSource_->Find(token, position);
     }
 
     std::size_t ScanQuotedValueEnd(std::size_t quoteStart) const noexcept {
-        return ScanQuotedValueEndAt(inputSource_.get(), quoteStart);
+        return ScanQuotedValueEndAt(inputSource_, quoteStart);
     }
 
     std::size_t ScanDelimitedSectionEnd(std::size_t contentStart, std::string_view terminator) const noexcept {
-        return ScanDelimitedSectionEndAt(inputSource_.get(), contentStart, terminator);
+        return ScanDelimitedSectionEndAt(inputSource_, contentStart, terminator);
     }
 
     std::size_t ScanDocumentTypeInternalSubsetEnd(std::size_t contentStart) const noexcept {
-        return ScanDocumentTypeInternalSubsetEndAt(inputSource_.get(), contentStart);
+        return ScanDocumentTypeInternalSubsetEndAt(inputSource_, contentStart);
     }
 
     XmlMarkupKind ClassifyMarkup(std::size_t position) const noexcept {
@@ -1157,15 +1229,15 @@ public:
     }
 
     std::string ParseNameAt(std::size_t& position) const {
-        return ParseNameFromInputSourceAt(inputSource_.get(), position);
+        return ParseNameFromInputSourceAt(inputSource_, position);
     }
 
     bool SkipTag(std::size_t& position, bool& isEmptyElement) const {
-        return SkipTagFromInputSourceAt(inputSource_.get(), position, isEmptyElement);
+        return SkipTagFromInputSourceAt(inputSource_, position, isEmptyElement);
     }
 
     void SkipWhitespace(std::size_t& position) const noexcept {
-        SkipXmlWhitespaceAt(inputSource_.get(), position);
+        SkipXmlWhitespaceAt(inputSource_, position);
     }
 
     bool ConsumeStartTagClose(std::size_t& position, bool& isEmptyElement) const noexcept {
@@ -1209,11 +1281,11 @@ public:
     }
 
     QuotedValueToken ParseQuotedLiteral(std::size_t& position) const {
-        return ParseQuotedLiteralFromInputSourceAt(inputSource_.get(), position);
+        return ParseQuotedLiteralFromInputSourceAt(inputSource_, position);
     }
 
     EntityReferenceToken ScanEntityReference(std::size_t ampersandPosition) const {
-        return ScanEntityReferenceFromInputSourceAt(inputSource_.get(), ampersandPosition);
+        return ScanEntityReferenceFromInputSourceAt(inputSource_, ampersandPosition);
     }
 
     std::string Slice(std::size_t start, std::size_t count = std::string::npos) const {
@@ -1221,7 +1293,7 @@ public:
     }
 
 private:
-    std::shared_ptr<const XmlReaderInputSource> inputSource_;
+    const XmlReaderInputSource* inputSource_;
     const StringXmlReaderInputSource* stringInputSource_ = nullptr;
     const StreamXmlReaderInputSource* streamInputSource_ = nullptr;
     const SubrangeXmlReaderInputSource* subrangeInputSource_ = nullptr;
@@ -1243,7 +1315,7 @@ bool XmlReader::HasSourceChar(std::size_t position) const noexcept {
     return SourceCharAt(position) != '\0';
 }
 
-std::size_t XmlReader::FindInSource(const std::string& token, std::size_t position) const noexcept {
+std::size_t XmlReader::FindInSource(std::string_view token, std::size_t position) const noexcept {
     return inputSource_ == nullptr ? std::string::npos : inputSource_->Find(token, position);
 }
 
@@ -1256,10 +1328,19 @@ bool XmlReader::SourceRangeContains(std::size_t start, std::size_t end, char val
         return false;
     }
 
-    for (std::size_t index = start; index < end && HasSourceChar(index); ++index) {
-        if (SourceCharAt(index) == value) {
+    while (start < end) {
+        std::size_t available = 0;
+        const char* chunk = SourcePtrAt(start, available);
+        if (chunk == nullptr || available == 0) {
+            break;
+        }
+
+        const std::size_t chunkLength = (std::min)(available, end - start);
+        if (std::char_traits<char>::find(chunk, chunkLength, value) != nullptr) {
             return true;
         }
+
+        start += chunkLength;
     }
 
     return false;
@@ -1279,12 +1360,12 @@ std::size_t XmlReader::AppendDecodedSourceRangeTo(std::string& target, std::size
 
     const std::size_t originalSize = target.size();
     target.reserve(originalSize + (end - start));
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
 
     if (const auto* stringSource = dynamic_cast<const StringXmlReaderInputSource*>(inputSource_.get()); stringSource != nullptr) {
         const std::string& source = *stringSource->Text();
         
-        if (entityDeclarations_.empty()) {
+        if (!dtdState_ || dtdState_->entityDeclarations.empty()) {
             target.resize(originalSize + (end - start));
             char* out = target.data() + originalSize;
             const char* in = source.data() + start;
@@ -1383,17 +1464,21 @@ std::size_t XmlReader::AppendDecodedSourceRangeTo(std::string& target, std::size
                 AppendCodePointUtf8(target, codePoint);
             } else {
                 const std::string entityName(entity);
-                if (const auto found = entityDeclarations_.find(entityName); found != entityDeclarations_.end()) {
-                    DecodeEntityTextTo(
-                        target,
-                        found->second,
-                        [this](const std::string& nestedEntity) -> std::optional<std::string> {
-                            const auto resolved = entityDeclarations_.find(nestedEntity);
-                            return resolved == entityDeclarations_.end() ? std::nullopt : std::optional<std::string>(resolved->second);
-                        },
-                        [this](const std::string& message) {
-                            Throw(message);
-                        });
+                if (dtdState_) {
+                    if (const auto found = dtdState_->entityDeclarations.find(entityName); found != dtdState_->entityDeclarations.end()) {
+                        DecodeEntityTextTo(
+                            target,
+                            found->second,
+                            [this](const std::string& nestedEntity) -> std::optional<std::string> {
+                                const auto resolved = dtdState_->entityDeclarations.find(nestedEntity);
+                                return resolved == dtdState_->entityDeclarations.end() ? std::nullopt : std::optional<std::string>(resolved->second);
+                            },
+                            [this](const std::string& message) {
+                                Throw(message);
+                            });
+                    } else {
+                        Throw("Unknown entity reference: &" + entityName + ';');
+                    }
                 } else {
                     Throw("Unknown entity reference: &" + entityName + ';');
                 }
@@ -1448,17 +1533,21 @@ std::size_t XmlReader::AppendDecodedSourceRangeTo(std::string& target, std::size
                 Throw("Invalid numeric entity reference: &" + entity + ';');
             }
             AppendCodePointUtf8(target, codePoint);
-        } else if (const auto found = entityDeclarations_.find(entity); found != entityDeclarations_.end()) {
-            DecodeEntityTextTo(
-                target,
-                found->second,
-                [this](const std::string& nestedEntity) -> std::optional<std::string> {
-                    const auto resolved = entityDeclarations_.find(nestedEntity);
-                    return resolved == entityDeclarations_.end() ? std::nullopt : std::optional<std::string>(resolved->second);
-                },
-                [this](const std::string& message) {
-                    Throw(message);
-                });
+        } else if (dtdState_) {
+            if (const auto found = dtdState_->entityDeclarations.find(entity); found != dtdState_->entityDeclarations.end()) {
+                DecodeEntityTextTo(
+                    target,
+                    found->second,
+                    [this](const std::string& nestedEntity) -> std::optional<std::string> {
+                        const auto resolved = dtdState_->entityDeclarations.find(nestedEntity);
+                        return resolved == dtdState_->entityDeclarations.end() ? std::nullopt : std::optional<std::string>(resolved->second);
+                    },
+                    [this](const std::string& message) {
+                        Throw(message);
+                    });
+            } else {
+                Throw("Unknown entity reference: &" + entity + ';');
+            }
         } else {
             Throw("Unknown entity reference: &" + entity + ';');
         }
@@ -1573,8 +1662,19 @@ void XmlReader::MaybeDiscardSourcePrefix() const {
         return;
     }
 
+    if (dynamic_cast<const StreamXmlReaderInputSource*>(inputSource_.get()) == nullptr) {
+        return;
+    }
+
     const std::size_t discardBefore = EarliestRetainedSourceOffset();
     if (discardBefore <= discardedSourceOffset_) {
+        return;
+    }
+
+    // Discarding on every node turns stream-backed Read() into a bookkeeping-heavy path.
+    // Reclaim in larger chunks so streaming stays fast while memory still remains bounded.
+    static constexpr std::size_t DiscardChunkThreshold = 512 * 1024;
+    if (discardBefore - discardedSourceOffset_ < DiscardChunkThreshold) {
         return;
     }
 
@@ -1592,6 +1692,13 @@ void XmlReader::MaybeDiscardSourcePrefix() const {
     discardedSourceOffset_ = discardBefore;
     discardedLineNumber_ = line;
     discardedLinePosition_ = column;
+}
+
+XmlReader::DtdState& XmlReader::EnsureDtdState() {
+    if (!dtdState_) {
+        dtdState_ = std::make_unique<DtdState>();
+    }
+    return *dtdState_;
 }
 
 void XmlReader::FinalizeSuccessfulRead() {
@@ -1623,7 +1730,7 @@ char XmlReader::ReadChar() {
     return ch;
 }
 
-bool XmlReader::StartsWith(const std::string& token) const noexcept {
+bool XmlReader::StartsWith(std::string_view token) const noexcept {
     for (std::size_t index = 0; index < token.size(); ++index) {
         if (SourceCharAt(position_ + index) != token[index]) {
             return false;
@@ -1659,12 +1766,15 @@ std::string XmlReader::ParseName() {
     return SourceSubstr(start, position_ - start);
 }
 
-std::string XmlReader::DecodeEntities(const std::string& value) const {
+std::string XmlReader::DecodeEntities(std::string_view value) const {
     const std::string decoded = DecodeEntityText(
         value,
         [this](const std::string& entity) -> std::optional<std::string> {
-            const auto found = entityDeclarations_.find(entity);
-            return found == entityDeclarations_.end() ? std::nullopt : std::optional<std::string>(found->second);
+            if (!dtdState_) {
+                return std::nullopt;
+            }
+            const auto found = dtdState_->entityDeclarations.find(entity);
+            return found == dtdState_->entityDeclarations.end() ? std::nullopt : std::optional<std::string>(found->second);
         },
         [this](const std::string& message) {
             Throw(message);
@@ -1748,7 +1858,7 @@ bool XmlReader::TryConsumeBufferedNode() {
 }
 
 std::string XmlReader::ParseQuotedValue(bool decodeEntities) {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const char quote = ReadChar();
     if (quote != '\"' && quote != '\'') {
         Throw("Expected quoted value");
@@ -1768,11 +1878,17 @@ std::string XmlReader::ParseQuotedValue(bool decodeEntities) {
 void XmlReader::ResetCurrentNode() {
     currentNodeType_ = XmlNodeType::None;
     currentName_.clear();
+    currentLocalName_.clear();
+    currentPrefix_.clear();
+    currentNamePartsResolved_ = false;
     currentNamespaceUri_.clear();
     currentValue_.clear();
     currentInnerXml_.clear();
     currentOuterXml_.clear();
     currentAttributes_.clear();
+    currentAttributeLocalNames_.clear();
+    currentAttributePrefixes_.clear();
+    currentAttributeNamePartsResolved_.clear();
     currentAttributeNamespaceUrisResolved_.clear();
     currentAttributeValueMetadata_.clear();
     currentAttributeNamespaceUris_.clear();
@@ -1830,6 +1946,9 @@ void XmlReader::SetCurrentNode(
     }
     currentNodeType_ = nodeType;
     currentName_ = std::move(name);
+    currentLocalName_.clear();
+    currentPrefix_.clear();
+    currentNamePartsResolved_ = false;
     currentNamespaceUri_ = std::move(namespaceUri);
     currentValue_ = std::move(value);
     currentDepth_ = depth;
@@ -1837,6 +1956,9 @@ void XmlReader::SetCurrentNode(
     currentInnerXml_ = std::move(innerXml);
     currentOuterXml_ = std::move(outerXml);
     currentAttributes_ = std::move(attributes);
+    currentAttributeLocalNames_.clear();
+    currentAttributePrefixes_.clear();
+    currentAttributeNamePartsResolved_.assign(currentAttributes_.size(), static_cast<unsigned char>(0));
     currentAttributeNamespaceUrisResolved_.assign(attributeNamespaceUris.size(), static_cast<unsigned char>(1));
     currentAttributeValueMetadata_.clear();
     currentAttributeNamespaceUris_ = std::move(attributeNamespaceUris);
@@ -1852,6 +1974,18 @@ void XmlReader::SetCurrentNode(
     currentContentStart_ = contentStart;
     currentCloseStart_ = closeStart;
     currentCloseEnd_ = closeEnd;
+}
+
+void XmlReader::SetCurrentNameParts(std::string_view prefix, std::string_view localName) {
+    currentPrefix_.assign(prefix);
+    currentLocalName_.assign(localName);
+    currentNamePartsResolved_ = true;
+}
+
+void XmlReader::SetCurrentAttributeNameParts(std::vector<std::string> prefixes, std::vector<std::string> localNames) {
+    currentAttributePrefixes_ = std::move(prefixes);
+    currentAttributeLocalNames_ = std::move(localNames);
+    currentAttributeNamePartsResolved_.assign(currentAttributes_.size(), static_cast<unsigned char>(1));
 }
 
 const XmlNameTable& XmlReader::NameTable() const noexcept {
@@ -1886,13 +2020,13 @@ std::pair<std::size_t, std::size_t> XmlReader::ComputeLineColumn(std::size_t pos
     return {line, column};
 }
 
-[[noreturn]] void XmlReader::Throw(const std::string& message) const {
+[[noreturn]] void XmlReader::Throw(std::string_view message) const {
     const auto [line, column] = ComputeLineColumn(position_);
-    throw XmlException(message, line, column);
+    throw XmlException(std::string(message), line, column);
 }
 
 void XmlReader::ParseDeclaration() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
     if (!xmlDeclarationAllowed_) {
         position_ += 5;
@@ -1966,6 +2100,7 @@ void XmlReader::ParseDeclaration() {
         std::string::npos,
         start,
         position_);
+    SetCurrentNameParts({}, "xml");
     currentDeclarationVersion_ = declaration.Version();
     currentDeclarationEncoding_ = declaration.Encoding();
     currentDeclarationStandalone_ = declaration.Standalone();
@@ -1973,7 +2108,7 @@ void XmlReader::ParseDeclaration() {
 }
 
 void XmlReader::ParseDocumentType() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     if (settings_.DtdProcessing == DtdProcessing::Prohibit) {
         Throw("DTD is prohibited in this XML document");
     }
@@ -1990,11 +2125,7 @@ void XmlReader::ParseDocumentType() {
     std::string systemId;
     std::string internalSubset;
 
-    entityDeclarations_.clear();
-    declaredEntityNames_.clear();
-    notationDeclarationNames_.clear();
-    unparsedEntityDeclarationNames_.clear();
-    externalEntitySystemIds_.clear();
+    dtdState_.reset();
 
     if (tokenizer.StartsWith(position_, "PUBLIC")) {
         position_ += 6;
@@ -2066,24 +2197,24 @@ void XmlReader::ParseDocumentType() {
             std::vector<std::shared_ptr<XmlNode>> entities;
             std::vector<std::shared_ptr<XmlNode>> notations;
             ParseDocumentTypeInternalSubset(internalSubset, entities, notations);
-            PopulateInternalEntityDeclarations(entities, entityDeclarations_);
+            PopulateInternalEntityDeclarations(entities, EnsureDtdState().entityDeclarations);
             for (const auto& entity : entities) {
                 if (entity != nullptr) {
-                    declaredEntityNames_.insert(entity->Name());
+                    dtdState_->declaredEntityNames.insert(entity->Name());
                     const auto typedEntity = std::dynamic_pointer_cast<XmlEntity>(entity);
                     if (typedEntity != nullptr) {
                         if (!typedEntity->SystemId().empty()) {
-                            externalEntitySystemIds_[typedEntity->Name()] = typedEntity->SystemId();
+                            dtdState_->externalEntitySystemIds[typedEntity->Name()] = typedEntity->SystemId();
                         }
                         if (!typedEntity->NotationName().empty()) {
-                            unparsedEntityDeclarationNames_.insert(typedEntity->Name());
+                            dtdState_->unparsedEntityDeclarationNames.insert(typedEntity->Name());
                         }
                     }
                 }
             }
             for (const auto& notation : notations) {
                 if (notation != nullptr) {
-                    notationDeclarationNames_.insert(notation->Name());
+                    dtdState_->notationDeclarationNames.insert(notation->Name());
                 }
             }
         }
@@ -2107,11 +2238,12 @@ void XmlReader::ParseDocumentType() {
         std::string::npos,
         start,
         position_);
+    SetCurrentNameParts({}, currentName_);
     sawDocumentType_ = true;
 }
 
 void XmlReader::ParseProcessingInstruction() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
     position_ += 2;
     linePosition_ += 2;
@@ -2151,10 +2283,14 @@ void XmlReader::ParseProcessingInstruction() {
         dataEnd,
         start,
         position_);
+    {
+        const auto [prefixView, localNameView] = SplitQualifiedNameView(currentName_);
+        SetCurrentNameParts(prefixView, localNameView);
+    }
 }
 
 void XmlReader::ParseComment() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
     const auto end = tokenizer.ScanDelimitedSectionEnd(position_ + 4, "-->");
     if (end == std::string::npos) {
@@ -2162,6 +2298,11 @@ void XmlReader::ParseComment() {
         throw XmlException("Unterminated comment", line, column);
     }
     const auto valueStart = position_ + 4;
+    const auto invalidDoubleHyphen = SourceSubstr(valueStart, end - valueStart).find("--");
+    if (invalidDoubleHyphen != std::string::npos) {
+        const auto [line, column] = ComputeLineColumn(valueStart + invalidDoubleHyphen);
+        throw XmlException("Comment may not contain '--'", line, column);
+    }
     const auto valueEnd = end;
     position_ = end + 3;
     AdvanceLineInfoFromInputSource(inputSource_.get(), start, position_, lineNumber_, linePosition_);
@@ -2170,7 +2311,7 @@ void XmlReader::ParseComment() {
 }
 
 void XmlReader::ParseCData() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
     const auto end = tokenizer.ScanDelimitedSectionEnd(position_ + 9, "]]>");
     if (end == std::string::npos) {
@@ -2186,7 +2327,7 @@ void XmlReader::ParseCData() {
 }
 
 void XmlReader::ParseText() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const int textDepth = static_cast<int>(elementStack_.size());
     const bool preserveSpace = !xmlSpacePreserveStack_.empty() && xmlSpacePreserveStack_.back();
     std::string textBuffer;
@@ -2233,9 +2374,13 @@ void XmlReader::ParseText() {
         rawSegmentKnownNonWhitespace = false;
     };
 
-    while (HasSourceChar(position_) && SourceCharAt(position_) != '<') {
+        while (HasSourceChar(position_) && SourceCharAt(position_) != '<') {
+        if (tokenizer.StartsWith(position_, "]]>") ) {
+            const auto [line, column] = ComputeLineColumn(position_);
+            throw XmlException("']]>' is not allowed in text content", line, column);
+        }
         if (SourceCharAt(position_) != '&') {
-            const auto segmentEnd = FindFirstOfFromInputSource(inputSource_.get(), "\n<&", position_);
+            const auto segmentEnd = FindFirstOfFromInputSource(inputSource_.get(), "\n<&]", position_);
 
             if (segmentEnd != std::string::npos && segmentEnd > position_) {
                 if (rawSegmentStart == std::string::npos) {
@@ -2311,20 +2456,20 @@ void XmlReader::ParseText() {
             continue;
         }
 
-        if (declaredEntityNames_.find(entity) == declaredEntityNames_.end()) {
+        if (!dtdState_ || dtdState_->declaredEntityNames.find(entity) == dtdState_->declaredEntityNames.end()) {
             Throw("Unknown entity reference: &" + entity + ';');
         }
 
         flushText(entityStart);
 
         std::string resolvedValue;
-        const auto declared = entityDeclarations_.find(entity);
-        if (declared != entityDeclarations_.end()) {
+        const auto declared = dtdState_->entityDeclarations.find(entity);
+        if (declared != dtdState_->entityDeclarations.end()) {
             resolvedValue = DecodeEntityText(
                 declared->second,
                 [this](const std::string& nestedEntity) -> std::optional<std::string> {
-                    const auto found = entityDeclarations_.find(nestedEntity);
-                    return found == entityDeclarations_.end() ? std::nullopt : std::optional<std::string>(found->second);
+                    const auto found = dtdState_->entityDeclarations.find(nestedEntity);
+                    return found == dtdState_->entityDeclarations.end() ? std::nullopt : std::optional<std::string>(found->second);
                 },
                 [this](const std::string& message) {
                     Throw(message);
@@ -2336,8 +2481,8 @@ void XmlReader::ParseText() {
                 }
             }
         } else if (settings_.Resolver != nullptr) {
-            const auto external = externalEntitySystemIds_.find(entity);
-            if (external != externalEntitySystemIds_.end()) {
+            const auto external = dtdState_->externalEntitySystemIds.find(entity);
+            if (external != dtdState_->externalEntitySystemIds.end()) {
                 const std::string absoluteUri = settings_.Resolver->ResolveUri(baseUri_, external->second);
                 resolvedValue = settings_.Resolver->GetEntity(absoluteUri);
                 if (settings_.MaxCharactersFromEntities != 0) {
@@ -2380,7 +2525,7 @@ bool XmlReader::TryReadSimpleElementContentAsString(std::string& result, std::si
         return false;
     }
 
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     result.clear();
     result.reserve(closeStart - currentContentStart_);
 
@@ -2474,10 +2619,10 @@ std::pair<std::size_t, std::size_t> XmlReader::EnsureCurrentElementXmlBounds() c
 std::pair<std::size_t, std::size_t> XmlReader::FindElementXmlBounds(
     std::size_t,
     std::size_t contentStart,
-    const std::string& elementName) const {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    std::string_view elementName) const {
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     std::vector<std::string> elementNames;
-    elementNames.push_back(elementName);
+    elementNames.push_back(std::string(elementName));
 
     auto throwAt = [this](const std::string& message, std::size_t errorPosition) -> void {
         const auto [line, column] = ComputeLineColumn(errorPosition);
@@ -2612,20 +2757,22 @@ std::pair<std::string, std::string> XmlReader::CaptureElementXml(
 }
 
 void XmlReader::ParseElement() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
     ReadChar();
-    const std::string name = ParseName();
-    const std::string elementPrefix{SplitQualifiedNameView(name).first};
+    std::string name = ParseName();
+    const auto [elementPrefixView, elementLocalNameView] = SplitQualifiedNameView(name);
     const bool topLevelElement = elementStack_.empty();
     std::vector<std::pair<std::string, std::string>> attributes;
+    std::vector<std::string> attributeLocalNames;
+    std::vector<std::string> attributePrefixes;
     std::vector<AttributeValueMetadata> attributeValueMetadata;
     std::vector<std::pair<std::string, std::string>> localNamespaceDeclarations;
     bool retainLocalNamespaceDeclarationsForAttributes = false;
     const bool inheritedPreserveSpace = !xmlSpacePreserveStack_.empty() && xmlSpacePreserveStack_.back();
     bool preserveSpace = inheritedPreserveSpace;
 
-    auto lookupNamespaceInScopes = [this, &localNamespaceDeclarations](const std::string& prefix) {
+    auto lookupNamespaceInScopes = [this, &localNamespaceDeclarations](std::string_view prefix) {
         for (auto it = localNamespaceDeclarations.rbegin(); it != localNamespaceDeclarations.rend(); ++it) {
             if (it->first == prefix) {
                 return it->second;
@@ -2673,10 +2820,11 @@ void XmlReader::ParseElement() {
         if (tokenizer.ConsumeStartTagClose(position_, isEmptyElement)) {
             AdvanceLineInfoFromInputSource(inputSource_.get(), closeStart, position_, lineNumber_, linePosition_);
             if (isEmptyElement) {
+                std::string nsUri = lookupNamespaceInScopes(elementPrefixView);
                 SetCurrentNode(
                     XmlNodeType::Element,
-                    name,
-                    lookupNamespaceInScopes(elementPrefix),
+                    std::move(name),
+                    std::move(nsUri),
                     {},
                     static_cast<int>(elementStack_.size()),
                     true,
@@ -2729,20 +2877,34 @@ void XmlReader::ParseElement() {
             }
             Throw("Expected quoted value");
         }
-        const auto rawValueStart = attributeToken.rawValueStart;
+                const auto rawValueStart = attributeToken.rawValueStart;
         const auto rawValueEnd = attributeToken.rawValueEnd;
+        const auto invalidLt = FindInSource("<", rawValueStart);
+        if (invalidLt != std::string::npos && invalidLt < rawValueEnd) {
+            const auto [line, column] = ComputeLineColumn(invalidLt);
+            throw XmlException("'<' is not allowed in attribute values", line, column);
+        }
         const bool needsDecoding = SourceRangeContains(rawValueStart, rawValueEnd, '&');
         attributes.emplace_back(std::move(attributeToken.name), std::string{});
         const std::string& attributeName = attributes.back().first;
+        const auto [attributePrefixView, attributeLocalNameView] = SplitQualifiedNameView(attributeName);
+        attributePrefixes.emplace_back(attributePrefixView);
+        attributeLocalNames.emplace_back(attributeLocalNameView);
         const auto attributeColon = attributeName.find(':');
         if (attributeColon != std::string::npos
             && std::string_view(attributeName).substr(0, attributeColon) != "xmlns") {
             retainLocalNamespaceDeclarationsForAttributes = true;
         }
-        attributeValueMetadata.push_back(AttributeValueMetadata{
+                attributeValueMetadata.push_back(AttributeValueMetadata{
             rawValueStart,
             rawValueEnd,
             static_cast<unsigned char>(needsDecoding ? kAttributeValueNeedsDecoding : 0)});
+        if (needsDecoding
+            && attributeName != "xmlns"
+            && attributeName.rfind("xmlns:", 0) != 0
+            && attributeName != "xml:space") {
+            (void)DecodeEntities(SourceSubstr(rawValueStart, rawValueEnd - rawValueStart));
+        }
         if (attributeName == "xmlns") {
             std::string attributeValue = SourceSubstr(rawValueStart, rawValueEnd - rawValueStart);
             if (needsDecoding) {
@@ -2775,24 +2937,20 @@ void XmlReader::ParseElement() {
     }
 
     const bool pushedNamespaceScope = !localNamespaceDeclarations.empty();
-    const std::string elementNamespaceUri = lookupNamespaceInScopes(elementPrefix);
+    const std::string elementNamespaceUri = lookupNamespaceInScopes(elementPrefixView);
     currentLocalNamespaceDeclarations_ = retainLocalNamespaceDeclarationsForAttributes
         ? localNamespaceDeclarations
         : std::vector<std::pair<std::string, std::string>>{};
     if (pushedNamespaceScope) {
-        std::unordered_map<std::string, std::string> localScope;
-        localScope.reserve(localNamespaceDeclarations.size());
-        for (auto& [prefix, namespaceUri] : localNamespaceDeclarations) {
-            localScope[std::move(prefix)] = std::move(namespaceUri);
-        }
-        namespaceScopes_.push_back(std::move(localScope));
+        namespaceScopes_.push_back(std::move(localNamespaceDeclarations));
     }
+    elementStack_.push_back(name);
     SetCurrentNode(
         XmlNodeType::Element,
-        name,
+        std::move(name),
         std::move(elementNamespaceUri),
         {},
-        static_cast<int>(elementStack_.size()),
+        static_cast<int>(elementStack_.size()) - 1,
         false,
         {},
         {},
@@ -2804,6 +2962,11 @@ void XmlReader::ParseElement() {
         {},
         start,
         position_);
+    {
+        const auto [pv, lv] = SplitQualifiedNameView(currentName_);
+        SetCurrentNameParts(pv, lv);
+    }
+    SetCurrentAttributeNameParts(std::move(attributePrefixes), std::move(attributeLocalNames));
     currentAttributeValueMetadata_ = std::move(attributeValueMetadata);
     RefreshCurrentEarliestRetainedAttributeValueStart();
     const bool pushedXmlSpacePreserve = preserveSpace != inheritedPreserveSpace;
@@ -2812,25 +2975,49 @@ void XmlReader::ParseElement() {
     }
     namespaceScopeFramePushedStack_.push_back(pushedNamespaceScope);
     xmlSpacePreserveFramePushedStack_.push_back(pushedXmlSpacePreserve);
-    elementStack_.push_back(name);
     if (topLevelElement) {
         sawRootElement_ = true;
     }
 }
 
 void XmlReader::ParseEndElement() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
     std::size_t cursor = position_ + 2;
-    const std::string name = tokenizer.ParseNameAt(cursor);
-    const std::string namePrefix{SplitQualifiedNameView(name).first};
+    const std::size_t nameStart = cursor;
+    if (!TryConsumeNameFromInputSourceAt(inputSource_.get(), cursor)) {
+        Throw("Expected element name after </");
+    }
+    const std::size_t nameEnd = cursor;
+    const std::size_t nameLen = nameEnd - nameStart;
     position_ = cursor;
+
     if (elementStack_.empty()) {
+        const std::string name = SourceSubstr(nameStart, nameLen);
         Throw("Unexpected closing tag: </" + name + ">");
     }
-    if (elementStack_.back() != name) {
-        Throw("Mismatched closing tag. Expected </" + elementStack_.back() + "> but found </" + name + ">");
+
+    const std::string& expected = elementStack_.back();
+    bool nameMatch = (expected.size() == nameLen);
+    if (nameMatch) {
+        std::size_t available = 0;
+        const char* ptr = inputSource_->PtrAt(nameStart, available);
+        if (ptr != nullptr && available >= nameLen) {
+            nameMatch = (std::memcmp(ptr, expected.data(), nameLen) == 0);
+        } else {
+            for (std::size_t i = 0; i < nameLen; ++i) {
+                if (inputSource_->CharAt(nameStart + i) != expected[i]) {
+                    nameMatch = false;
+                    break;
+                }
+            }
+        }
     }
+    if (!nameMatch) {
+        const std::string name = SourceSubstr(nameStart, nameLen);
+        Throw("Mismatched closing tag. Expected </" + expected + "> but found </" + name + ">");
+    }
+
     if (!tokenizer.ConsumeEndTagClose(cursor)) {
         const std::size_t errorPosition = tokenizer.HasChar(cursor) ? cursor + 1 : cursor;
         const auto [line, column] = ComputeLineColumn(errorPosition);
@@ -2840,7 +3027,12 @@ void XmlReader::ParseEndElement() {
     AdvanceLineInfoFromInputSource(inputSource_.get(), start, position_, lineNumber_, linePosition_);
 
     const int depth = static_cast<int>(elementStack_.size()) - 1;
-    const std::string namespaceUri = LookupNamespaceUri(namePrefix);
+    std::string name = std::move(elementStack_.back());
+    elementStack_.pop_back();
+
+    const auto [prefixView, localNameView] = SplitQualifiedNameView(name);
+    const std::string namespaceUri = LookupNamespaceUri(prefixView);
+
     bool popNamespaceScope = false;
     if (!namespaceScopeFramePushedStack_.empty()) {
         popNamespaceScope = namespaceScopeFramePushedStack_.back();
@@ -2851,7 +3043,6 @@ void XmlReader::ParseEndElement() {
         popXmlSpacePreserve = xmlSpacePreserveFramePushedStack_.back();
         xmlSpacePreserveFramePushedStack_.pop_back();
     }
-    elementStack_.pop_back();
     if (popNamespaceScope && namespaceScopes_.size() > 1) {
         namespaceScopes_.pop_back();
     }
@@ -2861,6 +3052,7 @@ void XmlReader::ParseEndElement() {
     if (elementStack_.empty() && sawRootElement_) {
         completedRootElement_ = true;
     }
+
     SetCurrentNode(
         XmlNodeType::EndElement,
         std::move(name),
@@ -2874,13 +3066,18 @@ void XmlReader::ParseEndElement() {
         std::string::npos,
         start,
         position_);
+    {
+        const auto [pv, lv] = SplitQualifiedNameView(currentName_);
+        SetCurrentNameParts(pv, lv);
+    }
 }
 
-std::string XmlReader::LookupNamespaceUri(const std::string& prefix) const {
+std::string XmlReader::LookupNamespaceUri(std::string_view prefix) const {
     for (auto it = namespaceScopes_.rbegin(); it != namespaceScopes_.rend(); ++it) {
-        const auto found = it->find(prefix);
-        if (found != it->end()) {
-            return found->second;
+        for (auto jt = it->rbegin(); jt != it->rend(); ++jt) {
+            if (jt->first == prefix) {
+                return jt->second;
+            }
         }
     }
 
@@ -2892,25 +3089,69 @@ const std::vector<std::pair<std::string, std::string>>& XmlReader::CurrentAttrib
 }
 
 std::string XmlReader::CurrentLocalName() const {
-    return std::string{SplitQualifiedNameView(currentName_).second};
+    if (!currentNamePartsResolved_) {
+        const auto [prefixView, localNameView] = SplitQualifiedNameView(currentName_);
+        currentPrefix_ = std::string(prefixView);
+        currentLocalName_ = std::string(localNameView);
+        currentNamePartsResolved_ = true;
+    }
+    return currentLocalName_;
 }
 
 std::string XmlReader::CurrentPrefix() const {
-    return std::string{SplitQualifiedNameView(currentName_).first};
+    if (!currentNamePartsResolved_) {
+        const auto [prefixView, localNameView] = SplitQualifiedNameView(currentName_);
+        currentPrefix_ = std::string(prefixView);
+        currentLocalName_ = std::string(localNameView);
+        currentNamePartsResolved_ = true;
+    }
+    return currentPrefix_;
 }
 
 std::string XmlReader::CurrentAttributeLocalName(std::size_t index) const {
     if (index >= currentAttributes_.size()) {
         return {};
     }
-    return std::string{SplitQualifiedNameView(currentAttributes_[index].first).second};
+
+    if (currentAttributeLocalNames_.size() < currentAttributes_.size()) {
+        currentAttributeLocalNames_.resize(currentAttributes_.size());
+    }
+    if (currentAttributePrefixes_.size() < currentAttributes_.size()) {
+        currentAttributePrefixes_.resize(currentAttributes_.size());
+    }
+    if (currentAttributeNamePartsResolved_.size() < currentAttributes_.size()) {
+        currentAttributeNamePartsResolved_.resize(currentAttributes_.size(), static_cast<unsigned char>(0));
+    }
+    if (currentAttributeNamePartsResolved_[index] == 0) {
+        const auto [prefixView, localNameView] = SplitQualifiedNameView(currentAttributes_[index].first);
+        currentAttributePrefixes_[index] = std::string(prefixView);
+        currentAttributeLocalNames_[index] = std::string(localNameView);
+        currentAttributeNamePartsResolved_[index] = static_cast<unsigned char>(1);
+    }
+    return currentAttributeLocalNames_[index];
 }
 
 std::string XmlReader::CurrentAttributePrefix(std::size_t index) const {
     if (index >= currentAttributes_.size()) {
         return {};
     }
-    return std::string{SplitQualifiedNameView(currentAttributes_[index].first).first};
+
+    if (currentAttributeLocalNames_.size() < currentAttributes_.size()) {
+        currentAttributeLocalNames_.resize(currentAttributes_.size());
+    }
+    if (currentAttributePrefixes_.size() < currentAttributes_.size()) {
+        currentAttributePrefixes_.resize(currentAttributes_.size());
+    }
+    if (currentAttributeNamePartsResolved_.size() < currentAttributes_.size()) {
+        currentAttributeNamePartsResolved_.resize(currentAttributes_.size(), static_cast<unsigned char>(0));
+    }
+    if (currentAttributeNamePartsResolved_[index] == 0) {
+        const auto [prefixView, localNameView] = SplitQualifiedNameView(currentAttributes_[index].first);
+        currentAttributePrefixes_[index] = std::string(prefixView);
+        currentAttributeLocalNames_[index] = std::string(localNameView);
+        currentAttributeNamePartsResolved_[index] = static_cast<unsigned char>(1);
+    }
+    return currentAttributePrefixes_[index];
 }
 
 const std::string& XmlReader::CurrentAttributeNamespaceUri(std::size_t index) const {
@@ -3139,8 +3380,8 @@ void XmlReader::InitializeInputState() {
     xmlSpacePreserveStack_.clear();
     xmlSpacePreserveFramePushedStack_.clear();
     namespaceScopes_.push_back({});
-    namespaceScopes_.back().emplace("xml", "http://www.w3.org/XML/1998/namespace");
-    namespaceScopes_.back().emplace("xmlns", "http://www.w3.org/2000/xmlns/");
+    namespaceScopes_.back().emplace_back("xml", "http://www.w3.org/XML/1998/namespace");
+    namespaceScopes_.back().emplace_back("xmlns", "http://www.w3.org/2000/xmlns/");
     xmlSpacePreserveStack_.push_back(false);
     if (HasSourceChar(2)
         && static_cast<unsigned char>(SourceCharAt(0)) == 0xEF
@@ -3156,12 +3397,16 @@ void XmlReader::InitializeInputState() {
     discardedLinePosition_ = 1;
 }
 
-XmlReader XmlReader::CreateFromValidatedString(std::shared_ptr<const std::string> xml, const XmlReaderSettings& settings) {
+XmlReader XmlReader::CreateFromValidatedString(
+    std::shared_ptr<const std::string> xml,
+    const XmlReaderSettings& settings,
+    bool skipMaxCharactersPrecheck) {
     const std::size_t sourceSize = xml == nullptr ? 0 : xml->size();
     XmlReader reader(settings);
     reader.inputSource_ = std::make_shared<StringXmlReaderInputSource>(std::move(xml));
     reader.InitializeInputState();
-    if (reader.settings_.MaxCharactersInDocument != 0
+    if (!skipMaxCharactersPrecheck
+        && reader.settings_.MaxCharactersInDocument != 0
         && sourceSize > reader.position_
         && sourceSize - reader.position_ > reader.settings_.MaxCharactersInDocument) {
         throw XmlException("The XML document exceeds the configured MaxCharactersInDocument limit");
@@ -3171,8 +3416,8 @@ XmlReader XmlReader::CreateFromValidatedString(std::shared_ptr<const std::string
 
 XmlReader XmlReader::Create(const std::string& xml, const XmlReaderSettings& settings) {
     auto sourceText = std::make_shared<std::string>(xml);
-    ValidateXmlReaderInputAgainstSchemas(*sourceText, settings);
-    return CreateFromValidatedString(sourceText, settings);
+    ValidateXmlReaderInputAgainstSchemas(sourceText, settings);
+    return CreateFromValidatedString(sourceText, settings, settings.Validation == ValidationType::Schema);
 }
 
 XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& settings) {
@@ -3189,16 +3434,7 @@ XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& setti
             stream.seekg(startPosition);
             if (stream.good()) {
                 XmlReader reader(settings);
-                std::string initialBuffer;
-                if (settings.MaxCharactersInDocument != 0) {
-                    initialBuffer = ReadStreamPrefix(stream, settings.MaxCharactersInDocument + 4);
-                    const std::size_t bomLength = GetUtf8BomLength(initialBuffer);
-                    if (initialBuffer.size() > bomLength
-                        && initialBuffer.size() - bomLength > settings.MaxCharactersInDocument) {
-                        throw XmlException("The XML document exceeds the configured MaxCharactersInDocument limit");
-                    }
-                }
-                reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(stream, std::move(initialBuffer));
+                reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(stream);
                 reader.InitializeInputState();
                 return reader;
             }
@@ -3206,37 +3442,23 @@ XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& setti
             stream.clear();
         }
 
-        const auto replayPath = SpoolStreamToTemporaryFile(stream);
-        try {
-            std::ifstream validationStream(replayPath, std::ios::binary);
-            if (!validationStream) {
-                throw XmlException("Failed to open temporary XML replay file");
-            }
+        auto replayStream = SpoolStreamToTemporaryReplayStream(stream);
 
-            XmlReaderSettings validationSettings = settings;
-            validationSettings.Validation = ValidationType::None;
-            auto validatingReader = XmlReader::Create(validationStream, validationSettings);
-            ValidateXmlReaderInputAgainstSchemas(validatingReader, settings);
+        XmlReaderSettings validationSettings = settings;
+        validationSettings.Validation = ValidationType::None;
+        auto validatingReader = XmlReader::Create(*replayStream, validationSettings);
+        ValidateXmlReaderInputAgainstSchemas(validatingReader, settings);
 
-            auto replayStream = OpenTemporaryXmlReplayStream(replayPath);
-            XmlReader reader(settings);
-            std::string initialBuffer;
-            if (settings.MaxCharactersInDocument != 0) {
-                initialBuffer = ReadStreamPrefix(*replayStream, settings.MaxCharactersInDocument + 4);
-                const std::size_t bomLength = GetUtf8BomLength(initialBuffer);
-                if (initialBuffer.size() > bomLength
-                    && initialBuffer.size() - bomLength > settings.MaxCharactersInDocument) {
-                    throw XmlException("The XML document exceeds the configured MaxCharactersInDocument limit");
-                }
-            }
-            reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(replayStream, std::move(initialBuffer));
-            reader.InitializeInputState();
-            return reader;
-        } catch (...) {
-            std::error_code error;
-            std::filesystem::remove(replayPath, error);
-            throw;
+        replayStream->clear();
+        replayStream->seekg(0, std::ios::beg);
+        if (!*replayStream) {
+            throw XmlException("Failed to rewind temporary XML replay file");
         }
+
+        XmlReader reader(settings);
+        reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(replayStream);
+        reader.InitializeInputState();
+        return reader;
     }
 
     XmlReader reader(settings);
@@ -3256,19 +3478,20 @@ XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& setti
 
 XmlReader XmlReader::CreateFromFile(const std::string& path, const XmlReaderSettings& settings) {
     if (settings.Validation == ValidationType::Schema) {
-        std::ifstream validationStream(std::filesystem::path(path), std::ios::binary);
-        if (!validationStream) {
+        auto stream = std::make_shared<std::ifstream>(std::filesystem::path(path), std::ios::binary);
+        if (!*stream) {
             throw XmlException("Failed to open XML file: " + path);
         }
 
         XmlReaderSettings validationSettings = settings;
         validationSettings.Validation = ValidationType::None;
-        auto validatingReader = XmlReader::Create(validationStream, validationSettings);
+        auto validatingReader = XmlReader::Create(*stream, validationSettings);
         ValidateXmlReaderInputAgainstSchemas(validatingReader, settings);
 
-        auto stream = std::make_shared<std::ifstream>(std::filesystem::path(path), std::ios::binary);
+        stream->clear();
+        stream->seekg(0, std::ios::beg);
         if (!*stream) {
-            throw XmlException("Failed to open XML file: " + path);
+            throw XmlException("Failed to rewind XML file after schema validation: " + path);
         }
 
         XmlReader reader(settings);
@@ -3304,7 +3527,7 @@ XmlReader XmlReader::CreateFromFile(const std::string& path, const XmlReaderSett
 }
 
 bool XmlReader::Read() {
-    XmlReaderTokenizer tokenizer(inputSource_);
+    XmlReaderTokenizer tokenizer(inputSource_.get());
     if (closed_) {
         return false;
     }
@@ -3517,6 +3740,14 @@ const std::string& XmlReader::NamespaceURI() const {
     return currentNamespaceUri_;
 }
 
+void XmlReader::MaterializeValue() {
+    if (currentValue_.empty()
+        && currentValueStart_ != std::string::npos
+        && currentValueEnd_ != std::string::npos) {
+        currentValue_ = SourceSubstr(currentValueStart_, currentValueEnd_ - currentValueStart_);
+    }
+}
+
 const std::string& XmlReader::Value() const {
     if (attributeIndex_ >= 0) {
         return CurrentAttributeValue(static_cast<std::size_t>(attributeIndex_));
@@ -3593,14 +3824,13 @@ std::size_t XmlReader::LinePosition() const noexcept {
     return linePosition_;
 }
 
-std::string XmlReader::GetAttribute(const std::string& name) const {
+std::string XmlReader::GetAttribute(std::string_view name) const {
     const auto& attributes = CurrentAttributes();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        const std::string_view attributeName(attributes[i].first);
-        if (attributeName == name) {
+        if (attributes[i].first == name) {
             return CurrentAttributeValue(i);
         }
-        if (SplitQualifiedNameView(attributeName).second == name) {
+        if (CurrentAttributeLocalName(i) == name) {
             return CurrentAttributeValue(i);
         }
     }
@@ -3615,11 +3845,10 @@ std::string XmlReader::GetAttribute(int index) const {
     return CurrentAttributeValue(static_cast<std::size_t>(index));
 }
 
-std::string XmlReader::GetAttribute(const std::string& localName, const std::string& namespaceUri) const {
+std::string XmlReader::GetAttribute(std::string_view localName, std::string_view namespaceUri) const {
     const auto& attributes = currentAttributes_;
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        const std::string_view attributeName(attributes[i].first);
-        if (SplitQualifiedNameView(attributeName).second != localName) {
+        if (CurrentAttributeLocalName(i) != localName) {
             continue;
         }
         if (CurrentAttributeNamespaceUri(i) == namespaceUri) {
@@ -3629,11 +3858,10 @@ std::string XmlReader::GetAttribute(const std::string& localName, const std::str
     return {};
 }
 
-bool XmlReader::MoveToAttribute(const std::string& name) {
+bool XmlReader::MoveToAttribute(std::string_view name) {
     const auto& attributes = CurrentAttributes();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        const std::string_view attributeName(attributes[i].first);
-        if (attributeName == name || SplitQualifiedNameView(attributeName).second == name) {
+        if (attributes[i].first == name || CurrentAttributeLocalName(i) == name) {
             attributeIndex_ = static_cast<int>(i);
             return true;
         }
@@ -3650,10 +3878,9 @@ bool XmlReader::MoveToAttribute(int index) {
     return true;
 }
 
-bool XmlReader::MoveToAttribute(const std::string& localName, const std::string& namespaceUri) {
+bool XmlReader::MoveToAttribute(std::string_view localName, std::string_view namespaceUri) {
     for (std::size_t i = 0; i < currentAttributes_.size(); ++i) {
-        const std::string_view attributeName(currentAttributes_[i].first);
-        if (SplitQualifiedNameView(attributeName).second != localName) {
+        if (CurrentAttributeLocalName(i) != localName) {
             continue;
         }
         if (CurrentAttributeNamespaceUri(i) == namespaceUri) {
@@ -3691,7 +3918,7 @@ bool XmlReader::MoveToElement() {
     return moved;
 }
 
-std::string XmlReader::LookupNamespace(const std::string& prefix) const {
+std::string XmlReader::LookupNamespace(std::string_view prefix) const {
     return LookupNamespaceUri(prefix);
 }
 
@@ -3823,7 +4050,7 @@ bool XmlReader::IsStartElement() {
     return MoveToContent() == XmlNodeType::Element;
 }
 
-bool XmlReader::IsStartElement(const std::string& name) {
+bool XmlReader::IsStartElement(std::string_view name) {
     return MoveToContent() == XmlNodeType::Element && Name() == name;
 }
 
@@ -3834,12 +4061,12 @@ void XmlReader::ReadStartElement() {
     Read();
 }
 
-void XmlReader::ReadStartElement(const std::string& name) {
+void XmlReader::ReadStartElement(std::string_view name) {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadStartElement called when the reader is not positioned on an element");
     }
     if (Name() != name) {
-        throw XmlException("Element '" + name + "' was not found. Current element is '" + Name() + "'");
+        throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
     }
     Read();
 }
@@ -3933,12 +4160,12 @@ std::string XmlReader::ReadElementString() {
     }
 }
 
-std::string XmlReader::ReadElementString(const std::string& name) {
+std::string XmlReader::ReadElementString(std::string_view name) {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadElementString called when the reader is not positioned on an element");
     }
     if (Name() != name) {
-        throw XmlException("Element '" + name + "' was not found. Current element is '" + Name() + "'");
+        throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
     }
     return ReadElementString();
 }
@@ -3958,7 +4185,7 @@ void XmlReader::Skip() {
     }
 }
 
-bool XmlReader::ReadToFollowing(const std::string& name) {
+bool XmlReader::ReadToFollowing(std::string_view name) {
     while (Read()) {
         if (NodeType() == XmlNodeType::Element && Name() == name) {
             return true;
@@ -3967,7 +4194,7 @@ bool XmlReader::ReadToFollowing(const std::string& name) {
     return false;
 }
 
-bool XmlReader::ReadToDescendant(const std::string& name) {
+bool XmlReader::ReadToDescendant(std::string_view name) {
     if (NodeType() != XmlNodeType::Element || IsEmptyElement()) {
         return false;
     }
@@ -3983,7 +4210,7 @@ bool XmlReader::ReadToDescendant(const std::string& name) {
     return false;
 }
 
-bool XmlReader::ReadToNextSibling(const std::string& name) {
+bool XmlReader::ReadToNextSibling(std::string_view name) {
     int targetDepth = Depth();
     // Skip current node
     if (NodeType() == XmlNodeType::Element && !IsEmptyElement()) {

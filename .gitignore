@@ -50,3 +50,10 @@
 /tests/System.Xml.Tests/build-int/System.Xml.Tests/Debug
 /LIBXML_TODO.md
 /build/System.Xml/Debug
+/src/System.Xml/build-int/System.Xml/Release
+/outtests-int
+/build
+/outtests
+/xmlconf
+/largreTest.xml
+/.vscode/settings.json

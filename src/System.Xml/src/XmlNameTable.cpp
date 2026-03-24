@@ -1,4 +1,4 @@
-#include "XmlInternal.h"
+#include "XmlNameTable.h"
 
 namespace System::Xml {
 

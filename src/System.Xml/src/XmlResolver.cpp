@@ -1,32 +1,33 @@
-#include "XmlInternal.h"
+#include "XmlUtilityInternal.h"
 
 namespace System::Xml {
 
-std::string XmlResolver::ResolveUri(const std::string& baseUri, const std::string& relativeUri) const {
+std::string XmlResolver::ResolveUri(std::string_view baseUri, std::string_view relativeUri) const {
     if (relativeUri.empty()) {
-        return baseUri;
+        return std::string(baseUri);
     }
     if (baseUri.empty()) {
-        return relativeUri;
+        return std::string(relativeUri);
     }
-    return (std::filesystem::path(baseUri).parent_path() / std::filesystem::path(relativeUri)).lexically_normal().string();
+    return (std::filesystem::path(std::string(baseUri)).parent_path() / std::filesystem::path(std::string(relativeUri))).lexically_normal().string();
 }
 
-std::string XmlResolver::GetEntity(const std::string& absoluteUri) const {
-    std::ifstream stream(std::filesystem::path(absoluteUri), std::ios::binary);
+std::string XmlResolver::GetEntity(std::string_view absoluteUri) const {
+    const std::string uriStr(absoluteUri);
+    std::ifstream stream(std::filesystem::path(uriStr), std::ios::binary);
     if (!stream) {
-        throw XmlException("Failed to resolve XML entity: " + absoluteUri);
+        throw XmlException("Failed to resolve XML entity: " + uriStr);
     }
     std::ostringstream buffer;
     buffer << stream.rdbuf();
     return buffer.str();
 }
 
-std::string XmlUrlResolver::ResolveUri(const std::string& baseUri, const std::string& relativeUri) const {
+std::string XmlUrlResolver::ResolveUri(std::string_view baseUri, std::string_view relativeUri) const {
     return XmlResolver::ResolveUri(baseUri, relativeUri);
 }
 
-std::string XmlUrlResolver::GetEntity(const std::string& absoluteUri) const {
+std::string XmlUrlResolver::GetEntity(std::string_view absoluteUri) const {
     return XmlResolver::GetEntity(absoluteUri);
 }
 

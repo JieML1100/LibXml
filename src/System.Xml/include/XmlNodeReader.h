@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,16 +33,16 @@ public:
     int AttributeCount() const noexcept;
     bool HasAttributes() const noexcept;
 
-    std::string GetAttribute(const std::string& name) const;
+    std::string GetAttribute(std::string_view name) const;
     std::string GetAttribute(int index) const;
-    std::string GetAttribute(const std::string& localName, const std::string& namespaceUri) const;
-    bool MoveToAttribute(const std::string& name);
+    std::string GetAttribute(std::string_view localName, std::string_view namespaceUri) const;
+    bool MoveToAttribute(std::string_view name);
     bool MoveToAttribute(int index);
-    bool MoveToAttribute(const std::string& localName, const std::string& namespaceUri);
+    bool MoveToAttribute(std::string_view localName, std::string_view namespaceUri);
     bool MoveToFirstAttribute();
     bool MoveToNextAttribute();
     bool MoveToElement();
-    std::string LookupNamespace(const std::string& prefix) const;
+    std::string LookupNamespace(std::string_view prefix) const;
 
     std::string ReadInnerXml() const;
     std::string ReadOuterXml() const;
@@ -55,23 +56,25 @@ public:
 
     XmlNodeType MoveToContent();
     bool IsStartElement();
-    bool IsStartElement(const std::string& name);
+    bool IsStartElement(std::string_view name);
     void ReadStartElement();
-    void ReadStartElement(const std::string& name);
+    void ReadStartElement(std::string_view name);
     void ReadEndElement();
     std::string ReadElementContentAsString();
     std::string ReadElementString();
-    std::string ReadElementString(const std::string& name);
+    std::string ReadElementString(std::string_view name);
     void Skip();
-    bool ReadToFollowing(const std::string& name);
-    bool ReadToDescendant(const std::string& name);
-    bool ReadToNextSibling(const std::string& name);
+    bool ReadToFollowing(std::string_view name);
+    bool ReadToDescendant(std::string_view name);
+    bool ReadToNextSibling(std::string_view name);
     const XmlNameTable& NameTable() const noexcept;
 
 private:
     struct NodeEvent {
         XmlNodeType nodeType = XmlNodeType::None;
         std::string name;
+        std::string localName;
+        std::string prefix;
         std::string namespaceUri;
         std::string value;
         int depth = 0;
@@ -79,6 +82,8 @@ private:
         std::string innerXml;
         std::string outerXml;
         std::vector<std::pair<std::string, std::string>> attributes;
+        std::vector<std::string> attributeLocalNames;
+        std::vector<std::string> attributePrefixes;
         std::vector<std::string> attributeNamespaceUris;
     };
 

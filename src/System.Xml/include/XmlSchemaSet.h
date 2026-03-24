@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -32,18 +33,18 @@ public:
 
     XmlSchemaSet() = default;
 
-    void AddXml(const std::string& xml);
+    void AddXml(std::string_view xml);
     void AddFile(const std::string& path);
     std::size_t Count() const noexcept;
     bool HasIdentityConstraints() const noexcept;
-    const Annotation* FindSchemaAnnotation(const std::string& namespaceUri) const;
-    const Annotation* FindElementAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindSimpleTypeAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindComplexTypeAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindAttributeAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindAttributeGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindIdentityConstraintAnnotation(const std::string& localName, const std::string& namespaceUri) const;
+    const Annotation* FindSchemaAnnotation(std::string_view namespaceUri) const;
+    const Annotation* FindElementAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindSimpleTypeAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindComplexTypeAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindAttributeAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindAttributeGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindIdentityConstraintAnnotation(std::string_view localName, std::string_view namespaceUri) const;
 
 private:
     enum class ContentModel {
@@ -312,23 +313,23 @@ private:
         Annotation annotation;
     };
 
-    friend std::string NormalizeSchemaSimpleTypeValue(const SimpleTypeRule& type, const std::string& lexicalValue);
+    friend std::string NormalizeSchemaSimpleTypeValue(const SimpleTypeRule& type, std::string_view lexicalValue);
     friend void ValidateSchemaSimpleValueWithQNameResolver(
         const SimpleTypeRule& type,
-        const std::string& value,
-        const std::string& label,
+        std::string_view value,
+        std::string_view label,
         const std::function<std::string(const std::string&)>& resolveNamespaceUri,
         const std::function<bool(const std::string&)>& hasNotationDeclaration,
         const std::function<bool(const std::string&)>& hasUnparsedEntityDeclaration);
     friend void ValidateSchemaSimpleValue(
         const SimpleTypeRule& type,
-        const std::string& value,
-        const std::string& label,
+        std::string_view value,
+        std::string_view label,
         const XmlElement* contextElement);
     friend void ValidateSchemaSimpleValue(
         const SimpleTypeRule& type,
-        const std::string& value,
-        const std::string& label,
+        std::string_view value,
+        std::string_view label,
         const std::vector<std::pair<std::string, std::string>>& namespaceBindings,
         const std::unordered_set<std::string>& notationDeclarationNames,
         const std::unordered_set<std::string>& unparsedEntityDeclarationNames);
@@ -346,16 +347,16 @@ private:
     std::unordered_set<std::string> loadedSchemaFiles_;
     std::unordered_set<std::string> activeSchemaFiles_;
 
-    const ElementRule* FindElementRule(const std::string& localName, const std::string& namespaceUri) const;
-    const SimpleTypeRule* FindSimpleTypeRule(const std::string& localName, const std::string& namespaceUri) const;
-    const ComplexTypeRule* FindComplexTypeRule(const std::string& localName, const std::string& namespaceUri) const;
-    const AttributeUse* FindAttributeRule(const std::string& localName, const std::string& namespaceUri) const;
-    const Particle* FindGroupRule(const std::string& localName, const std::string& namespaceUri) const;
-    const AttributeGroupRule* FindAttributeGroupRule(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindStoredSchemaAnnotation(const std::string& namespaceUri) const;
-    const Annotation* FindStoredGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const Annotation* FindStoredAttributeGroupAnnotation(const std::string& localName, const std::string& namespaceUri) const;
-    const ElementRule::IdentityConstraint* FindIdentityConstraint(const std::string& localName, const std::string& namespaceUri) const;
+    const ElementRule* FindElementRule(std::string_view localName, std::string_view namespaceUri) const;
+    const SimpleTypeRule* FindSimpleTypeRule(std::string_view localName, std::string_view namespaceUri) const;
+    const ComplexTypeRule* FindComplexTypeRule(std::string_view localName, std::string_view namespaceUri) const;
+    const AttributeUse* FindAttributeRule(std::string_view localName, std::string_view namespaceUri) const;
+    const Particle* FindGroupRule(std::string_view localName, std::string_view namespaceUri) const;
+    const AttributeGroupRule* FindAttributeGroupRule(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindStoredSchemaAnnotation(std::string_view namespaceUri) const;
+    const Annotation* FindStoredGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const Annotation* FindStoredAttributeGroupAnnotation(std::string_view localName, std::string_view namespaceUri) const;
+    const ElementRule::IdentityConstraint* FindIdentityConstraint(std::string_view localName, std::string_view namespaceUri) const;
 
     friend class XmlDocument;
 };

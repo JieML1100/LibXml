@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -18,48 +19,55 @@ public:
     XmlWriter(std::ostream& stream, XmlWriterSettings settings = {});
 
     WriteState GetWriteState() const noexcept;
-    std::string LookupPrefix(const std::string& namespaceUri) const;
+    std::string LookupPrefix(std::string_view namespaceUri) const;
 
     void WriteStartDocument(
-        const std::string& version = "1.0",
-        const std::string& encoding = {},
-        const std::string& standalone = {});
+        std::string_view version = "1.0",
+        std::string_view encoding = {},
+        std::string_view standalone = {});
     void WriteDocType(
-        const std::string& name,
-        const std::string& publicId = {},
-        const std::string& systemId = {},
-        const std::string& internalSubset = {});
-    void WriteStartElement(const std::string& name);
-    void WriteStartElement(const std::string& prefix, const std::string& localName, const std::string& namespaceUri = {});
-    void WriteStartAttribute(const std::string& name);
-    void WriteStartAttribute(const std::string& prefix, const std::string& localName, const std::string& namespaceUri = {});
+        std::string_view name,
+        std::string_view publicId = {},
+        std::string_view systemId = {},
+        std::string_view internalSubset = {});
+    void WriteStartElement(std::string_view name);
+    void WriteStartElement(std::string_view prefix, std::string_view localName, std::string_view namespaceUri = {});
+    void WriteStartAttribute(std::string_view name);
+    void WriteStartAttribute(std::string_view prefix, std::string_view localName, std::string_view namespaceUri = {});
     void WriteEndAttribute();
-    void WriteAttributeString(const std::string& name, const std::string& value);
+    void WriteAttributeString(std::string_view name, std::string_view value);
     void WriteAttributeString(
-        const std::string& prefix,
-        const std::string& localName,
-        const std::string& namespaceUri,
-        const std::string& value);
+        std::string_view prefix,
+        std::string_view localName,
+        std::string_view namespaceUri,
+        std::string_view value);
+    // Legacy aliases (identical to WriteAttributeString with string_view)
+    void WriteAttributeStringView(std::string_view name, std::string_view value) { WriteAttributeString(name, value); }
+    void WriteAttributeStringView(
+        std::string_view prefix,
+        std::string_view localName,
+        std::string_view namespaceUri,
+        std::string_view value) { WriteAttributeString(prefix, localName, namespaceUri, value); }
     void WriteAttributes(const XmlAttributeCollection& attributes);
     void WriteAttributes(const XmlElement& element);
     void WriteCharEntity(unsigned int codePoint);
-    void WriteEntityRef(const std::string& name);
-    void WriteString(const std::string& text);
-    void WriteValue(const std::string& value);
+    void WriteEntityRef(std::string_view name);
+    void WriteString(std::string_view text);
+    void WriteValue(std::string_view value);
     void WriteValue(bool value);
     void WriteValue(int value);
     void WriteValue(double value);
-    void WriteName(const std::string& name);
-    void WriteQualifiedName(const std::string& localName, const std::string& namespaceUri = {});
-    void WriteWhitespace(const std::string& whitespace);
-    void WriteSignificantWhitespace(const std::string& whitespace);
-    void WriteCData(const std::string& text);
-    void WriteComment(const std::string& text);
-    void WriteProcessingInstruction(const std::string& name, const std::string& text);
-    void WriteRaw(const std::string& xml);
+    void WriteName(std::string_view name);
+    void WriteQualifiedName(std::string_view localName, std::string_view namespaceUri = {});
+    void WriteWhitespace(std::string_view whitespace);
+    void WriteSignificantWhitespace(std::string_view whitespace);
+    void WriteCData(std::string_view text);
+    void WriteComment(std::string_view text);
+    void WriteProcessingInstruction(std::string_view name, std::string_view text);
+    void WriteRaw(std::string_view xml);
     void WriteBase64(const unsigned char* data, std::size_t length);
-    void WriteElementString(const std::string& name, const std::string& value);
-    void WriteElementString(const std::string& prefix, const std::string& localName, const std::string& namespaceUri, const std::string& value);
+    void WriteElementString(std::string_view name, std::string_view value);
+    void WriteElementString(std::string_view prefix, std::string_view localName, std::string_view namespaceUri, std::string_view value);
     void WriteNode(const XmlNode& node);
     void WriteNode(XmlReader& reader, bool defattr = true);
     void WriteEndElement();
@@ -83,29 +91,44 @@ private:
         bool hasTextLikeChild = false;
         bool hasNonTextChild = false;
         bool forceFullEnd = false;
-        std::unordered_map<std::string, std::string> namespaceDeclarations;
+        std::unique_ptr<std::unordered_map<std::string, std::string>> namespaceDeclarations;
     };
 
-    void EnsureDocumentOpen(const std::string& operation) const;
-    void EnsureOpenElement(const std::string& operation) const;
-    void EnsureOpenStartElement(const std::string& operation) const;
-    void EnsureNoOpenAttribute(const std::string& operation) const;
+    struct InMemoryMutationCheckpoint {
+        std::vector<std::shared_ptr<XmlElement>> elementStack;
+        std::vector<bool> startTagOpenStack;
+        std::shared_ptr<XmlElement> targetParent;
+        std::size_t parentChildCount = 0;
+        std::size_t documentChildCount = 0;
+        std::size_t fragmentChildCount = 0;
+        bool startDocumentWritten = false;
+        bool hadFragmentRoot = false;
+    };
+
+    void EnsureDocumentOpen(std::string_view operation) const;
+    void EnsureOpenElement(std::string_view operation) const;
+    void EnsureOpenStartElement(std::string_view operation) const;
+    void EnsureNoOpenAttribute(std::string_view operation) const;
     void EnsureOutputReady() const;
     void MarkCurrentElementContentStarted();
-    std::string LookupNamespacePrefix(const std::string& namespaceUri) const;
+    std::string LookupNamespacePrefix(std::string_view namespaceUri) const;
+    std::shared_ptr<XmlDocumentFragment> EnsureFragmentRoot() const;
     void AppendDocumentLevelNode(const std::shared_ptr<XmlNode>& node);
     bool UsesDirectOutput() const noexcept;
     void WriteDirectTopLevelSeparatorIfNeeded();
     void EnsureDirectCurrentStartTagClosed();
     void PrepareDirectParentForChild(bool textLikeChild);
-    void WriteDirectAttribute(const std::string& name, const std::string& value);
-    bool HasDirectNamespaceBinding(const std::string& prefix, const std::string& namespaceUri) const;
-    std::string LookupDirectNamespacePrefix(const std::string& namespaceUri) const;
-    void DeclareDirectNamespaceIfNeeded(const std::string& prefix, const std::string& namespaceUri);
+    void WriteDirectAttribute(std::string_view name, std::string_view value);
+    bool HasDirectNamespaceBinding(std::string_view prefix, std::string_view namespaceUri) const;
+    std::string LookupDirectNamespacePrefix(std::string_view namespaceUri) const;
+    void DeclareDirectNamespaceIfNeeded(std::string_view prefix, std::string_view namespaceUri);
     void WriteDirectTopLevelNode(const XmlNode& node);
+    void WriteNodeInMemory(const XmlNode& node);
+    InMemoryMutationCheckpoint CaptureInMemoryMutationCheckpoint() const;
+    void RollbackInMemoryMutation(const InMemoryMutationCheckpoint& checkpoint);
 
     XmlDocument document_;
-    std::shared_ptr<XmlDocumentFragment> fragmentRoot_;
+    mutable std::shared_ptr<XmlDocumentFragment> fragmentRoot_;
     XmlWriterSettings settings_;
     std::vector<std::shared_ptr<XmlElement>> elementStack_;
     std::vector<bool> startTagOpenStack_;

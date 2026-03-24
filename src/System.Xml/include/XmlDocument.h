@@ -2,9 +2,12 @@
 
 #include "XmlNode.h"
 
+#include <array>
 #include <iostream>
 #include <memory>
+#include <memory_resource>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace System::Xml {
@@ -16,10 +19,11 @@ class XmlWriter;
 class XmlDocument final : public XmlNode {
 public:
     XmlDocument();
+    ~XmlDocument() override;
 
-    static std::shared_ptr<XmlDocument> Parse(const std::string& xml);
+    static std::shared_ptr<XmlDocument> Parse(std::string_view xml);
 
-    void LoadXml(const std::string& xml);
+    void LoadXml(std::string_view xml);
     void Load(const std::string& path);
     void Load(std::istream& stream);
     void Save(const std::string& path, const XmlWriterSettings& settings = {}) const;
@@ -35,36 +39,36 @@ public:
     std::shared_ptr<XmlDeclaration> Declaration() const;
     std::shared_ptr<XmlDocumentType> DocumentType() const;
     std::shared_ptr<XmlElement> DocumentElement() const;
-    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(const std::string& name) const;
-    XmlNodeList GetElementsByTagNameList(const std::string& name) const;
-    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(const std::string& localName, const std::string& namespaceUri) const;
-    XmlNodeList GetElementsByTagNameList(const std::string& localName, const std::string& namespaceUri) const;
+    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(std::string_view name) const;
+    XmlNodeList GetElementsByTagNameList(std::string_view name) const;
+    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(std::string_view localName, std::string_view namespaceUri) const;
+    XmlNodeList GetElementsByTagNameList(std::string_view localName, std::string_view namespaceUri) const;
 
     std::shared_ptr<XmlDocumentFragment> CreateDocumentFragment() const;
-    std::shared_ptr<XmlElement> CreateElement(const std::string& name) const;
-    std::shared_ptr<XmlElement> CreateElement(const std::string& prefix, const std::string& localName, const std::string& namespaceUri = {}) const;
-    std::shared_ptr<XmlAttribute> CreateAttribute(const std::string& name, const std::string& value = {}) const;
-    std::shared_ptr<XmlAttribute> CreateAttribute(const std::string& prefix, const std::string& localName, const std::string& namespaceUri, const std::string& value = {}) const;
-    std::shared_ptr<XmlText> CreateTextNode(const std::string& value) const;
-    std::shared_ptr<XmlEntityReference> CreateEntityReference(const std::string& name) const;
-    std::shared_ptr<XmlWhitespace> CreateWhitespace(const std::string& value) const;
-    std::shared_ptr<XmlSignificantWhitespace> CreateSignificantWhitespace(const std::string& value) const;
-    std::shared_ptr<XmlCDataSection> CreateCDataSection(const std::string& value) const;
-    std::shared_ptr<XmlComment> CreateComment(const std::string& value) const;
-    std::shared_ptr<XmlProcessingInstruction> CreateProcessingInstruction(const std::string& target, const std::string& data = {}) const;
+    std::shared_ptr<XmlElement> CreateElement(std::string_view name) const;
+    std::shared_ptr<XmlElement> CreateElement(std::string_view prefix, std::string_view localName, std::string_view namespaceUri = {}) const;
+    std::shared_ptr<XmlAttribute> CreateAttribute(std::string_view name, std::string_view value = {}) const;
+    std::shared_ptr<XmlAttribute> CreateAttribute(std::string_view prefix, std::string_view localName, std::string_view namespaceUri, std::string_view value = {}) const;
+    std::shared_ptr<XmlText> CreateTextNode(std::string_view value) const;
+    std::shared_ptr<XmlEntityReference> CreateEntityReference(std::string_view name) const;
+    std::shared_ptr<XmlWhitespace> CreateWhitespace(std::string_view value) const;
+    std::shared_ptr<XmlSignificantWhitespace> CreateSignificantWhitespace(std::string_view value) const;
+    std::shared_ptr<XmlCDataSection> CreateCDataSection(std::string_view value) const;
+    std::shared_ptr<XmlComment> CreateComment(std::string_view value) const;
+    std::shared_ptr<XmlProcessingInstruction> CreateProcessingInstruction(std::string_view target, std::string_view data = {}) const;
     std::shared_ptr<XmlDeclaration> CreateXmlDeclaration(
-        const std::string& version = "1.0",
-        const std::string& encoding = {},
-        const std::string& standalone = {}) const;
+        std::string_view version = "1.0",
+        std::string_view encoding = {},
+        std::string_view standalone = {}) const;
     std::shared_ptr<XmlDocumentType> CreateDocumentType(
-        const std::string& name,
-        const std::string& publicId = {},
-        const std::string& systemId = {},
-        const std::string& internalSubset = {}) const;
+        std::string_view name,
+        std::string_view publicId = {},
+        std::string_view systemId = {},
+        std::string_view internalSubset = {}) const;
     std::shared_ptr<XmlNode> CreateNode(
         XmlNodeType nodeType,
-        const std::string& name = {},
-        const std::string& value = {}) const;
+        std::string_view name = {},
+        std::string_view value = {}) const;
     std::shared_ptr<XmlNode> ImportNode(const XmlNode& node, bool deep) const;
 
     std::shared_ptr<XmlNode> AppendChild(const std::shared_ptr<XmlNode>& child) override;
@@ -80,6 +84,72 @@ protected:
     void ValidateChildInsertion(const std::shared_ptr<XmlNode>& child, const XmlNode* replacingChild = nullptr) const override;
 
 private:
+    struct NodeArenaState {
+        std::array<std::byte, 4096> initialBuffer{};
+        std::pmr::monotonic_buffer_resource resource;
+
+        NodeArenaState()
+            : resource(initialBuffer.data(), initialBuffer.size()) {
+        }
+    };
+
+    template <typename TValue>
+    class NodeArenaAllocator {
+    public:
+        using value_type = TValue;
+
+        NodeArenaAllocator() = default;
+
+        explicit NodeArenaAllocator(std::shared_ptr<NodeArenaState> state) noexcept
+            : state_(std::move(state)) {
+        }
+
+        template <typename TOther>
+        NodeArenaAllocator(const NodeArenaAllocator<TOther>& other) noexcept
+            : state_(other.state_) {
+        }
+
+        [[nodiscard]] TValue* allocate(std::size_t count) {
+            std::pmr::polymorphic_allocator<TValue> allocator(&state_->resource);
+            return allocator.allocate(count);
+        }
+
+        void deallocate(TValue* pointer, std::size_t count) noexcept {
+            std::pmr::polymorphic_allocator<TValue> allocator(&state_->resource);
+            allocator.deallocate(pointer, count);
+        }
+
+        template <typename TOther>
+        bool operator==(const NodeArenaAllocator<TOther>& other) const noexcept {
+            return state_.get() == other.state_.get();
+        }
+
+        template <typename TOther>
+        bool operator!=(const NodeArenaAllocator<TOther>& other) const noexcept {
+            return !(*this == other);
+        }
+
+    private:
+        std::shared_ptr<NodeArenaState> state_;
+
+        template <typename TOther>
+        friend class NodeArenaAllocator;
+    };
+
+    template <typename TNode, typename... TArgs>
+    std::shared_ptr<TNode> AllocateNode(TArgs&&... args) const {
+        NodeArenaAllocator<TNode> allocator(nodeArenaState_);
+        return std::allocate_shared<TNode>(allocator, std::forward<TArgs>(args)...);
+    }
+
+    template <typename TNode, typename... TArgs>
+    std::shared_ptr<TNode> AllocateOwnedNode(TArgs&&... args) const {
+        auto node = AllocateNode<TNode>(std::forward<TArgs>(args)...);
+        node->SetOwnerDocument(const_cast<XmlDocument*>(this));
+        return node;
+    }
+
+    mutable std::shared_ptr<NodeArenaState> nodeArenaState_;
     bool preserveWhitespace_ = false;
     XmlNodeChangedEventHandler onNodeInserting_;
     XmlNodeChangedEventHandler onNodeInserted_;
@@ -98,7 +168,7 @@ private:
     void ValidateReaderAgainstSchemas(XmlReader& reader, const XmlSchemaSet& schemas) const;
     void ValidateIdentityConstraints(const XmlSchemaSet& schemas) const;
 
-    friend void ValidateXmlReaderInputAgainstSchemas(const std::string& xml, const XmlReaderSettings& settings);
+    friend void ValidateXmlReaderInputAgainstSchemas(const std::shared_ptr<const std::string>& xml, const XmlReaderSettings& settings);
     friend void ValidateXmlReaderInputAgainstSchemas(XmlReader& reader, const XmlReaderSettings& settings);
     friend void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document);
 

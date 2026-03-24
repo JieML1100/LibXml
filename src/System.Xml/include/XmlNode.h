@@ -3,9 +3,11 @@
 #include "XmlTypes.h"
 
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace System::Xml {
@@ -21,6 +23,7 @@ class XmlNamespaceManager;
 class XmlNameTable;
 class XmlNodeReader;
 class XmlNotation;
+class XmlParser;
 class XmlReader;
 class XmlWriter;
 class XPathNavigator;
@@ -28,6 +31,7 @@ class XPathDocument;
 
 void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document);
 std::string LookupNamespaceUriOnElement(const XmlElement* element, std::string_view prefix);
+bool LookupNamespaceUriOnElementView(const XmlElement* element, std::string_view prefix, std::string_view& namespaceUri) noexcept;
 
 class XmlNode;
 
@@ -54,7 +58,7 @@ public:
 
     std::size_t Count() const noexcept;
     std::shared_ptr<XmlAttribute> Item(std::size_t index) const;
-    std::shared_ptr<XmlAttribute> Item(const std::string& name) const;
+    std::shared_ptr<XmlAttribute> Item(std::string_view name) const;
     bool Empty() const noexcept;
 
     std::vector<std::shared_ptr<XmlAttribute>>::const_iterator begin() const noexcept;
@@ -71,7 +75,7 @@ public:
 
     std::size_t Count() const noexcept;
     std::shared_ptr<XmlNode> Item(std::size_t index) const;
-    std::shared_ptr<XmlNode> GetNamedItem(const std::string& name) const;
+    std::shared_ptr<XmlNode> GetNamedItem(std::string_view name) const;
     bool Empty() const noexcept;
 
     std::vector<std::shared_ptr<XmlNode>>::const_iterator begin() const noexcept;
@@ -90,10 +94,10 @@ public:
     std::string LocalName() const;
     std::string Prefix() const;
     std::string NamespaceURI() const;
-    std::string GetNamespaceOfPrefix(const std::string& prefix) const;
-    std::string GetPrefixOfNamespace(const std::string& namespaceUri) const;
+    std::string GetNamespaceOfPrefix(std::string_view prefix) const;
+    std::string GetPrefixOfNamespace(std::string_view namespaceUri) const;
     virtual const std::string& Value() const noexcept;
-    virtual void SetValue(const std::string& value);
+    virtual void SetValue(std::string_view value);
 
     virtual void Normalize();
 
@@ -125,17 +129,17 @@ public:
     virtual void RemoveAll();
 
     std::string InnerText() const;
-    virtual void SetInnerText(const std::string& text);
+    virtual void SetInnerText(std::string_view text);
     std::string InnerXml(const XmlWriterSettings& settings = {}) const;
-    virtual void SetInnerXml(const std::string& xml);
+    virtual void SetInnerXml(std::string_view xml);
     std::string OuterXml(const XmlWriterSettings& settings = {}) const;
     std::shared_ptr<XmlNode> CloneNode(bool deep) const;
     XPathNavigator CreateNavigator() const;
 
-    std::shared_ptr<XmlNode> SelectSingleNode(const std::string& xpath) const;
-    std::shared_ptr<XmlNode> SelectSingleNode(const std::string& xpath, const XmlNamespaceManager& namespaces) const;
-    XmlNodeList SelectNodes(const std::string& xpath) const;
-    XmlNodeList SelectNodes(const std::string& xpath, const XmlNamespaceManager& namespaces) const;
+    std::shared_ptr<XmlNode> SelectSingleNode(std::string_view xpath) const;
+    std::shared_ptr<XmlNode> SelectSingleNode(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
+    XmlNodeList SelectNodes(std::string_view xpath) const;
+    XmlNodeList SelectNodes(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
 
 protected:
     XmlNode(XmlNodeType nodeType, std::string name = {}, std::string value = {});
@@ -149,15 +153,23 @@ protected:
     std::shared_ptr<XmlNode> AppendChildForOwnedLoad(const std::shared_ptr<XmlNode>& child);
 
 private:
+    static constexpr std::size_t DetachedSiblingIndex = (std::numeric_limits<std::size_t>::max)();
+
+    void SetSiblingIndex(std::size_t siblingIndex) noexcept;
+    std::size_t ResolveSiblingIndex() const noexcept;
+    void ReindexChildNodesFrom(std::size_t startIndex) noexcept;
+
     XmlNodeType nodeType_;
     std::string name_;
     std::string value_;
     XmlNode* parent_;
     XmlDocument* ownerDocument_;
-    std::vector<std::shared_ptr<XmlNode>> childNodes_;
+    std::size_t siblingIndex_;
+    std::unique_ptr<std::vector<std::shared_ptr<XmlNode>>> childNodes_;
 
     friend class XmlDocument;
     friend class XmlElement;
+    friend class XmlParser;
     friend class XmlWriter;
     friend void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document);
 };
@@ -173,12 +185,12 @@ public:
 class XmlCharacterData : public XmlNode {
 public:
     const std::string& Data() const noexcept;
-    void SetData(const std::string& data);
+    void SetData(std::string_view data);
     std::size_t Length() const noexcept;
-    void AppendData(const std::string& strData);
+    void AppendData(std::string_view strData);
     void DeleteData(std::size_t offset, std::size_t count);
-    void InsertData(std::size_t offset, const std::string& strData);
-    void ReplaceData(std::size_t offset, std::size_t count, const std::string& strData);
+    void InsertData(std::size_t offset, std::string_view strData);
+    void ReplaceData(std::size_t offset, std::size_t count, std::string_view strData);
     std::string Substring(std::size_t offset, std::size_t count) const;
 
 protected:
@@ -232,14 +244,14 @@ class XmlWhitespace final : public XmlCharacterData {
 public:
     explicit XmlWhitespace(std::string whitespace);
 
-    void SetValue(const std::string& value) override;
+    void SetValue(std::string_view value) override;
 };
 
 class XmlSignificantWhitespace final : public XmlCharacterData {
 public:
     explicit XmlSignificantWhitespace(std::string whitespace);
 
-    void SetValue(const std::string& value) override;
+    void SetValue(std::string_view value) override;
 };
 
 class XmlCDataSection final : public XmlCharacterData {
@@ -258,7 +270,7 @@ public:
 
     const std::string& Target() const noexcept;
     const std::string& Data() const noexcept;
-    void SetData(const std::string& data);
+    void SetData(std::string_view data);
 };
 
 class XmlDeclaration final : public XmlNode {
@@ -303,7 +315,7 @@ class XmlDocumentFragment final : public XmlNode {
 public:
     XmlDocumentFragment();
 
-    void SetInnerXml(const std::string& xml);
+    void SetInnerXml(std::string_view xml);
 };
 
 class XmlElement final : public XmlNode {
@@ -313,32 +325,67 @@ public:
     const std::vector<std::shared_ptr<XmlAttribute>>& Attributes() const;
     XmlAttributeCollection AttributeNodes() const;
     bool HasAttributes() const noexcept;
-    bool HasAttribute(const std::string& name) const;
-    bool HasAttribute(const std::string& localName, const std::string& namespaceUri) const;
-    std::string GetAttribute(const std::string& name) const;
-    std::string GetAttribute(const std::string& localName, const std::string& namespaceUri) const;
-    std::shared_ptr<XmlAttribute> GetAttributeNode(const std::string& name) const;
-    std::shared_ptr<XmlAttribute> GetAttributeNode(const std::string& localName, const std::string& namespaceUri) const;
-    std::shared_ptr<XmlAttribute> SetAttribute(const std::string& name, const std::string& value);
-    void SetAttribute(const std::string& localName, const std::string& namespaceUri, const std::string& value);
+    bool HasAttribute(std::string_view name) const;
+    bool HasAttribute(std::string_view localName, std::string_view namespaceUri) const;
+    std::string GetAttribute(std::string_view name) const;
+    std::string GetAttribute(std::string_view localName, std::string_view namespaceUri) const;
+    std::shared_ptr<XmlAttribute> GetAttributeNode(std::string_view name) const;
+    std::shared_ptr<XmlAttribute> GetAttributeNode(std::string_view localName, std::string_view namespaceUri) const;
+    std::shared_ptr<XmlAttribute> SetAttribute(std::string_view name, std::string_view value);
+    void SetAttribute(std::string_view localName, std::string_view namespaceUri, std::string_view value);
     std::shared_ptr<XmlAttribute> SetAttributeNode(const std::shared_ptr<XmlAttribute>& attribute);
-    bool RemoveAttribute(const std::string& name);
-    bool RemoveAttribute(const std::string& localName, const std::string& namespaceUri);
+    bool RemoveAttribute(std::string_view name);
+    bool RemoveAttribute(std::string_view localName, std::string_view namespaceUri);
     std::shared_ptr<XmlAttribute> RemoveAttributeNode(const std::shared_ptr<XmlAttribute>& attribute);
     void RemoveAllAttributes();
-    void SetInnerXml(const std::string& xml);
+    void SetInnerXml(std::string_view xml);
     bool IsEmpty() const noexcept;
-    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(const std::string& name) const;
-    XmlNodeList GetElementsByTagNameList(const std::string& name) const;
-    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(const std::string& localName, const std::string& namespaceUri) const;
-    XmlNodeList GetElementsByTagNameList(const std::string& localName, const std::string& namespaceUri) const;
+    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(std::string_view name) const;
+    XmlNodeList GetElementsByTagNameList(std::string_view name) const;
+    std::vector<std::shared_ptr<XmlElement>> GetElementsByTagName(std::string_view localName, std::string_view namespaceUri) const;
+    XmlNodeList GetElementsByTagNameList(std::string_view localName, std::string_view namespaceUri) const;
     bool WritesFullEndElement() const noexcept;
     XmlNodeReader CreateReader() const;
-    std::string FindNamespaceDeclarationValue(const std::string& prefix) const;
-    bool HasNamespaceDeclaration(const std::string& prefix) const;
-    std::string FindNamespaceDeclarationPrefix(const std::string& namespaceUri) const;
+    std::string FindNamespaceDeclarationValue(std::string_view prefix) const;
+    bool HasNamespaceDeclaration(std::string_view prefix) const;
+    std::string FindNamespaceDeclarationPrefix(std::string_view namespaceUri) const;
 
 private:
+    struct TransparentStringHash {
+        using is_transparent = void;
+
+        std::size_t operator()(std::string_view value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+
+        std::size_t operator()(const std::string& value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+    };
+
+    struct TransparentStringEqual {
+        using is_transparent = void;
+
+        bool operator()(std::string_view left, std::string_view right) const noexcept {
+            return left == right;
+        }
+
+        bool operator()(const std::string& left, std::string_view right) const noexcept {
+            return std::string_view(left) == right;
+        }
+
+        bool operator()(std::string_view left, const std::string& right) const noexcept {
+            return left == std::string_view(right);
+        }
+
+        bool operator()(const std::string& left, const std::string& right) const noexcept {
+            return left == right;
+        }
+    };
+
+    using AttributeNameIndex = std::unordered_map<std::string_view, std::size_t, TransparentStringHash, TransparentStringEqual>;
+    using PendingAttributeNameIndex = std::unordered_map<std::string_view, std::size_t, TransparentStringHash, TransparentStringEqual>;
+
     struct PendingLoadAttribute {
         std::size_t nameOffset = 0;
         std::size_t nameLength = 0;
@@ -347,23 +394,33 @@ private:
     };
 
     bool TryFindNamespaceDeclarationValueView(std::string_view prefix, std::string_view& value) const noexcept;
+    bool TryFindNamespaceDeclarationPrefixView(std::string_view namespaceUri, std::string_view& prefix) const noexcept;
     std::string_view PendingLoadAttributeNameView(const PendingLoadAttribute& attribute) const noexcept;
     std::string_view PendingLoadAttributeValueView(const PendingLoadAttribute& attribute) const noexcept;
+    void MarkAttributeNameIndexesDirty() const noexcept;
+    void EnsureAttributeNameIndexes() const;
+    std::size_t FindIndexedAttributeIndex(std::string_view name) const noexcept;
+    std::size_t FindIndexedPendingLoadAttributeIndex(std::string_view name) const noexcept;
     std::shared_ptr<XmlAttribute> MaterializePendingLoadAttribute(std::size_t index) const;
-    std::size_t FindPendingLoadAttributeIndex(const std::string& name) const noexcept;
-    std::size_t FindPendingLoadAttributeIndex(const std::string& localName, const std::string& namespaceUri) const;
+    std::size_t FindPendingLoadAttributeIndex(std::string_view name) const noexcept;
+    std::size_t FindPendingLoadAttributeIndex(std::string_view localName, std::string_view namespaceUri) const;
     void EnsureAttributesMaterialized() const;
     void ReserveAttributesForLoad(std::size_t count, std::size_t totalStorageBytes = 0);
     void AppendAttributeForLoad(std::string name, std::string value);
     mutable std::vector<std::shared_ptr<XmlAttribute>> attributes_;
     mutable std::vector<PendingLoadAttribute> pendingLoadAttributes_;
-    std::string pendingLoadAttributeStorage_;
+    mutable std::unique_ptr<AttributeNameIndex> attributeNameIndex_;
+    mutable std::unique_ptr<PendingAttributeNameIndex> pendingLoadAttributeNameIndex_;
+    mutable bool attributeNameIndexesDirty_ = true;
+    mutable std::string pendingLoadAttributeStorage_;
     bool writeFullEndElement_ = false;
 
     friend void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document);
     friend std::string LookupNamespaceUriOnElement(const XmlElement* element, std::string_view prefix);
+    friend bool LookupNamespaceUriOnElementView(const XmlElement* element, std::string_view prefix, std::string_view& namespaceUri) noexcept;
     friend bool TryGetAttributeValueViewInternal(const XmlElement& element, std::string_view name, std::string_view& value) noexcept;
     friend bool AttributeValueEqualsInternal(const XmlElement& element, std::string_view name, std::string_view expectedValue) noexcept;
+    friend class XmlParser;
     friend class XmlReader;
     friend class XmlWriter;
     friend class XmlNode;
