@@ -35,6 +35,9 @@ std::string BuildExceptionMessage(const std::string& message, std::size_t line, 
 std::string ComposeQualifiedName(std::string_view prefix, std::string_view localName);
 std::string ResolveNodeNamespaceUri(const XmlNode& node);
 const std::string& EmptyString();
+void ValidateXmlDeclarationVersion(std::string_view version);
+void ValidateXmlDeclarationEncoding(std::string_view encoding);
+void ValidateXmlDeclarationStandalone(std::string_view standalone);
 std::string BuildDeclarationValue(
     const std::string& version,
     const std::string& encoding,
@@ -473,6 +476,27 @@ std::string_view NamespaceDeclarationPrefixView(std::string_view name) noexcept 
         return name.substr(6);
     }
     return {};
+}
+
+void ValidateNamespaceDeclarationBinding(std::string_view prefix, std::string_view namespaceUri) {
+    constexpr std::string_view kXmlNamespaceUri = "http://www.w3.org/XML/1998/namespace";
+    constexpr std::string_view kXmlnsNamespaceUri = "http://www.w3.org/2000/xmlns/";
+
+    if (prefix == "xmlns") {
+        throw XmlException("Invalid namespace declaration for reserved prefix 'xmlns'");
+    }
+    if (prefix == "xml") {
+        if (namespaceUri != kXmlNamespaceUri) {
+            throw XmlException("Invalid namespace declaration for reserved prefix 'xml'");
+        }
+        return;
+    }
+    if (namespaceUri == kXmlnsNamespaceUri) {
+        throw XmlException("The namespace URI 'http://www.w3.org/2000/xmlns/' cannot be declared");
+    }
+    if (namespaceUri == kXmlNamespaceUri) {
+        throw XmlException("The namespace URI 'http://www.w3.org/XML/1998/namespace' must be bound to the prefix 'xml'");
+    }
 }
 
 std::string LookupPrefixOnElement(const XmlElement* element, std::string_view namespaceUri) {

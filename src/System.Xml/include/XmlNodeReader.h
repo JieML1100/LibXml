@@ -72,6 +72,7 @@ public:
 private:
     struct NodeEvent {
         XmlNodeType nodeType = XmlNodeType::None;
+        const XmlNode* sourceNode = nullptr;
         std::string name;
         std::string localName;
         std::string prefix;
@@ -90,6 +91,7 @@ private:
     void BuildEvents(const XmlNode& node, int depth, bool preserveSpace);
     void AppendEvent(
         XmlNodeType nodeType,
+        const XmlNode* sourceNode,
         std::string name,
         std::string namespaceUri,
         std::string value,

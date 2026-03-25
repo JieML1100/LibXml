@@ -1766,6 +1766,105 @@ void XmlReader::RegisterDtdDeclarations(
     }
 }
 
+void XmlReader::RegisterDtdAttributeDeclarations(
+    const std::unordered_map<std::string, std::string>& idAttributes,
+    const std::unordered_map<std::string, std::string>& notationAttributes,
+    const std::unordered_map<std::string, std::unordered_map<std::string, bool>>& nmTokenAttributes,
+    const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& nameAttributes,
+    const std::unordered_map<std::string, std::unordered_set<std::string>>& requiredAttributes,
+    const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& defaultAttributes,
+    const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& fixedAttributes,
+    const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& enumeratedAttributes,
+    bool fromExternalSubset) {
+    if (idAttributes.empty() && notationAttributes.empty() && nmTokenAttributes.empty() && nameAttributes.empty() && requiredAttributes.empty() && defaultAttributes.empty() && fixedAttributes.empty() && enumeratedAttributes.empty()) {
+        return;
+    }
+
+    DtdState& dtdState = EnsureDtdState();
+    for (const auto& [elementName, attributeName] : idAttributes) {
+        const auto existingIdAttribute = dtdState.idAttributes.find(elementName);
+        if (existingIdAttribute != dtdState.idAttributes.end() && existingIdAttribute->second != attributeName) {
+            throw XmlException(
+                "DTD validation failed: element '" + elementName + "' must not declare more than one ID attribute");
+        }
+        dtdState.idAttributes[elementName] = attributeName;
+    }
+
+    for (const auto& [elementName, attributeName] : notationAttributes) {
+        const auto existingNotationAttribute = dtdState.notationAttributes.find(elementName);
+        if (existingNotationAttribute != dtdState.notationAttributes.end() && existingNotationAttribute->second != attributeName) {
+            throw XmlException(
+                "DTD validation failed: element '" + elementName + "' must not declare more than one NOTATION attribute");
+        }
+        dtdState.notationAttributes[elementName] = attributeName;
+    }
+
+    for (const auto& [elementName, attributes] : nmTokenAttributes) {
+        auto& destination = dtdState.nmTokenAttributes[elementName];
+        for (const auto& [attributeName, allowMultipleTokens] : attributes) {
+            destination.emplace(attributeName, allowMultipleTokens);
+        }
+    }
+
+    for (const auto& [elementName, attributes] : nameAttributes) {
+        auto& destination = dtdState.nameAttributes[elementName];
+        for (const auto& [attributeName, attributeType] : attributes) {
+            destination.emplace(attributeName, attributeType);
+        }
+    }
+
+    for (const auto& [elementName, attributeNames] : requiredAttributes) {
+        auto& destination = dtdState.requiredAttributes[elementName];
+        destination.insert(attributeNames.begin(), attributeNames.end());
+        if (fromExternalSubset) {
+            auto& externalDestination = dtdState.externalRequiredAttributes[elementName];
+            externalDestination.insert(attributeNames.begin(), attributeNames.end());
+        }
+    }
+
+    for (const auto& [elementName, attributes] : defaultAttributes) {
+        auto& destination = dtdState.defaultAttributes[elementName];
+        for (const auto& [attributeName, value] : attributes) {
+            if (fromExternalSubset) {
+                if (destination.find(attributeName) == destination.end()) {
+                    destination.emplace(attributeName, value);
+                }
+                dtdState.externalDefaultAttributes[elementName].emplace(attributeName, value);
+            } else {
+                destination[attributeName] = value;
+            }
+        }
+    }
+
+    for (const auto& [elementName, attributes] : fixedAttributes) {
+        auto& destination = dtdState.fixedAttributes[elementName];
+        for (const auto& [attributeName, value] : attributes) {
+            if (fromExternalSubset) {
+                if (destination.find(attributeName) == destination.end()) {
+                    destination.emplace(attributeName, value);
+                }
+                dtdState.externalFixedAttributes[elementName].emplace(attributeName, value);
+            } else {
+                destination[attributeName] = value;
+            }
+        }
+    }
+
+    for (const auto& [elementName, attributes] : enumeratedAttributes) {
+        auto& destination = dtdState.enumeratedAttributes[elementName];
+        for (const auto& [attributeName, valueSet] : attributes) {
+            if (fromExternalSubset) {
+                if (destination.find(attributeName) == destination.end()) {
+                    destination.emplace(attributeName, valueSet);
+                }
+                dtdState.externalEnumeratedAttributes[elementName].emplace(attributeName, valueSet);
+            } else {
+                destination[attributeName] = valueSet;
+            }
+        }
+    }
+}
+
 void XmlReader::LoadExternalSubsetDeclarations(std::string_view systemLiteral) {
     DtdState& dtdState = EnsureDtdState();
     if (!systemLiteral.empty()) {
@@ -1789,6 +1888,20 @@ void XmlReader::LoadExternalSubsetDeclarations(std::string_view systemLiteral) {
     std::vector<std::shared_ptr<XmlNode>> notations;
     ParseDocumentTypeInternalSubset(externalSubset, entities, notations);
     RegisterDtdDeclarations(entities, notations);
+
+    DtdRequiredAttributeDeclarations requiredAttributes;
+    DtdDefaultAttributeDeclarations defaultAttributes;
+    DtdFixedAttributeDeclarations fixedAttributes;
+    DtdEnumeratedAttributeDeclarations enumeratedAttributes;
+    DtdEmptyElementDeclarations emptyElementDeclarations;
+    DtdIdAttributeDeclarations idAttributes;
+    DtdNotationAttributeDeclarations notationAttributes;
+    DtdNmTokenAttributeDeclarations nmTokenAttributes;
+    DtdNameAttributeDeclarations nameAttributes;
+    ParseDocumentTypeEmptyElementDeclarations(externalSubset, emptyElementDeclarations);
+    ParseDocumentTypeAttributeDeclarations(externalSubset, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes);
+    dtdState.emptyElementDeclarations.insert(emptyElementDeclarations.begin(), emptyElementDeclarations.end());
+    RegisterDtdAttributeDeclarations(idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, true);
 }
 
 void XmlReader::EnsureExternalSubsetDeclarationsLoaded() {
@@ -1812,6 +1925,220 @@ void XmlReader::EnsureExternalSubsetDeclarationsLoaded() {
 
 [[noreturn]] void XmlReader::ThrowUnknownEntityReference(std::string_view entity) const {
     Throw("Unknown entity reference: &" + std::string(entity) + ';');
+}
+
+void XmlReader::ApplyDtdAttributeDeclarations(
+    std::string_view elementName,
+    std::vector<std::pair<std::string, std::string>>& attributes,
+    std::vector<AttributeValueMetadata>& attributeValueMetadata,
+    bool& retainLocalNamespaceDeclarationsForAttributes) const {
+    if (dtdState_ == nullptr) {
+        return;
+    }
+
+    const auto hasAttribute = [&attributes](std::string_view attributeName) {
+        for (const auto& attribute : attributes) {
+            if (attribute.first == attributeName) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto attributeValueAt = [this, &attributes, &attributeValueMetadata](std::size_t index) {
+        if (index >= attributes.size()) {
+            return std::string{};
+        }
+        if (index >= attributeValueMetadata.size()) {
+            return attributes[index].second;
+        }
+
+        const auto& metadata = attributeValueMetadata[index];
+        if ((metadata.flags & kAttributeValueDecoded) != 0
+            || metadata.valueStart == std::string::npos
+            || metadata.valueEnd == std::string::npos
+            || metadata.valueEnd < metadata.valueStart) {
+            return attributes[index].second;
+        }
+
+        std::string value = SourceSubstr(metadata.valueStart, metadata.valueEnd - metadata.valueStart);
+        if ((metadata.flags & kAttributeValueNeedsDecoding) != 0) {
+            value = DecodeEntities(value);
+        }
+        return value;
+    };
+
+    const std::string elementNameString(elementName);
+    if (documentDeclarationStandalone_ == "yes") {
+        const bool hasExternalRequired = dtdState_->externalRequiredAttributes.find(elementNameString)
+            != dtdState_->externalRequiredAttributes.end();
+        const bool hasExternalDefault = dtdState_->externalDefaultAttributes.find(elementNameString)
+            != dtdState_->externalDefaultAttributes.end();
+        const bool hasExternalFixed = dtdState_->externalFixedAttributes.find(elementNameString)
+            != dtdState_->externalFixedAttributes.end();
+        const bool hasExternalEnumerated = dtdState_->externalEnumeratedAttributes.find(elementNameString)
+            != dtdState_->externalEnumeratedAttributes.end();
+        if (hasExternalRequired || hasExternalDefault || hasExternalFixed || hasExternalEnumerated) {
+            throw XmlException(
+                "Standalone document declaration must not use external DTD attribute declarations");
+        }
+    }
+
+    const auto fixedIt = dtdState_->fixedAttributes.find(elementNameString);
+    if (fixedIt != dtdState_->fixedAttributes.end()) {
+        for (const auto& [attributeName, fixedValue] : fixedIt->second) {
+            for (std::size_t index = 0; index < attributes.size(); ++index) {
+                if (attributes[index].first != attributeName) {
+                    continue;
+                }
+
+                if (attributeValueAt(index) != fixedValue) {
+                    throw XmlException(
+                        "DTD validation failed: attribute '" + attributeName
+                        + "' on element '" + elementNameString
+                        + "' must match the fixed value '" + fixedValue + "'");
+                }
+                break;
+            }
+        }
+    }
+
+    const auto requiredIt = dtdState_->requiredAttributes.find(elementNameString);
+    if (requiredIt != dtdState_->requiredAttributes.end()) {
+        for (const auto& attributeName : requiredIt->second) {
+            if (!hasAttribute(attributeName)) {
+                throw XmlException(
+                    "DTD validation failed: required attribute '" + attributeName
+                    + "' is missing on element '" + elementNameString + "'");
+            }
+        }
+    }
+
+    const auto defaultIt = dtdState_->defaultAttributes.find(elementNameString);
+    if (defaultIt != dtdState_->defaultAttributes.end()) {
+        for (const auto& [attributeName, defaultValue] : defaultIt->second) {
+            if (hasAttribute(attributeName)) {
+                continue;
+            }
+
+            if (attributeName.find(':') != std::string::npos && attributeName.rfind("xmlns", 0) != 0) {
+                retainLocalNamespaceDeclarationsForAttributes = true;
+            }
+
+            attributes.emplace_back(attributeName, defaultValue);
+            attributeValueMetadata.push_back(AttributeValueMetadata{
+                std::string::npos,
+                std::string::npos,
+                static_cast<unsigned char>(kAttributeValueDecoded)});
+        }
+    }
+
+    const auto enumeratedIt = dtdState_->enumeratedAttributes.find(elementNameString);
+    const auto nmTokenIt = dtdState_->nmTokenAttributes.find(elementNameString);
+    const auto nameIt = dtdState_->nameAttributes.find(elementNameString);
+    const auto idIt = dtdState_->idAttributes.find(elementNameString);
+
+    for (std::size_t index = 0; index < attributes.size(); ++index) {
+        if (idIt != dtdState_->idAttributes.end() && attributes[index].first == idIt->second) {
+            const std::string value = attributeValueAt(index);
+            if (!IsValidDtdName(value)) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + attributes[index].first
+                    + "' on element '" + elementNameString
+                    + "' must be a valid ID value");
+            }
+            if (!dtdState_->seenIdAttributeValues.insert(value).second) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + attributes[index].first
+                    + "' on element '" + elementNameString
+                    + "' duplicates ID value '" + value + "'");
+            }
+        }
+
+        if (nmTokenIt != dtdState_->nmTokenAttributes.end()) {
+            const auto nmTokenDeclaration = nmTokenIt->second.find(attributes[index].first);
+            if (nmTokenDeclaration != nmTokenIt->second.end()) {
+                const std::string value = attributeValueAt(index);
+                if (!IsValidDtdNmTokensValue(value, nmTokenDeclaration->second)) {
+                    throw XmlException(
+                        "DTD validation failed: attribute '" + attributes[index].first
+                        + "' on element '" + elementNameString
+                        + "' must be a valid "
+                        + std::string(nmTokenDeclaration->second ? "NMTOKENS" : "NMTOKEN")
+                        + " value");
+                }
+            }
+        }
+
+        if (nameIt != dtdState_->nameAttributes.end()) {
+            const auto nameDeclaration = nameIt->second.find(attributes[index].first);
+            if (nameDeclaration != nameIt->second.end()) {
+                const std::string value = attributeValueAt(index);
+                const bool allowsMultipleNames = nameDeclaration->second == "IDREFS" || nameDeclaration->second == "ENTITIES";
+                if (!IsValidDtdNamesValue(value, allowsMultipleNames)) {
+                    throw XmlException(
+                        "DTD validation failed: attribute '" + attributes[index].first
+                        + "' on element '" + elementNameString
+                        + "' must be a valid " + nameDeclaration->second + " value");
+                }
+
+                if (nameDeclaration->second == "ENTITY" || nameDeclaration->second == "ENTITIES") {
+                    ForEachDtdNamesValueToken(value, [&](std::string_view entityName) {
+                        if (dtdState_->unparsedEntityDeclarationNames.find(std::string(entityName))
+                            == dtdState_->unparsedEntityDeclarationNames.end()) {
+                            throw XmlException(
+                                "DTD validation failed: attribute '" + attributes[index].first
+                                + "' on element '" + elementNameString
+                                + "' must reference a declared unparsed " + nameDeclaration->second + " value");
+                        }
+                    });
+                } else if (nameDeclaration->second == "IDREF" || nameDeclaration->second == "IDREFS") {
+                    ForEachDtdNamesValueToken(value, [&](std::string_view idValue) {
+                        dtdState_->pendingIdAttributeReferences.push_back(PendingDtdIdReference{
+                            std::string(idValue),
+                            attributes[index].first,
+                            elementNameString});
+                    });
+                }
+            }
+        }
+    }
+
+    if (enumeratedIt == dtdState_->enumeratedAttributes.end()) {
+        return;
+    }
+
+    for (std::size_t index = 0; index < attributes.size(); ++index) {
+        const auto enumerationDeclaration = enumeratedIt->second.find(attributes[index].first);
+        if (enumerationDeclaration == enumeratedIt->second.end()) {
+            continue;
+        }
+
+        const std::string value = attributeValueAt(index);
+        if (!AttributeValueMatchesDtdEnumeration(value, enumerationDeclaration->second)) {
+            throw XmlException(
+                "DTD validation failed: attribute '" + attributes[index].first
+                + "' on element '" + elementNameString
+                + "' must match one of " + enumerationDeclaration->second);
+        }
+    }
+}
+
+void XmlReader::ValidatePendingDtdIdReferences() {
+    if (dtdState_ == nullptr || dtdState_->pendingIdAttributeReferences.empty()) {
+        return;
+    }
+
+    for (const auto& reference : dtdState_->pendingIdAttributeReferences) {
+        if (dtdState_->seenIdAttributeValues.find(reference.value) == dtdState_->seenIdAttributeValues.end()) {
+            throw XmlException(
+                "DTD validation failed: attribute '" + reference.attributeName
+                + "' on element '" + reference.elementName
+                + "' references unknown ID value '" + reference.value + "'");
+        }
+    }
+
+    dtdState_->pendingIdAttributeReferences.clear();
 }
 
 void XmlReader::FinalizeSuccessfulRead() {
@@ -2211,6 +2538,9 @@ void XmlReader::ParseDeclaration() {
     std::string version = "1.0";
     std::string encoding;
     std::string standalone;
+    bool sawVersion = false;
+    bool sawEncoding = false;
+    bool sawStandalone = false;
 
     while (true) {
         SkipWhitespace();
@@ -2248,17 +2578,48 @@ void XmlReader::ParseDeclaration() {
         const std::string value = DecodeEntities(SourceSubstr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart));
 
         if (name == "version") {
+            if (sawEncoding || sawStandalone) {
+                Throw("Malformed XML declaration");
+            }
+            if (sawVersion) {
+                Throw("Malformed XML declaration");
+            }
+            sawVersion = true;
+            ValidateXmlDeclarationVersion(value);
             version = value;
         } else if (name == "encoding") {
+            if (!sawVersion || sawStandalone) {
+                Throw("Malformed XML declaration");
+            }
+            if (sawEncoding) {
+                Throw("Malformed XML declaration");
+            }
+            sawEncoding = true;
+            ValidateXmlDeclarationEncoding(value);
             encoding = value;
         } else if (name == "standalone") {
+            if (!sawVersion) {
+                Throw("Malformed XML declaration");
+            }
+            if (sawStandalone) {
+                Throw("Malformed XML declaration");
+            }
+            sawStandalone = true;
+            if (value != "yes" && value != "no") {
+                Throw("Malformed XML declaration");
+            }
             standalone = value;
         } else {
             Throw("Unsupported XML declaration attribute: " + name);
         }
     }
 
+    if (!sawVersion) {
+        Throw("Malformed XML declaration");
+    }
+
     XmlDeclaration declaration(version, encoding, standalone);
+    documentDeclarationStandalone_ = declaration.Standalone();
     SetCurrentNode(
         XmlNodeType::XmlDeclaration,
         "xml",
@@ -2379,6 +2740,20 @@ void XmlReader::ParseDocumentType() {
             std::vector<std::shared_ptr<XmlNode>> notations;
             ParseDocumentTypeInternalSubset(internalSubset, entities, notations);
             RegisterDtdDeclarations(entities, notations);
+
+            DtdRequiredAttributeDeclarations requiredAttributes;
+            DtdDefaultAttributeDeclarations defaultAttributes;
+            DtdFixedAttributeDeclarations fixedAttributes;
+            DtdEnumeratedAttributeDeclarations enumeratedAttributes;
+            DtdEmptyElementDeclarations emptyElementDeclarations;
+            DtdIdAttributeDeclarations idAttributes;
+            DtdNotationAttributeDeclarations notationAttributes;
+            DtdNmTokenAttributeDeclarations nmTokenAttributes;
+            DtdNameAttributeDeclarations nameAttributes;
+            ParseDocumentTypeEmptyElementDeclarations(internalSubset, emptyElementDeclarations);
+            ParseDocumentTypeAttributeDeclarations(internalSubset, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes);
+            EnsureDtdState().emptyElementDeclarations.insert(emptyElementDeclarations.begin(), emptyElementDeclarations.end());
+            RegisterDtdAttributeDeclarations(idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes);
         }
         SkipWhitespace();
     }
@@ -2416,6 +2791,7 @@ void XmlReader::ParseDocumentType() {
         start,
         position_);
     SetCurrentNameParts({}, currentName_);
+    documentTypeName_ = currentName_;
     sawDocumentType_ = true;
 }
 
@@ -2515,6 +2891,11 @@ void XmlReader::ParseCData() {
         const auto [line, column] = ComputeLineColumn(valueStart + invalidDoubleHyphen);
         throw XmlException("Comment may not contain '--'", line, column);
     }
+    if (!elementStack_.empty() && dtdState_ != nullptr
+        && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
+        throw XmlException(
+            "DTD validation failed: element '" + elementStack_.back() + "' declared EMPTY must not contain character data");
+    }
     position_ = end + 3;
     AdvanceLineInfoFromInputSource(inputSource_.get(), start, position_, lineNumber_, linePosition_);
 
@@ -2524,6 +2905,11 @@ void XmlReader::ParseCData() {
 void XmlReader::ParseText() {
     XmlReaderTokenizer tokenizer(inputSource_.get());
     EnsureExternalSubsetDeclarationsLoaded();
+    if (!elementStack_.empty() && dtdState_ != nullptr
+        && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
+        throw XmlException(
+            "DTD validation failed: element '" + elementStack_.back() + "' declared EMPTY must not contain character data");
+    }
     const int textDepth = static_cast<int>(elementStack_.size());
     const bool preserveSpace = !xmlSpacePreserveStack_.empty() && xmlSpacePreserveStack_.back();
     std::string textBuffer;
@@ -2700,6 +3086,10 @@ void XmlReader::ParseText() {
         } else if (settings_.Resolver != nullptr) {
             const auto external = dtdState_->externalEntitySystemIds.find(entity);
             if (external != dtdState_->externalEntitySystemIds.end()) {
+                if (documentDeclarationStandalone_ == "yes") {
+                    throw XmlException(
+                        "Standalone document declaration must not use external general entity references");
+                }
                 const std::string absoluteUri = settings_.Resolver->ResolveUri(baseUri_, external->second);
                 resolvedValue = settings_.Resolver->GetEntity(absoluteUri);
                 if (settings_.MaxCharactersFromEntities != 0) {
@@ -2978,6 +3368,11 @@ void XmlReader::ParseElement() {
     const auto start = position_;
     ReadChar();
     std::string name = ParseName();
+    if (!elementStack_.empty() && dtdState_ != nullptr
+        && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
+        throw XmlException(
+            "DTD validation failed: element '" + elementStack_.back() + "' declared EMPTY must not contain child elements");
+    }
     const auto [elementPrefixView, elementLocalNameView] = SplitQualifiedNameView(name);
     const bool topLevelElement = elementStack_.empty();
     std::vector<std::pair<std::string, std::string>> attributes;
@@ -3026,6 +3421,41 @@ void XmlReader::ParseElement() {
         return true;
     };
 
+    auto applyXmlSpaceFromAttributes = [this, &attributes, &attributeValueMetadata, &preserveSpace, &sourceRangeEqualsLiteral]() {
+        for (std::size_t index = 0; index < attributes.size(); ++index) {
+            if (attributes[index].first != "xml:space") {
+                continue;
+            }
+
+            const auto& metadata = attributeValueMetadata[index];
+            if (metadata.valueStart == std::string::npos || metadata.valueEnd == std::string::npos) {
+                if (IsXmlSpacePreserve(attributes[index].second)) {
+                    preserveSpace = true;
+                } else if (IsXmlSpaceDefault(attributes[index].second)) {
+                    preserveSpace = false;
+                }
+                continue;
+            }
+
+            if ((metadata.flags & kAttributeValueNeedsDecoding) == 0) {
+                if (sourceRangeEqualsLiteral(metadata.valueStart, metadata.valueEnd, "preserve")) {
+                    preserveSpace = true;
+                } else if (sourceRangeEqualsLiteral(metadata.valueStart, metadata.valueEnd, "default")) {
+                    preserveSpace = false;
+                }
+                continue;
+            }
+
+            std::string attributeValue = SourceSubstr(metadata.valueStart, metadata.valueEnd - metadata.valueStart);
+            attributeValue = DecodeEntities(attributeValue);
+            if (IsXmlSpacePreserve(attributeValue)) {
+                preserveSpace = true;
+            } else if (IsXmlSpaceDefault(attributeValue)) {
+                preserveSpace = false;
+            }
+        }
+    };
+
     while (true) {
         const auto whitespaceStart = position_;
         tokenizer.SkipWhitespace(position_);
@@ -3035,6 +3465,11 @@ void XmlReader::ParseElement() {
         if (tokenizer.ConsumeStartTagClose(position_, isEmptyElement)) {
             AdvanceLineInfoFromInputSource(inputSource_.get(), closeStart, position_, lineNumber_, linePosition_);
             if (isEmptyElement) {
+                ApplyDtdAttributeDeclarations(name, attributes, attributeValueMetadata, retainLocalNamespaceDeclarationsForAttributes);
+                applyXmlSpaceFromAttributes();
+                if (topLevelElement && !documentTypeName_.empty() && name != documentTypeName_) {
+                    Throw("Document type name '" + documentTypeName_ + "' does not match root element name '" + name + "'");
+                }
                 std::string nsUri = lookupNamespaceInScopes(elementPrefixView);
                 SetCurrentNode(
                     XmlNodeType::Element,
@@ -3053,9 +3488,7 @@ void XmlReader::ParseElement() {
                     {},
                     start,
                     position_);
-                currentLocalNamespaceDeclarations_ = retainLocalNamespaceDeclarationsForAttributes
-                    ? localNamespaceDeclarations
-                    : std::vector<std::pair<std::string, std::string>>{};
+                currentLocalNamespaceDeclarations_ = localNamespaceDeclarations;
                 currentAttributeValueMetadata_ = std::move(attributeValueMetadata);
                 RefreshCurrentEarliestRetainedAttributeValueStart();
                 if (topLevelElement) {
@@ -3122,12 +3555,14 @@ void XmlReader::ParseElement() {
             if (needsDecoding) {
                 attributeValue = DecodeEntities(attributeValue);
             }
+            ValidateNamespaceDeclarationBinding({}, attributeValue);
             setLocalNamespaceDeclaration({}, std::move(attributeValue));
         } else if (attributeName.rfind("xmlns:", 0) == 0) {
             std::string attributeValue = SourceSubstr(rawValueStart, rawValueEnd - rawValueStart);
             if (needsDecoding) {
                 attributeValue = DecodeEntities(attributeValue);
             }
+            ValidateNamespaceDeclarationBinding(attributeName.substr(6), attributeValue);
             setLocalNamespaceDeclaration(attributeName.substr(6), std::move(attributeValue));
         } else if (attributeName == "xml:space") {
             if (!needsDecoding) {
@@ -3148,11 +3583,15 @@ void XmlReader::ParseElement() {
         }
     }
 
+    ApplyDtdAttributeDeclarations(name, attributes, attributeValueMetadata, retainLocalNamespaceDeclarationsForAttributes);
+    applyXmlSpaceFromAttributes();
+    if (topLevelElement && !documentTypeName_.empty() && name != documentTypeName_) {
+        Throw("Document type name '" + documentTypeName_ + "' does not match root element name '" + name + "'");
+    }
+
     const bool pushedNamespaceScope = !localNamespaceDeclarations.empty();
     const std::string elementNamespaceUri = lookupNamespaceInScopes(elementPrefixView);
-    currentLocalNamespaceDeclarations_ = retainLocalNamespaceDeclarationsForAttributes
-        ? localNamespaceDeclarations
-        : std::vector<std::pair<std::string, std::string>>{};
+    currentLocalNamespaceDeclarations_ = localNamespaceDeclarations;
     if (pushedNamespaceScope) {
         namespaceScopes_.push_back(std::move(localNamespaceDeclarations));
     }
@@ -3245,6 +3684,10 @@ void XmlReader::ParseEndElement() {
         popNamespaceScope = namespaceScopeFramePushedStack_.back();
         namespaceScopeFramePushedStack_.pop_back();
     }
+    std::vector<std::pair<std::string, std::string>> endElementLocalNamespaceDeclarations;
+    if (popNamespaceScope && namespaceScopes_.size() > 1) {
+        endElementLocalNamespaceDeclarations = namespaceScopes_.back();
+    }
     bool popXmlSpacePreserve = false;
     if (!xmlSpacePreserveFramePushedStack_.empty()) {
         popXmlSpacePreserve = xmlSpacePreserveFramePushedStack_.back();
@@ -3273,6 +3716,7 @@ void XmlReader::ParseEndElement() {
         std::string::npos,
         start,
         position_);
+    currentLocalNamespaceDeclarations_ = std::move(endElementLocalNamespaceDeclarations);
 }
 
 std::string XmlReader::LookupNamespaceUri(std::string_view prefix) const {
@@ -3582,6 +4026,8 @@ void XmlReader::InitializeInputState() {
     namespaceScopeFramePushedStack_.clear();
     xmlSpacePreserveStack_.clear();
     xmlSpacePreserveFramePushedStack_.clear();
+    documentDeclarationStandalone_.clear();
+    documentTypeName_.clear();
     namespaceScopes_.push_back({});
     namespaceScopes_.back().emplace_back("xml", "http://www.w3.org/XML/1998/namespace");
     namespaceScopes_.back().emplace_back("xmlns", "http://www.w3.org/2000/xmlns/");
@@ -3758,6 +4204,7 @@ bool XmlReader::Read() {
         }
 
         if (!HasSourceChar(position_)) {
+            ValidatePendingDtdIdReferences();
             MaybeDiscardSourcePrefix();
             eof_ = true;
             return false;
@@ -4130,6 +4577,12 @@ bool XmlReader::MoveToElement() {
 }
 
 std::string XmlReader::LookupNamespace(std::string_view prefix) const {
+    for (auto it = currentLocalNamespaceDeclarations_.rbegin(); it != currentLocalNamespaceDeclarations_.rend(); ++it) {
+        if (it->first == prefix) {
+            return it->second;
+        }
+    }
+
     return LookupNamespaceUri(prefix);
 }
 

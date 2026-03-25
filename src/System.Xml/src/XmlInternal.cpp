@@ -54,6 +54,42 @@ const std::string& EmptyString() {
     return empty;
 }
 
+void ValidateXmlDeclarationVersion(std::string_view version) {
+    if (version != "1.0") {
+        throw XmlException("Malformed XML declaration");
+    }
+}
+
+void ValidateXmlDeclarationEncoding(std::string_view encoding) {
+    if (encoding.empty()) {
+        return;
+    }
+
+    const auto isAsciiAlpha = [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+    };
+    const auto isAsciiDigit = [](char ch) {
+        return ch >= '0' && ch <= '9';
+    };
+
+    if (!isAsciiAlpha(encoding.front())) {
+        throw XmlException("Malformed XML declaration");
+    }
+
+    for (const char ch : encoding) {
+        if (isAsciiAlpha(ch) || isAsciiDigit(ch) || ch == '.' || ch == '_' || ch == '-') {
+            continue;
+        }
+        throw XmlException("Malformed XML declaration");
+    }
+}
+
+void ValidateXmlDeclarationStandalone(std::string_view standalone) {
+    if (!standalone.empty() && standalone != "yes" && standalone != "no") {
+        throw XmlException("Malformed XML declaration");
+    }
+}
+
 std::string BuildDeclarationValue(
     const std::string& version,
     const std::string& encoding,

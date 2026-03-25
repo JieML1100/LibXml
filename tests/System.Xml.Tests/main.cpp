@@ -1003,6 +1003,17 @@ void TestInvalidDtdInputs() {
         Assert(threw, label);
     };
 
+    auto expectCreateDocumentTypeExceptionContaining = [](const std::string& internalSubset, const std::string& expectedMessage, const std::string& label) {
+        bool threw = false;
+        try {
+            XmlDocument document;
+            (void)document.CreateDocumentType("root", {}, {}, internalSubset);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find(expectedMessage) != std::string::npos;
+        }
+        Assert(threw, label);
+    };
+
     {
         const auto document = XmlDocument::Parse(
             "<!DOCTYPE root [<!ELEMENT root ANY><!ATTLIST root id CDATA #IMPLIED><!ENTITY label 'ok'>]><root id='42'/>");
@@ -1057,6 +1068,31 @@ void TestInvalidDtdInputs() {
         "Malformed ENTITY declarations should report a stable XmlException");
 
     expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover 'inline' NDATA jpg>]><root/>",
+        "Malformed DTD entity declaration",
+        "XmlDocument should reject internal entities that declare NDATA notation metadata");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg>]><root/>",
+        "references undeclared notation 'jpg'",
+        "XmlDocument should reject unparsed entities whose NDATA notation is undeclared");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY author 'Anne'><!ENTITY author 'Bronte'>]><root/>",
+        "duplicate entity declaration 'author'",
+        "XmlDocument should reject duplicate general entity declarations");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION jpg SYSTEM 'image/png'>]><root/>",
+        "duplicate notation declaration 'jpg'",
+        "XmlDocument should reject duplicate notation declarations");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY lt 'less-than'>]><root/>",
+        "must not redefine a predefined entity",
+        "XmlDocument should reject redefinition of predefined XML entities");
+
+    expectXmlExceptionContaining(
         "<!DOCTYPE root [<!NOTATION jpg SYSTEM>]><root/>",
         "Malformed DTD notation declaration",
         "Malformed NOTATION declarations should report a stable XmlException");
@@ -1081,10 +1117,120 @@ void TestInvalidDtdInputs() {
         "Expected '>' after DOCTYPE",
         "DOCTYPE headers with trailing tokens should report a stable closing token error");
 
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root mode INVALID_TYPE #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject ATTLIST declarations that use unknown attribute types");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root format NOTATION CDATA #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject NOTATION ATTLIST declarations without a parenthesized value set");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id ID 'fallback'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject ID ATTLIST declarations that specify a direct default value");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id ID #FIXED 'fallback'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject ID ATTLIST declarations that specify a fixed default value");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root mode (sync|sync) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject enumeration ATTLIST declarations with duplicate values");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!ATTLIST root format NOTATION (jpg|jpg) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject NOTATION ATTLIST declarations with duplicate values");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id ID #IMPLIED><!ATTLIST root code ID #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject element types that declare more than one ID attribute in the same subset");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #IMPLIED><!ATTLIST root media NOTATION (jpg|png) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject element types that declare more than one NOTATION attribute in the same subset");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root mode (sync|async) 'manual'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject enumeration ATTLIST declarations whose default value is outside the declared value set");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #FIXED 'gif'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject NOTATION ATTLIST declarations whose fixed value is outside the declared value set");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root token NMTOKEN 'bad value'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject NMTOKEN ATTLIST declarations whose default value is not a valid NMTOKEN");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root tokens NMTOKENS #FIXED 'alpha beta gamma?'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject NMTOKENS ATTLIST declarations whose fixed value is not a valid NMTOKENS list");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root target IDREF 'bad value'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject IDREF ATTLIST declarations whose default value is not a valid Name");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root refs ENTITIES #FIXED 'cover bad?'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject ENTITIES ATTLIST declarations whose fixed value is not a valid Names list");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root xml:space CDATA #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject xml:space ATTLIST declarations that are not enumerations");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root xml:space (default|custom) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument should reject xml:space ATTLIST declarations whose value set contains tokens other than default/preserve");
+
+    expectXmlExceptionContaining(
+        "<!DOCTYPE root><child/>",
+        "Document type name 'root' does not match root element name 'child'",
+        "XmlDocument should reject documents whose DOCTYPE name does not match the root element name");
+
     expectReaderXmlExceptionContaining(
         "<!DOCTYPE root SYSTEM><root/>",
         "Expected quoted value",
         "XmlReader should reject SYSTEM doctypes without a system literal");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover 'inline' NDATA jpg>]><root/>",
+        "Malformed DTD entity declaration",
+        "XmlReader should reject internal entities that declare NDATA notation metadata");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg>]><root/>",
+        "references undeclared notation 'jpg'",
+        "XmlReader should reject unparsed entities whose NDATA notation is undeclared");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY author 'Anne'><!ENTITY author 'Bronte'>]><root/>",
+        "duplicate entity declaration 'author'",
+        "XmlReader should reject duplicate general entity declarations");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION jpg SYSTEM 'image/png'>]><root/>",
+        "duplicate notation declaration 'jpg'",
+        "XmlReader should reject duplicate notation declarations");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ENTITY lt 'less-than'>]><root/>",
+        "must not redefine a predefined entity",
+        "XmlReader should reject redefinition of predefined XML entities");
 
     expectReaderXmlExceptionContaining(
         "<!DOCTYPE root PUBLIC \"-//LibXML//DTD Root 1.0//EN\"><root/>",
@@ -1096,11 +1242,776 @@ void TestInvalidDtdInputs() {
         "Expected '>' after DOCTYPE",
         "XmlReader should reject trailing tokens after the DOCTYPE header with a stable error");
 
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root mode INVALID_TYPE #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject ATTLIST declarations that use unknown attribute types");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root format NOTATION CDATA #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject NOTATION ATTLIST declarations without a parenthesized value set");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id ID 'fallback'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject ID ATTLIST declarations that specify a direct default value");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id ID #FIXED 'fallback'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject ID ATTLIST declarations that specify a fixed default value");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root mode (sync||async) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject enumeration ATTLIST declarations with empty value items");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!ATTLIST root format NOTATION (jpg|bad value) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject NOTATION ATTLIST declarations whose value set contains invalid names");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root id ID #IMPLIED><!ATTLIST root code ID #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject element types that declare more than one ID attribute in the same subset");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #IMPLIED><!ATTLIST root media NOTATION (jpg|png) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject element types that declare more than one NOTATION attribute in the same subset");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root mode (sync|async) #FIXED 'manual'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject enumeration ATTLIST declarations whose fixed value is outside the declared value set");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) 'gif'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject NOTATION ATTLIST declarations whose default value is outside the declared value set");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root token NMTOKEN #FIXED 'bad value'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject NMTOKEN ATTLIST declarations whose fixed value is not a valid NMTOKEN");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root tokens NMTOKENS 'alpha beta gamma?'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject NMTOKENS ATTLIST declarations whose default value is not a valid NMTOKENS list");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root target IDREFS #FIXED 'alpha bad?'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject IDREFS ATTLIST declarations whose fixed value is not a valid Names list");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root ref ENTITY 'bad value'>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject ENTITY ATTLIST declarations whose default value is not a valid Name");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root xml:space NMTOKEN #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject xml:space ATTLIST declarations that are not enumerations");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root [<!ATTLIST root xml:space (preserve|inherit) #IMPLIED>]><root/>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlReader should reject xml:space ATTLIST declarations whose value set contains tokens other than default/preserve");
+
+    expectReaderXmlExceptionContaining(
+        "<!DOCTYPE root><child/>",
+        "Document type name 'root' does not match root element name 'child'",
+        "XmlReader should reject documents whose DOCTYPE name does not match the root element name");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg>",
+        "references undeclared notation 'jpg'",
+        "XmlDocument::CreateDocumentType should reject unparsed entities whose NDATA notation is undeclared");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover 'inline' NDATA jpg>",
+        "Malformed DTD entity declaration",
+        "XmlDocument::CreateDocumentType should reject internal entities that declare NDATA notation metadata");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ENTITY author 'Anne'><!ENTITY author 'Bronte'>",
+        "duplicate entity declaration 'author'",
+        "XmlDocument::CreateDocumentType should reject duplicate general entity declarations");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION jpg SYSTEM 'image/png'>",
+        "duplicate notation declaration 'jpg'",
+        "XmlDocument::CreateDocumentType should reject duplicate notation declarations");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ENTITY lt 'less-than'>",
+        "must not redefine a predefined entity",
+        "XmlDocument::CreateDocumentType should reject redefinition of predefined XML entities");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root mode INVALID_TYPE #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject ATTLIST declarations that use unknown attribute types");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root format NOTATION CDATA #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject NOTATION ATTLIST declarations without a parenthesized value set");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root id ID 'fallback'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject ID ATTLIST declarations that specify a direct default value");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root id ID #FIXED 'fallback'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject ID ATTLIST declarations that specify a fixed default value");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root mode (sync|manual mode) #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject enumeration ATTLIST declarations whose value set contains invalid NMTOKENs");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!NOTATION jpg SYSTEM 'image/jpeg'><!ATTLIST root format NOTATION (jpg||png) #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject NOTATION ATTLIST declarations with empty value items");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root id ID #IMPLIED><!ATTLIST root code ID #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject element types that declare more than one ID attribute in the same subset");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #IMPLIED><!ATTLIST root media NOTATION (jpg|png) #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject element types that declare more than one NOTATION attribute in the same subset");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root mode (sync|async) 'manual'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject enumeration ATTLIST declarations whose default value is outside the declared value set");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #FIXED 'gif'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject NOTATION ATTLIST declarations whose fixed value is outside the declared value set");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root token NMTOKEN 'bad value'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject NMTOKEN ATTLIST declarations whose default value is not a valid NMTOKEN");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root tokens NMTOKENS #FIXED 'alpha beta gamma?'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject NMTOKENS ATTLIST declarations whose fixed value is not a valid NMTOKENS list");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root target IDREF 'bad value'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject IDREF ATTLIST declarations whose default value is not a valid Name");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root refs ENTITIES #FIXED 'cover bad?'>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject ENTITIES ATTLIST declarations whose fixed value is not a valid Names list");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root xml:space CDATA #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject xml:space ATTLIST declarations that are not enumerations");
+
+    expectCreateDocumentTypeExceptionContaining(
+        "<!ATTLIST root xml:space (default|custom) #IMPLIED>",
+        "Malformed DTD ATTLIST declaration",
+        "XmlDocument::CreateDocumentType should reject xml:space ATTLIST declarations whose value set contains tokens other than default/preserve");
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!ATTLIST root code ID #IMPLIED>"}});
+
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root SYSTEM 'catalog.dtd' [<!ATTLIST root id ID #IMPLIED>]><root/>",
+                settings);
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must not declare more than one ID attribute") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject element types that declare conflicting ID attributes across external and internal subsets");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root media NOTATION (jpg|png) #IMPLIED>"}});
+
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root SYSTEM 'catalog.dtd' [<!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #IMPLIED>]><root/>",
+                settings);
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must not declare more than one NOTATION attribute") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject element types that declare conflicting NOTATION attributes across external and internal subsets");
+    }
+
+    {
+        XmlReaderSettings settings;
+        bool threw = false;
+        try {
+            XmlDocument document;
+            document.LoadXml("<!DOCTYPE root><child/>", settings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Document type name 'root' does not match root element name 'child'") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument settings path should reject documents whose DOCTYPE name does not match the root element name");
+    }
+
     {
         XmlReader reader = XmlReader::Create(
             "<!DOCTYPE root [<!ELEMENT root ANY><!ATTLIST root id CDATA #IMPLIED>]><root id='42'/>");
         while (reader.Read()) {
         }
+    }
+}
+
+void TestDtdAttributeDefaultsAndValidation() {
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root lang CDATA 'en'><!ATTLIST root mode CDATA #FIXED 'sync'>]>"
+            "<root/>");
+        Assert(document->DocumentElement() != nullptr, "DTD default-attribute document should have a root element");
+        Assert(document->DocumentElement()->GetAttribute("lang") == "en",
+            "XmlDocument::Parse should materialize DTD default attributes from the internal subset");
+        Assert(document->DocumentElement()->GetAttribute("mode") == "sync",
+            "XmlDocument::Parse should materialize DTD fixed attributes when they are omitted");
+    }
+
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root lang CDATA 'first'><!ATTLIST root lang CDATA 'second'><!ATTLIST root mode CDATA #FIXED 'sync'><!ATTLIST root mode CDATA #FIXED 'async'>]>"
+            "<root/>");
+        Assert(document->DocumentElement() != nullptr, "Duplicate ATTLIST declaration test should have a root element");
+        Assert(document->DocumentElement()->GetAttribute("lang") == "first",
+            "XmlDocument::Parse should keep the first default attribute declaration when ATTLIST repeats the same attribute");
+        Assert(document->DocumentElement()->GetAttribute("mode") == "sync",
+            "XmlDocument::Parse should keep the first fixed attribute declaration when ATTLIST repeats the same attribute");
+    }
+
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root id CDATA 'first'><!ATTLIST root id CDATA #REQUIRED><!ATTLIST root mode CDATA 'default'><!ATTLIST root mode CDATA #FIXED 'locked'>]>"
+            "<root/>");
+        Assert(document->DocumentElement() != nullptr, "Cross-kind duplicate ATTLIST test should have a root element");
+        Assert(document->DocumentElement()->GetAttribute("id") == "first",
+            "XmlDocument::Parse should keep the first attribute declaration when a later ATTLIST repeats the same attribute with #REQUIRED");
+        Assert(document->DocumentElement()->GetAttribute("mode") == "default",
+            "XmlDocument::Parse should keep the first attribute declaration when a later ATTLIST repeats the same attribute with #FIXED");
+    }
+
+    {
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root lang CDATA 'en'><!ATTLIST root mode CDATA #FIXED 'sync'>]>"
+            "<root/>");
+        bool sawRoot = false;
+        while (reader.Read()) {
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "root") {
+                continue;
+            }
+
+            sawRoot = true;
+            Assert(reader.AttributeCount() == 2,
+                "XmlReader should expose DTD default and fixed attributes on the element node");
+            Assert(reader.GetAttribute("lang") == "en",
+                "XmlReader should surface internal-subset default attribute values");
+            Assert(reader.GetAttribute("mode") == "sync",
+                "XmlReader should surface omitted fixed attribute values");
+            break;
+        }
+        Assert(sawRoot, "XmlReader default-attribute test should observe the root element");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root id CDATA #REQUIRED>]><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("required attribute 'id'") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject elements missing DTD-required attributes");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root id CDATA #REQUIRED><!ATTLIST root id CDATA 'fallback'>]><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("required attribute 'id'") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should keep the first ATTLIST declaration when a later duplicate tries to replace #REQUIRED with a default value");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root mode CDATA #FIXED 'sync'>]><root mode='async'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("fixed value 'sync'") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject DTD fixed-attribute mismatches");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root mode (sync|async) 'sync'>]><root mode='manual'/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must match one of (sync|async)") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject attribute values outside an ATTLIST enumeration");
+    }
+
+    {
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root mode (sync|async) 'sync'>]><root/>");
+        bool sawRoot = false;
+        while (reader.Read()) {
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "root") {
+                continue;
+            }
+
+            sawRoot = true;
+            Assert(reader.GetAttribute("mode") == "sync",
+                "XmlReader should materialize enumerated default attributes when the default matches the allowed value set");
+            break;
+        }
+        Assert(sawRoot, "Enumerated default-attribute reader test should observe the root element");
+    }
+
+    {
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root token NMTOKEN 'alpha'><!ATTLIST root tokens NMTOKENS 'alpha beta'>]><root/>");
+        bool sawRoot = false;
+        while (reader.Read()) {
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "root") {
+                continue;
+            }
+
+            sawRoot = true;
+            Assert(reader.GetAttribute("token") == "alpha",
+                "XmlReader should materialize valid NMTOKEN default attributes");
+            Assert(reader.GetAttribute("tokens") == "alpha beta",
+                "XmlReader should materialize valid NMTOKENS default attributes");
+            break;
+        }
+        Assert(sawRoot, "NMTOKEN/NMTOKENS default-attribute reader test should observe the root element");
+    }
+
+    {
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root ANY><!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg><!ENTITY thumb SYSTEM 'thumb.jpg' NDATA jpg><!ATTLIST root target IDREF 'item'><!ATTLIST root refs ENTITIES 'cover thumb'>]><root><item id='item'/></root>");
+        bool sawRoot = false;
+        while (reader.Read()) {
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "root") {
+                continue;
+            }
+
+            sawRoot = true;
+            Assert(reader.GetAttribute("target") == "item",
+                "XmlReader should materialize valid IDREF default attributes");
+            Assert(reader.GetAttribute("refs") == "cover thumb",
+                "XmlReader should materialize valid ENTITIES default attributes");
+            break;
+        }
+        Assert(sawRoot, "IDREF/ENTITIES default-attribute reader test should observe the root element");
+    }
+
+    {
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root ANY><!ATTLIST root xml:space (default|preserve) 'preserve'>]><root>  </root>");
+        bool sawRoot = false;
+        bool sawSignificantWhitespace = false;
+        while (reader.Read()) {
+            if (reader.NodeType() == XmlNodeType::Element && reader.Name() == "root") {
+                sawRoot = true;
+                Assert(reader.GetAttribute("xml:space") == "preserve",
+                    "XmlReader should materialize xml:space DTD default attributes");
+                continue;
+            }
+
+            if (reader.NodeType() == XmlNodeType::SignificantWhitespace && reader.Value() == "  ") {
+                sawSignificantWhitespace = true;
+            }
+        }
+        Assert(sawRoot, "xml:space default-attribute reader test should observe the root element");
+        Assert(sawSignificantWhitespace,
+            "XmlReader should treat whitespace as significant when xml:space='preserve' is supplied by a DTD default attribute");
+    }
+
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root ANY><!ATTLIST root xml:space (default|preserve) 'preserve'>]><root>  </root>");
+        Assert(document->DocumentElement() != nullptr, "xml:space default-attribute document should have a root element");
+        Assert(document->DocumentElement()->GetAttribute("xml:space") == "preserve",
+            "XmlDocument::Parse should materialize xml:space DTD default attributes");
+        Assert(document->DocumentElement()->ChildNodeList().Count() == 1,
+            "XmlDocument::Parse should retain whitespace-only child nodes when xml:space='preserve' is supplied by a DTD default attribute");
+        Assert(document->DocumentElement()->ChildNodeList().Item(0)->NodeType() == XmlNodeType::SignificantWhitespace,
+            "XmlDocument::Parse should classify whitespace as SignificantWhitespace when xml:space='preserve' is supplied by a DTD default attribute");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root mode (sync|async) #IMPLIED>]><root mode='manual'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must match one of (sync|async)") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject attribute values outside an ATTLIST enumeration");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root token NMTOKEN #IMPLIED>]><root token='bad value'/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must be a valid NMTOKEN value") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject explicit NMTOKEN attribute values that violate lexical constraints");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root tokens NMTOKENS #IMPLIED>]><root tokens='alpha beta gamma?'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must be a valid NMTOKENS value") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject explicit NMTOKENS attribute values that violate lexical constraints");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root refs IDREFS #IMPLIED>]><root refs='item bad?'/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must be a valid IDREFS value") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject explicit IDREFS attribute values that violate Name-list lexical constraints");
+    }
+
+    {
+        const auto document = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root ANY><!ELEMENT item EMPTY><!ATTLIST root target IDREF #IMPLIED><!ATTLIST item id ID #IMPLIED>]><root target='item'><item id='item'/></root>");
+        Assert(document->DocumentElement() != nullptr && document->DocumentElement()->GetAttribute("target") == "item",
+            "XmlDocument::Parse should allow DTD IDREF attributes to resolve against later ID declarations in the same document");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root ANY><!ELEMENT item EMPTY><!ATTLIST root target IDREF #IMPLIED><!ATTLIST item id ID #IMPLIED>]><root target='missing'><item id='item'/></root>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("references unknown ID value 'missing'") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject DTD IDREF attribute values that do not resolve to any declared ID");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root id ID #IMPLIED>]><root id='bad value'/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must be a valid ID value") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject explicit ID attribute values that violate Name lexical constraints");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ENTITY author 'inline'><!ATTLIST root ref ENTITY #IMPLIED>]><root ref='author'/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared unparsed ENTITY value") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject ENTITY attribute values that do not reference declared unparsed entities");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root ANY><!ELEMENT item EMPTY><!ATTLIST item id ID #IMPLIED>]><root><item id='dup'/><item id='dup'/></root>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("duplicates ID value 'dup'") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject duplicate DTD ID attribute values within the same document");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg><!ATTLIST root refs ENTITIES 'cover missing'>]><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared unparsed ENTITIES value") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject ENTITIES default attributes that reference undeclared unparsed entities");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root ref ENTITY #IMPLIED>]><root ref='bad value'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must be a valid ENTITY value") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject explicit ENTITY attribute values that violate Name lexical constraints");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ENTITY author 'inline'><!ATTLIST root ref ENTITY #IMPLIED>]><root ref='author'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared unparsed ENTITY value") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject ENTITY attribute values that do not reference declared unparsed entities");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root id ID #IMPLIED>]><root id='bad value'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must be a valid ID value") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject explicit ID attribute values that violate Name lexical constraints");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root ANY><!ELEMENT item EMPTY><!ATTLIST item id ID #IMPLIED>]><root><item id='dup'/><item id='dup'/></root>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("duplicates ID value 'dup'") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject duplicate DTD ID attribute values within the same document");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root ANY><!ELEMENT item EMPTY><!ATTLIST root refs IDREFS #IMPLIED><!ATTLIST item id ID #IMPLIED>]><root refs='item item2'><item id='item'/><item id='item2'/></root>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException&) {
+            threw = true;
+        }
+        Assert(!threw, "XmlReader should allow DTD IDREFS attribute values to resolve against later ID declarations by end of document");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root ANY><!ELEMENT item EMPTY><!ATTLIST root refs IDREFS #IMPLIED><!ATTLIST item id ID #IMPLIED>]><root refs='item missing'><item id='item'/></root>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("references unknown ID value 'missing'") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject DTD IDREFS attribute values that do not resolve to declared IDs by end of document");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!NOTATION jpg SYSTEM 'image/jpeg'><!NOTATION png SYSTEM 'image/png'><!ATTLIST root format NOTATION (jpg|png) #IMPLIED>]><root format='gif'/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("must match one of (jpg|png)") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject NOTATION attribute values outside the declared value set");
+    }
+
+    {
+        const auto parsedDocument = XmlDocument::Parse(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root></root>");
+        Assert(parsedDocument->DocumentElement() != nullptr && parsedDocument->DocumentElement()->Name() == "root",
+            "XmlDocument::Parse should allow EMPTY elements with no child content");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root>text</root>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared EMPTY must not contain character data") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject character data inside DTD EMPTY elements");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ELEMENT child EMPTY>]><root><child/></root>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared EMPTY must not contain child elements") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject child elements inside DTD EMPTY elements");
+    }
+
+    {
+        bool sawRoot = false;
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root></root>");
+        while (reader.Read()) {
+            if (reader.NodeType() == XmlNodeType::Element && reader.Name() == "root") {
+                sawRoot = true;
+            }
+        }
+        Assert(sawRoot, "XmlReader should allow EMPTY elements with no child content");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root><![CDATA[text]]></root>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared EMPTY must not contain character data") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject CDATA inside DTD EMPTY elements");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<!DOCTYPE root [<!ELEMENT root EMPTY><!ELEMENT child EMPTY>]><root><child/></root>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("declared EMPTY must not contain child elements") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject child elements inside DTD EMPTY elements");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!ATTLIST root source CDATA 'external'>"}});
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root SYSTEM 'catalog.dtd'><root/>",
+            settings);
+        bool sawRoot = false;
+        while (reader.Read()) {
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "root") {
+                continue;
+            }
+
+            sawRoot = true;
+            Assert(reader.GetAttribute("source") == "external",
+                "XmlReader should materialize DTD default attributes from the external subset");
+            break;
+        }
+        Assert(sawRoot, "External-subset DTD default-attribute test should observe the root element");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!ATTLIST root source CDATA 'external'><!ATTLIST root mode CDATA #FIXED 'async'><!ATTLIST root extra CDATA 'ext'>"}});
+        XmlReader reader = XmlReader::Create(
+            "<!DOCTYPE root SYSTEM 'catalog.dtd' [<!ATTLIST root source CDATA 'internal'><!ATTLIST root mode CDATA #FIXED 'sync'>]><root/>",
+            settings);
+        bool sawRoot = false;
+        while (reader.Read()) {
+            if (reader.NodeType() != XmlNodeType::Element || reader.Name() != "root") {
+                continue;
+            }
+
+            sawRoot = true;
+            Assert(reader.GetAttribute("source") == "internal",
+                "XmlReader should keep the first default attribute declaration when an external subset repeats an internally declared attribute");
+            Assert(reader.GetAttribute("mode") == "sync",
+                "XmlReader should keep the first fixed attribute declaration when an external subset repeats an internally declared attribute");
+            Assert(reader.GetAttribute("extra") == "ext",
+                "XmlReader should still materialize new external-subset default attributes that do not duplicate prior declarations");
+            break;
+        }
+        Assert(sawRoot, "Reader duplicate ATTLIST merge test should observe the root element");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!ATTLIST root source CDATA 'external'><!ATTLIST root mode CDATA #FIXED 'async'><!ATTLIST root extra CDATA 'ext'>"}});
+        XmlDocument document;
+        document.LoadXml(
+            "<!DOCTYPE root SYSTEM 'catalog.dtd' [<!ATTLIST root source CDATA 'internal'><!ATTLIST root mode CDATA #FIXED 'sync'>]><root/>",
+            settings);
+        Assert(document.DocumentElement() != nullptr, "XmlDocument settings duplicate ATTLIST merge test should have a root element");
+        Assert(document.DocumentElement()->GetAttribute("source") == "internal",
+            "XmlDocument settings path should keep the first default attribute declaration when an external subset repeats an internally declared attribute");
+        Assert(document.DocumentElement()->GetAttribute("mode") == "sync",
+            "XmlDocument settings path should keep the first fixed attribute declaration when an external subset repeats an internally declared attribute");
+        Assert(document.DocumentElement()->GetAttribute("extra") == "ext",
+            "XmlDocument settings path should still materialize new external-subset default attributes that do not duplicate prior declarations");
     }
 }
 
@@ -1405,6 +2316,286 @@ void TestGenerateDocument() {
         "DOCTYPE should be written");
     Assert(output.find("<book id=\"b2\">A&amp;B<!--payload--><![CDATA[<unsafe/>]]></book>") != std::string::npos,
         "Element payload should be serialized");
+}
+
+void TestXmlDeclarationValidation() {
+    {
+        const auto document = XmlDocument::Parse("<?xml version='1.0' standalone='no'?><root/>");
+        Assert(document->FirstChild() != nullptr && document->FirstChild()->NodeType() == XmlNodeType::XmlDeclaration,
+            "Valid standalone='no' should preserve the XML declaration node");
+        Assert(static_cast<XmlDeclaration*>(document->FirstChild().get())->Standalone() == "no",
+            "XML declaration standalone value should round-trip when valid");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("<?xml version='1.0' standalone='maybe'?><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject XML declarations with invalid standalone values");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create("<?xml version='1.0' standalone='maybe'?><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject XML declarations with invalid standalone values");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("<?xml version='1.0' encoding='utf-8' encoding='utf-16'?><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject XML declarations with duplicate attributes");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create("<?xml version='1.0' encoding='utf-8' encoding='utf-16'?><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject XML declarations with duplicate attributes");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("<?xml encoding='utf-8'?><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject XML declarations that omit version");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create("<?xml encoding='utf-8'?><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject XML declarations that omit version");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("<?xml version='1.1'?><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject XML declarations whose version is not 1.0");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create("<?xml version='1.1'?><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject XML declarations whose version is not 1.0");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlDocument document;
+            (void)document.CreateXmlDeclaration("1.1", "utf-8", {});
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::CreateXmlDeclaration should reject declaration versions other than 1.0");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlWriter writer;
+            writer.WriteStartDocument("1.1", "utf-8", {});
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlWriter::WriteStartDocument should reject declaration versions other than 1.0");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("<?xml version='1.0' encoding='1utf-8'?><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject XML declarations with invalid encoding names");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create("<?xml version='1.0' encoding='1utf-8'?><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject XML declarations with invalid encoding names");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlDocument document;
+            (void)document.CreateXmlDeclaration("1.0", "1utf-8", {});
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::CreateXmlDeclaration should reject invalid encoding names");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlWriter writer;
+            writer.WriteStartDocument("1.0", "1utf-8", {});
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlWriter::WriteStartDocument should reject invalid encoding names");
+    }
+
+    {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse("<?xml standalone='yes' version='1.0'?><root/>");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::Parse should reject XML declarations with attributes out of order");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create("<?xml standalone='yes' version='1.0'?><root/>");
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject XML declarations with attributes out of order");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlDocument document;
+            (void)document.CreateXmlDeclaration("1.0", "utf-8", "maybe");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument::CreateXmlDeclaration should reject invalid standalone values");
+    }
+
+    {
+        bool threw = false;
+        try {
+            XmlWriter writer;
+            writer.WriteStartDocument("1.0", "utf-8", "maybe");
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Malformed XML declaration") != std::string::npos;
+        }
+        Assert(threw, "XmlWriter::WriteStartDocument should reject invalid standalone values");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!ATTLIST root source CDATA 'external'>"}});
+
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'catalog.dtd'><root/>",
+                settings);
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Standalone document declaration must not use external DTD attribute declarations") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject standalone documents that rely on external DTD attribute declarations");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ELEMENT root EMPTY><!ATTLIST root source CDATA 'external'>"}});
+
+        bool threw = false;
+        try {
+            XmlDocument document;
+            document.LoadXml(
+                "<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'catalog.dtd'><root/>",
+                settings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Standalone document declaration must not use external DTD attribute declarations") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument settings path should reject standalone documents that rely on external DTD attribute declarations");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ENTITY author SYSTEM 'author.txt'>"},
+            {"author.txt", "From External Entity"}});
+
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(
+                "<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'catalog.dtd'><root>&author;</root>",
+                settings);
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Standalone document declaration must not use external general entity references") != std::string::npos;
+        }
+        Assert(threw, "XmlReader should reject standalone documents that use external general entity references");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(std::unordered_map<std::string, std::string>{
+            {"catalog.dtd", "<!ENTITY author SYSTEM 'author.txt'>"},
+            {"author.txt", "From External Entity"}});
+
+        bool threw = false;
+        try {
+            XmlDocument document;
+            document.LoadXml(
+                "<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'catalog.dtd'><root>&author;</root>",
+                settings);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find("Standalone document declaration must not use external general entity references") != std::string::npos;
+        }
+        Assert(threw, "XmlDocument settings path should reject standalone documents that use external general entity references");
+    }
 }
 
 void TestFileRoundTrip() {
@@ -13637,6 +14828,13 @@ void TestDocumentConfiguration() {
     Assert(trimmedDocument.DocumentElement()->ChildNodeList().Count() == 1,
         "Whitespace-only child nodes should be omitted when PreserveWhitespace is false");
 
+    XmlDocument xmlSpaceDocument;
+    xmlSpaceDocument.LoadXml("<root xml:space='preserve'>  </root>");
+    Assert(xmlSpaceDocument.DocumentElement()->ChildNodeList().Count() == 1,
+        "xml:space='preserve' should retain whitespace-only child nodes even when PreserveWhitespace is false");
+    Assert(xmlSpaceDocument.DocumentElement()->ChildNodeList().Item(0)->NodeType() == XmlNodeType::SignificantWhitespace,
+        "xml:space='preserve' should materialize whitespace-only child nodes as SignificantWhitespace");
+
     XmlDocument preservedDocument;
     preservedDocument.SetPreserveWhitespace(true);
     preservedDocument.LoadXml("<root>  <child/>  </root>");
@@ -14229,6 +15427,218 @@ void TestXPathNamespaces() {
     Assert(attribute != nullptr && attribute->NodeType() == XmlNodeType::Attribute,
         "Namespace-aware XPath should return prefixed attribute nodes");
     Assert(attribute->Value() == "b1", "Namespace-aware attribute selection mismatch");
+
+    const auto namespaceAxis = document->SelectNodes("/bk:catalog/bk:book[1]/namespace::*", namespaces);
+    Assert(namespaceAxis.Count() == 2,
+        "namespace::* should expose inherited in-scope namespace declarations as query results");
+    Assert(namespaceAxis.Item(0) != nullptr && namespaceAxis.Item(1) != nullptr,
+        "namespace::* should return concrete query result nodes");
+    Assert(namespaceAxis.Item(0)->NodeType() == XmlNodeType::Attribute
+            && namespaceAxis.Item(1)->NodeType() == XmlNodeType::Attribute,
+        "B-tier namespace axis should keep using existing attribute nodes");
+
+    const auto prefixedNamespaceAxis = document->SelectSingleNode("/bk:catalog/bk:book[1]/namespace::meta", namespaces);
+    Assert(prefixedNamespaceAxis != nullptr && prefixedNamespaceAxis->NodeType() == XmlNodeType::Attribute,
+        "namespace::prefix should select the matching in-scope namespace declaration");
+    Assert(prefixedNamespaceAxis->Value() == "urn:meta",
+        "namespace::prefix should surface the namespace URI through the existing attribute value");
+
+    const auto namespaceSelfNode = document->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta/self::node()",
+        namespaces);
+    Assert(namespaceSelfNode != nullptr && namespaceSelfNode->NodeType() == XmlNodeType::Attribute,
+        "namespace-axis results should remain addressable through self::node()");
+    Assert(namespaceSelfNode->Value() == "urn:meta",
+        "self::node() over namespace-axis results should preserve the namespace URI value");
+
+    const auto namespaceParentElement = document->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta/parent::bk:book",
+        namespaces);
+    Assert(namespaceParentElement != nullptr && namespaceParentElement->NodeType() == XmlNodeType::Element,
+        "namespace-axis results should support parent::element follow-up navigation");
+    Assert(static_cast<XmlElement*>(namespaceParentElement.get())->GetAttribute("meta:id") == "b1",
+        "namespace-axis parent::element follow-up result mismatch");
+
+    const auto namespaceParentAttribute = document->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta/parent::bk:book/@m:id",
+        namespaces);
+    Assert(namespaceParentAttribute != nullptr && namespaceParentAttribute->NodeType() == XmlNodeType::Attribute,
+        "namespace-axis results should continue through parent::element/@attr follow-up paths");
+    Assert(namespaceParentAttribute->Value() == "b1",
+        "namespace-axis parent::element/@attr follow-up result mismatch");
+
+    const auto namespaceParentTitle = document->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta/parent::bk:book/bk:title",
+        namespaces);
+    Assert(namespaceParentTitle != nullptr && namespaceParentTitle->NodeType() == XmlNodeType::Element,
+        "namespace-axis results should continue through parent::element/child follow-up paths");
+    Assert(namespaceParentTitle->InnerText() == "One",
+        "namespace-axis parent::element/child follow-up result mismatch");
+
+    const auto namespaceAncestorCatalog = document->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta/ancestor::bk:catalog",
+        namespaces);
+    Assert(namespaceAncestorCatalog != nullptr && namespaceAncestorCatalog->NodeType() == XmlNodeType::Element,
+        "namespace-axis results should support ancestor::element follow-up navigation");
+    Assert(namespaceAncestorCatalog->Name() == "lib:catalog",
+        "namespace-axis ancestor::element follow-up result mismatch");
+
+    const auto namespaceFollowingSibling = document->SelectNodes(
+        "/bk:catalog/bk:book[1]/namespace::meta/following-sibling::node()",
+        namespaces);
+    Assert(namespaceFollowingSibling.Count() == 0,
+        "namespace-axis results should not expose following-sibling nodes under the B-tier attribute-backed model");
+
+    const auto namespaceFollowingTitles = document->SelectNodes(
+        "/bk:catalog/bk:book[1]/namespace::meta/following::bk:title",
+        namespaces);
+    Assert(namespaceFollowingTitles.Count() == 2,
+        "namespace-axis results should support following::element using the logical context element for inherited declarations");
+    Assert(namespaceFollowingTitles.Item(0) != nullptr && namespaceFollowingTitles.Item(0)->InnerText() == "One"
+            && namespaceFollowingTitles.Item(1) != nullptr && namespaceFollowingTitles.Item(1)->InnerText() == "Two",
+        "namespace-axis following::element should preserve document order from the logical context element");
+
+    const auto namespaceFollowingBookAttribute = document->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta/following::bk:book/@m:id",
+        namespaces);
+    Assert(namespaceFollowingBookAttribute != nullptr && namespaceFollowingBookAttribute->NodeType() == XmlNodeType::Attribute,
+        "namespace-axis results should support following::element/@attr follow-up paths");
+    Assert(namespaceFollowingBookAttribute->Value() == "b2",
+        "namespace-axis following::element/@attr follow-up result mismatch");
+
+    const auto namespacePrecedingBooks = document->SelectNodes(
+        "/bk:catalog/bk:book[2]/namespace::meta/preceding::bk:book",
+        namespaces);
+    Assert(namespacePrecedingBooks.Count() == 1,
+        "namespace-axis results should support preceding::element using the logical context element for inherited declarations");
+    Assert(namespacePrecedingBooks.Item(0) != nullptr
+            && static_cast<XmlElement*>(namespacePrecedingBooks.Item(0).get())->GetAttribute("meta:id") == "b1",
+        "namespace-axis preceding::element result mismatch");
+
+    const auto overridingNamespaceDocument = XmlDocument::Parse(
+        "<lib:catalog xmlns:lib=\"urn:lib\" xmlns:meta=\"urn:meta\">"
+        "<lib:book xmlns:meta=\"urn:meta-override\" meta:id=\"b1\"><lib:title>One</lib:title></lib:book>"
+        "</lib:catalog>");
+    const auto overridingNamespaceAxis = overridingNamespaceDocument->SelectNodes(
+        "/bk:catalog/bk:book[1]/namespace::*",
+        namespaces);
+    Assert(overridingNamespaceAxis.Count() == 2,
+        "namespace::* should deduplicate by prefix across ancestor scopes");
+
+    const auto overridingMetaNamespace = overridingNamespaceDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[1]/namespace::meta",
+        namespaces);
+    Assert(overridingMetaNamespace != nullptr && overridingMetaNamespace->Value() == "urn:meta-override",
+        "namespace::prefix should prefer the nearest in-scope declaration when prefixes are redefined");
+
+    const auto namespacePredicatePath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[namespace::meta='urn:meta' and string(namespace::meta)='urn:meta' and boolean(namespace::meta)]",
+        namespaces);
+    Assert(namespacePredicatePath != nullptr && namespacePredicatePath->NodeType() == XmlNodeType::Element,
+        "Predicate child paths should allow simple namespace::prefix string/boolean coercions");
+    Assert(static_cast<XmlElement*>(namespacePredicatePath.get())->GetAttribute("meta:id") == "b1",
+        "Predicate child-path namespace::prefix coercion result mismatch");
+
+    const auto namespaceFunctionPath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[name(namespace::meta)='xmlns:meta' and local-name(namespace::meta)='meta' and namespace-uri(namespace::meta)='http://www.w3.org/2000/xmlns/' and count(namespace::*)=2 and @m:id='b1']",
+        namespaces);
+    Assert(namespaceFunctionPath != nullptr && namespaceFunctionPath->NodeType() == XmlNodeType::Element,
+        "Predicate functions should allow simple namespace-axis path arguments");
+    Assert(static_cast<XmlElement*>(namespaceFunctionPath.get())->GetAttribute("meta:id") == "b1",
+        "Predicate function namespace-axis path result mismatch");
+
+    const auto overridingNamespaceFunctionPath = overridingNamespaceDocument->SelectSingleNode(
+        "/bk:catalog/bk:book[string(namespace::meta)='urn:meta-override' and count(namespace::*)=2]",
+        namespaces);
+    Assert(overridingNamespaceFunctionPath != nullptr && overridingNamespaceFunctionPath->NodeType() == XmlNodeType::Element,
+        "Predicate namespace-axis paths should honor nearest in-scope redeclarations");
+    Assert(static_cast<XmlElement*>(overridingNamespaceFunctionPath.get())->GetAttribute("meta:id") == "b1",
+        "Predicate namespace-axis redeclaration result mismatch");
+
+    const auto absoluteNamespaceFunctionPath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[@m:id='b2' and string(/bk:catalog/bk:book[1]/namespace::meta)='urn:meta' and count(/bk:catalog/bk:book[1]/namespace::*)=2]",
+        namespaces);
+    Assert(absoluteNamespaceFunctionPath != nullptr && absoluteNamespaceFunctionPath->NodeType() == XmlNodeType::Element,
+        "Predicate functions should allow absolute paths that target namespace-axis results");
+    Assert(static_cast<XmlElement*>(absoluteNamespaceFunctionPath.get())->GetAttribute("meta:id") == "b2",
+        "Absolute namespace-axis function-path result mismatch");
+
+    const auto unionNamespaceFunctionPath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[@m:id='b1' and count(namespace::* | @m:id)=3]",
+        namespaces);
+    Assert(unionNamespaceFunctionPath != nullptr && unionNamespaceFunctionPath->NodeType() == XmlNodeType::Element,
+        "Predicate functions should allow unions that include namespace-axis results");
+    Assert(static_cast<XmlElement*>(unionNamespaceFunctionPath.get())->GetAttribute("meta:id") == "b1",
+        "Union namespace-axis function-path result mismatch");
+
+    const auto namespaceFollowUpPredicatePath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[namespace::meta/parent::bk:book/@m:id='b1' and namespace::meta/ancestor::bk:catalog and namespace::meta/parent::bk:book/bk:title='One']",
+        namespaces);
+    Assert(namespaceFollowUpPredicatePath != nullptr && namespaceFollowUpPredicatePath->NodeType() == XmlNodeType::Element,
+        "Predicate paths should allow namespace-axis results to continue through parent/ancestor follow-up axes");
+    Assert(static_cast<XmlElement*>(namespaceFollowUpPredicatePath.get())->GetAttribute("meta:id") == "b1",
+        "Predicate namespace-axis follow-up path result mismatch");
+
+    const auto namespaceDocumentOrderPredicatePath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[namespace::meta/following::bk:book/@m:id='b2' and namespace::meta/following::bk:title='One']",
+        namespaces);
+    Assert(namespaceDocumentOrderPredicatePath != nullptr && namespaceDocumentOrderPredicatePath->NodeType() == XmlNodeType::Element,
+        "Predicate paths should allow namespace-axis results to continue through following:: follow-up axes");
+    Assert(static_cast<XmlElement*>(namespaceDocumentOrderPredicatePath.get())->GetAttribute("meta:id") == "b1",
+        "Predicate namespace-axis following:: path result mismatch");
+
+    const auto namespacePrecedingPredicatePath = document->SelectSingleNode(
+        "/bk:catalog/bk:book[@m:id='b2' and namespace::meta/preceding::bk:book/@m:id='b1']",
+        namespaces);
+    Assert(namespacePrecedingPredicatePath != nullptr && namespacePrecedingPredicatePath->NodeType() == XmlNodeType::Element,
+        "Predicate paths should allow namespace-axis results to continue through preceding:: follow-up axes");
+    Assert(static_cast<XmlElement*>(namespacePrecedingPredicatePath.get())->GetAttribute("meta:id") == "b2",
+        "Predicate namespace-axis preceding:: path result mismatch");
+
+    const auto defaultNamespaceDocument = XmlDocument::Parse(
+        "<root xmlns=\"urn:default\" xmlns:meta=\"urn:meta\">"
+        "<child xmlns=\"\" meta:id=\"c1\"><leaf/></child>"
+        "<scoped xmlns=\"urn:scoped\"/>"
+        "</root>");
+    XmlNamespaceManager defaultNamespaces;
+    defaultNamespaces.AddNamespace("d", "urn:default");
+    defaultNamespaces.AddNamespace("s", "urn:scoped");
+
+    const auto defaultNamespaceNode = defaultNamespaceDocument->SelectSingleNode(
+        "/d:root/namespace::*[name()='xmlns']",
+        defaultNamespaces);
+    Assert(defaultNamespaceNode != nullptr && defaultNamespaceNode->NodeType() == XmlNodeType::Attribute,
+        "namespace::* predicates should allow selecting the default namespace declaration node");
+    Assert(defaultNamespaceNode->Name() == "xmlns"
+            && defaultNamespaceNode->NamespaceURI() == "http://www.w3.org/2000/xmlns/"
+            && defaultNamespaceNode->Value() == "urn:default",
+        "Default namespace-axis node accessors should preserve the default xmlns declaration under the B-tier attribute-backed model");
+
+    const auto defaultNamespaceFunctionPath = defaultNamespaceDocument->SelectSingleNode(
+        "/d:root[name(namespace::*[name()='xmlns'])='xmlns' and local-name(namespace::*[name()='xmlns'])='' and string(namespace::*[name()='xmlns'])='urn:default' and count(namespace::*)=2]",
+        defaultNamespaces);
+    Assert(defaultNamespaceFunctionPath != nullptr && defaultNamespaceFunctionPath->NodeType() == XmlNodeType::Element,
+        "Predicate functions should allow selecting and inspecting the default namespace-axis node");
+
+    const auto undeclaredChildDefaultNamespace = defaultNamespaceDocument->SelectSingleNode(
+        "/d:root/*[local-name()='child']/namespace::*[name()='xmlns']",
+        defaultNamespaces);
+    Assert(undeclaredChildDefaultNamespace != nullptr && undeclaredChildDefaultNamespace->NodeType() == XmlNodeType::Attribute,
+        "namespace::* should surface xmlns='' undeclarations as the nearest default namespace node");
+    Assert(undeclaredChildDefaultNamespace->Value().empty(),
+        "Default namespace undeclarations should expose an empty string value through the attribute-backed namespace node");
+
+    const auto undeclaredChildNamespaceFunctionPath = defaultNamespaceDocument->SelectSingleNode(
+        "/d:root/*[local-name()='child' and string(namespace::*[name()='xmlns'])='' and count(namespace::*)=2]",
+        defaultNamespaces);
+    Assert(undeclaredChildNamespaceFunctionPath != nullptr && undeclaredChildNamespaceFunctionPath->NodeType() == XmlNodeType::Element,
+        "namespace-axis predicates should honor default namespace undeclarations over ancestor default bindings");
+
+    const auto scopedDefaultNamespaceNode = defaultNamespaceDocument->SelectSingleNode(
+        "/d:root/s:scoped/namespace::*[name()='xmlns']",
+        defaultNamespaces);
+    Assert(scopedDefaultNamespaceNode != nullptr && scopedDefaultNamespaceNode->Value() == "urn:scoped",
+        "namespace::* should prefer the nearest default namespace redeclaration when selecting the default xmlns node");
 
     const auto compositeNamespaceBook = document->SelectSingleNode(
         "/bk:catalog/bk:book[contains(bk:title, 'Tw') and not(@m:id='b1')]",
@@ -16073,8 +17483,14 @@ void TestDocumentStructureMutationMatrix() {
 
 void TestNamespaceManager() {
     XmlNamespaceManager namespaces;
+    namespaces.AddNamespace("", "urn:default");
     namespaces.AddNamespace("app", "urn:app");
+    Assert(namespaces.LookupNamespace("") == "urn:default", "Namespace lookup should return the default namespace binding");
     Assert(namespaces.LookupNamespace("app") == "urn:app", "Namespace lookup should find current scope");
+    Assert(namespaces.LookupPrefix("urn:default").empty(), "Reverse namespace lookup should surface the default namespace as an empty prefix");
+    Assert(namespaces.LookupPrefix("http://www.w3.org/XML/1998/namespace") == "xml", "Reverse namespace lookup should preserve the xml reserved prefix");
+    Assert(namespaces.LookupPrefix("http://www.w3.org/2000/xmlns/") == "xmlns", "Reverse namespace lookup should preserve the xmlns reserved prefix");
+    Assert(namespaces.HasNamespace(""), "HasNamespace should report the default namespace binding");
 
     namespaces.PushScope();
     namespaces.AddNamespace("item", "urn:item");
@@ -16099,8 +17515,72 @@ void TestDomNamespaces() {
     Assert(item->GetAttributeNode("app:id")->NamespaceURI() == "urn:app", "Prefixed attribute namespace mismatch");
     Assert(item->GetAttributeNode("plain")->NamespaceURI().empty(), "Default namespace must not apply to unprefixed attributes");
     Assert(root->GetAttributeNode("xml:lang")->NamespaceURI() == "http://www.w3.org/XML/1998/namespace", "xml prefix namespace mismatch");
+    Assert(root->GetNamespaceOfPrefix("") == "urn:root", "GetNamespaceOfPrefix should resolve the in-scope default namespace");
     Assert(root->GetNamespaceOfPrefix("app") == "urn:app", "GetNamespaceOfPrefix should resolve in-scope prefixes");
+    Assert(root->GetNamespaceOfPrefix("xml") == "http://www.w3.org/XML/1998/namespace", "GetNamespaceOfPrefix should preserve the xml reserved namespace");
     Assert(root->GetPrefixOfNamespace("urn:app") == "app", "GetPrefixOfNamespace should resolve prefix for namespace URI");
+    Assert(root->GetPrefixOfNamespace("urn:root").empty(), "GetPrefixOfNamespace should return an empty prefix for the default namespace binding");
+    Assert(root->GetPrefixOfNamespace("http://www.w3.org/XML/1998/namespace") == "xml", "GetPrefixOfNamespace should preserve the xml reserved prefix");
+}
+
+void TestInvalidNamespaceDeclarations() {
+    auto expectXmlExceptionContaining = [](const std::string& xml, const std::string& expectedMessage, const std::string& label) {
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(xml);
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find(expectedMessage) != std::string::npos;
+        }
+        Assert(threw, label);
+    };
+
+    auto expectReaderXmlExceptionContaining = [](const std::string& xml, const std::string& expectedMessage, const std::string& label) {
+        bool threw = false;
+        try {
+            XmlReader reader = XmlReader::Create(xml);
+            while (reader.Read()) {
+            }
+        } catch (const XmlException& exception) {
+            threw = std::string(exception.what()).find(expectedMessage) != std::string::npos;
+        }
+        Assert(threw, label);
+    };
+
+    expectXmlExceptionContaining(
+        "<root xmlns:xml='urn:not-xml'/>",
+        "reserved prefix 'xml'",
+        "XmlDocument::Parse should reject rebinding the xml reserved prefix");
+    expectReaderXmlExceptionContaining(
+        "<root xmlns:xml='urn:not-xml'/>",
+        "reserved prefix 'xml'",
+        "XmlReader should reject rebinding the xml reserved prefix");
+
+    expectXmlExceptionContaining(
+        "<root xmlns:xmlns='urn:not-xmlns'/>",
+        "reserved prefix 'xmlns'",
+        "XmlDocument::Parse should reject declaring the xmlns reserved prefix");
+    expectReaderXmlExceptionContaining(
+        "<root xmlns:xmlns='urn:not-xmlns'/>",
+        "reserved prefix 'xmlns'",
+        "XmlReader should reject declaring the xmlns reserved prefix");
+
+    expectXmlExceptionContaining(
+        "<root xmlns='http://www.w3.org/2000/xmlns/'/>",
+        "cannot be declared",
+        "XmlDocument::Parse should reject binding the xmlns namespace URI as the default namespace");
+    expectReaderXmlExceptionContaining(
+        "<root xmlns='http://www.w3.org/2000/xmlns/'/>",
+        "cannot be declared",
+        "XmlReader should reject binding the xmlns namespace URI as the default namespace");
+
+    expectXmlExceptionContaining(
+        "<root xmlns:p='http://www.w3.org/XML/1998/namespace'/>",
+        "must be bound to the prefix 'xml'",
+        "XmlDocument::Parse should reject binding the xml namespace URI to a non-xml prefix");
+    expectReaderXmlExceptionContaining(
+        "<root xmlns:p='http://www.w3.org/XML/1998/namespace'/>",
+        "must be bound to the prefix 'xml'",
+        "XmlReader should reject binding the xml namespace URI to a non-xml prefix");
 }
 
 void TestNamespaceScopeRoundTrip() {
@@ -17154,6 +18634,26 @@ void TestXmlWriterWriteNode() {
         "WriteNode should preserve inherited default namespaces when replaying isolated element nodes");
     Assert(inheritedNamespaceRoundTrip->DocumentElement()->GetAttribute("code", "urn:pfx") == "42",
         "WriteNode should preserve inherited prefixed attribute namespaces when replaying isolated element nodes");
+
+    auto undeclaredNamespaceSource = XmlDocument::Parse(
+        "<root xmlns='urn:outer'><plain xmlns='' code='42'/></root>");
+    const auto undeclaredNamespaceChild = undeclaredNamespaceSource->DocumentElement()->FirstChild();
+    Assert(undeclaredNamespaceChild != nullptr,
+        "Undeclared-namespace child should exist for WriteNode tests");
+
+    XmlWriter undeclaredNamespaceWriter;
+    undeclaredNamespaceWriter.WriteStartElement("host", "urn:host");
+    undeclaredNamespaceWriter.WriteNode(*undeclaredNamespaceChild);
+    undeclaredNamespaceWriter.WriteEndElement();
+    auto undeclaredNamespaceRoundTrip = XmlDocument::Parse(undeclaredNamespaceWriter.GetString());
+    const auto writtenUndeclaredNamespaceChild = std::static_pointer_cast<XmlElement>(
+        undeclaredNamespaceRoundTrip->DocumentElement() == nullptr
+            ? nullptr
+            : undeclaredNamespaceRoundTrip->DocumentElement()->FirstChild());
+    Assert(writtenUndeclaredNamespaceChild != nullptr && writtenUndeclaredNamespaceChild->NamespaceURI().empty(),
+        "WriteNode should emit xmlns='' when replaying an empty-namespace element inside a default-namespace parent");
+    Assert(writtenUndeclaredNamespaceChild->GetAttribute("code") == "42",
+        "WriteNode empty-namespace replay should preserve local attributes");
 
     auto fragment = source.CreateDocumentFragment();
     fragment->AppendChild(source.CreateElement("a"));
@@ -21357,6 +22857,44 @@ void TestXPathNavigatorAndDocument() {
     Assert(namespaceNavigator.MoveToPrevious() && namespaceNavigator.Name() == "meta:id",
         "Navigator previous attribute traversal should also skip xmlns declarations");
 
+    XmlNamespaceManager navigatorNamespaces;
+    navigatorNamespaces.AddNamespace("bk", "urn:lib");
+    const auto selectedNamespaceNavigator = navigatorNamespaceDocument->CreateNavigator().SelectSingleNode(
+        "/bk:catalog/bk:book/namespace::meta",
+        navigatorNamespaces);
+    Assert(!selectedNamespaceNavigator.IsEmpty() && selectedNamespaceNavigator.NodeType() == XmlNodeType::Attribute,
+        "Navigator should surface namespace-axis query results as attribute-backed navigator nodes");
+    Assert(selectedNamespaceNavigator.Name() == "xmlns:meta"
+            && selectedNamespaceNavigator.LocalName() == "meta"
+            && selectedNamespaceNavigator.Prefix() == "xmlns"
+            && selectedNamespaceNavigator.NamespaceURI() == "http://www.w3.org/2000/xmlns/"
+            && selectedNamespaceNavigator.Value() == "urn:meta",
+        "Navigator should preserve namespace-axis node naming and value accessors");
+
+    auto namespaceParentNavigator = selectedNamespaceNavigator.Clone();
+    Assert(namespaceParentNavigator.MoveToParent() && namespaceParentNavigator.Name() == "lib:book",
+        "Navigator should move from namespace-axis results to the logical context element rather than the physical xmlns host");
+
+    auto namespaceRootNavigator = selectedNamespaceNavigator.Clone();
+    namespaceRootNavigator.MoveToRoot();
+    Assert(!namespaceRootNavigator.IsEmpty() && namespaceRootNavigator.NodeType() == XmlNodeType::Document,
+        "Navigator MoveToRoot from a namespace-axis result should resolve through the logical context chain to the owning document");
+
+    auto namespaceNextNavigator = selectedNamespaceNavigator.Clone();
+    Assert(!namespaceNextNavigator.MoveToNext(),
+        "Navigator MoveToNext should not reinterpret namespace-axis results as real attribute traversal targets");
+    auto namespacePreviousNavigator = selectedNamespaceNavigator.Clone();
+    Assert(!namespacePreviousNavigator.MoveToPrevious(),
+        "Navigator MoveToPrevious should not reinterpret namespace-axis results as real attribute traversal targets");
+
+    const auto namespaceParentSelection = selectedNamespaceNavigator.SelectSingleNode("parent::bk:book", navigatorNamespaces);
+    Assert(!namespaceParentSelection.IsEmpty() && namespaceParentSelection.Name() == "lib:book",
+        "Navigator relative SelectSingleNode should preserve namespace-axis logical parent context");
+    const auto namespaceFollowingSelection = selectedNamespaceNavigator.SelectSingleNode("following::bk:title", navigatorNamespaces);
+    Assert(!namespaceFollowingSelection.IsEmpty() && namespaceFollowingSelection.Name() == "lib:title"
+            && namespaceFollowingSelection.Value() == "One",
+        "Navigator relative SelectSingleNode should preserve namespace-axis logical document-order context");
+
     const auto prologDocument = XmlDocument::Parse(
         "<?xml version=\"1.0\"?>"
         "<!--lead-->"
@@ -22107,16 +23645,67 @@ void TestTier1Apis() {
         Assert(pfx == "urn:pfx", "LookupNamespace('p') should return prefixed namespace");
         std::string missing = reader.LookupNamespace("x");
         Assert(missing.empty(), "LookupNamespace('x') for undeclared prefix should return empty");
+
+        auto scopedEndReader = XmlReader::Create("<root xmlns='urn:outer'><child xmlns='urn:inner'>text</child></root>");
+        scopedEndReader.Read(); // root
+        scopedEndReader.Read(); // child
+        scopedEndReader.Read(); // text
+        Assert(scopedEndReader.Read() && scopedEndReader.NodeType() == XmlNodeType::EndElement,
+            "XmlReader should expose the child end element for namespace scope testing");
+        Assert(scopedEndReader.LookupNamespace("") == "urn:inner",
+            "XmlReader LookupNamespace('') on an end element should preserve the namespace scope of the element being closed");
+
+        auto attributeScopedReader = XmlReader::Create("<root xmlns='urn:outer' xmlns:p='urn:outer-p'><child xmlns='' xmlns:p='urn:inner-p' plain='value'/></root>");
+        attributeScopedReader.Read(); // root
+        Assert(attributeScopedReader.Read() && attributeScopedReader.Name() == "child",
+            "XmlReader should expose the empty child element for attribute namespace scope testing");
+        Assert(attributeScopedReader.MoveToAttribute("plain"),
+            "XmlReader should move to the plain attribute on the empty child element");
+        Assert(attributeScopedReader.LookupNamespace("").empty(),
+            "XmlReader LookupNamespace('') on an attribute of an empty element should preserve xmlns='' undeclaration on the element");
+        Assert(attributeScopedReader.LookupNamespace("p") == "urn:inner-p",
+            "XmlReader LookupNamespace('p') on an attribute of an empty element should preserve the element's local prefixed declaration");
     }
     {
         // XmlNodeReader LookupNamespace
-        auto doc = XmlDocument::Parse("<root xmlns='urn:default' xmlns:p='urn:pfx'><p:child/></root>");
+        auto doc = XmlDocument::Parse("<root xmlns='urn:default' xmlns:p='urn:pfx'><p:child>text</p:child></root>");
         XmlNodeReader nr(*doc);
         while (nr.Read() && nr.Name() != "root") {}
         std::string dflt = nr.LookupNamespace("");
         Assert(dflt == "urn:default", "XmlNodeReader LookupNamespace('') default ns");
         std::string pfx = nr.LookupNamespace("p");
         Assert(pfx == "urn:pfx", "XmlNodeReader LookupNamespace('p')");
+        Assert(nr.Read() && nr.Name() == "p:child", "XmlNodeReader should advance to child element for inherited namespace lookup test");
+        Assert(nr.LookupNamespace("") == "urn:default",
+            "XmlNodeReader LookupNamespace('') should preserve inherited default namespaces on child elements");
+        Assert(nr.LookupNamespace("p") == "urn:pfx",
+            "XmlNodeReader LookupNamespace('p') should preserve inherited prefixed namespaces on child elements");
+        Assert(nr.Read() && nr.NodeType() == XmlNodeType::Text,
+            "XmlNodeReader should advance to text content for inherited namespace lookup test");
+        Assert(nr.LookupNamespace("") == "urn:default",
+            "XmlNodeReader LookupNamespace('') should preserve inherited default namespaces on text nodes");
+        Assert(nr.LookupNamespace("p") == "urn:pfx",
+            "XmlNodeReader LookupNamespace('p') should preserve inherited prefixed namespaces on text nodes");
+
+        auto scopedEndDocument = XmlDocument::Parse("<root xmlns='urn:outer'><child xmlns='urn:inner'>text</child></root>");
+        XmlNodeReader scopedEndReader(*scopedEndDocument);
+        while (scopedEndReader.Read() && !(scopedEndReader.NodeType() == XmlNodeType::EndElement && scopedEndReader.Name() == "child")) {}
+        Assert(scopedEndReader.NodeType() == XmlNodeType::EndElement,
+            "XmlNodeReader should expose the child end element for namespace scope testing");
+        Assert(scopedEndReader.LookupNamespace("") == "urn:inner",
+            "XmlNodeReader LookupNamespace('') on an end element should preserve the namespace scope of the element being closed");
+
+        auto attributeScopedDocument = XmlDocument::Parse("<root xmlns='urn:outer' xmlns:p='urn:outer-p'><child xmlns='' xmlns:p='urn:inner-p' plain='value'/></root>");
+        XmlNodeReader attributeScopedNodeReader(*attributeScopedDocument);
+        while (attributeScopedNodeReader.Read() && attributeScopedNodeReader.Name() != "child") {}
+        Assert(attributeScopedNodeReader.NodeType() == XmlNodeType::Element,
+            "XmlNodeReader should expose the empty child element for attribute namespace scope testing");
+        Assert(attributeScopedNodeReader.MoveToAttribute("plain"),
+            "XmlNodeReader should move to the plain attribute on the empty child element");
+        Assert(attributeScopedNodeReader.LookupNamespace("").empty(),
+            "XmlNodeReader LookupNamespace('') on an attribute of an empty element should preserve xmlns='' undeclaration on the element");
+        Assert(attributeScopedNodeReader.LookupNamespace("p") == "urn:inner-p",
+            "XmlNodeReader LookupNamespace('p') on an attribute of an empty element should preserve the element's local prefixed declaration");
     }
 
     // ---- ReadContentAsString ----
@@ -22344,6 +23933,26 @@ void TestTier1Apis() {
             "WriteNode(XmlReader) should preserve inherited prefixed attribute namespaces when replaying isolated elements");
     }
     {
+        auto reader = XmlReader::Create("<root xmlns='urn:outer'><plain xmlns='' code='42'/></root>");
+        reader.Read(); // root
+        reader.Read(); // plain
+
+        XmlWriter writer;
+        writer.WriteStartElement("host", "urn:host");
+        writer.WriteNode(reader);
+        writer.WriteEndElement();
+
+        auto roundTrip = XmlDocument::Parse(writer.GetString());
+        const auto child = std::static_pointer_cast<XmlElement>(
+            roundTrip->DocumentElement() == nullptr
+                ? nullptr
+                : roundTrip->DocumentElement()->FirstChild());
+        Assert(child != nullptr && child->NamespaceURI().empty(),
+            "WriteNode(XmlReader) should emit xmlns='' when replaying an empty-namespace element inside a default-namespace parent");
+        Assert(child->GetAttribute("code") == "42",
+            "WriteNode(XmlReader) empty-namespace replay should preserve local attributes");
+    }
+    {
         auto reader = XmlReader::Create(
             "<!DOCTYPE root [<!ENTITY label \"alpha\">]>"
             "<root>&label;</root>");
@@ -22526,6 +24135,25 @@ void TestTier2Apis() {
         w.WriteStartElement("ns", "root", "http://example.com");
         std::string prefix = w.LookupPrefix("http://example.com");
         Assert(prefix == "ns", "LookupPrefix should return declared prefix");
+        Assert(w.LookupPrefix("http://www.w3.org/XML/1998/namespace") == "xml",
+            "LookupPrefix should preserve the xml reserved prefix");
+        Assert(w.LookupPrefix("http://www.w3.org/2000/xmlns/") == "xmlns",
+            "LookupPrefix should preserve the xmlns reserved prefix");
+        w.WriteEndElement();
+    }
+
+    {
+        std::ostringstream stream;
+        XmlWriterSettings settings;
+        settings.Conformance = ConformanceLevel::Fragment;
+        XmlWriter w(stream, settings);
+        w.WriteStartElement("ns", "root", "http://example.com");
+        Assert(w.LookupPrefix("http://example.com") == "ns",
+            "Direct-output LookupPrefix should return declared prefix");
+        Assert(w.LookupPrefix("http://www.w3.org/XML/1998/namespace") == "xml",
+            "Direct-output LookupPrefix should preserve the xml reserved prefix");
+        Assert(w.LookupPrefix("http://www.w3.org/2000/xmlns/") == "xmlns",
+            "Direct-output LookupPrefix should preserve the xmlns reserved prefix");
         w.WriteEndElement();
     }
 
@@ -22749,12 +24377,14 @@ int main(int argc, char** argv) {
 
         TestParseDocument();
         TestDocumentTypeDeclarations();
+        TestXmlDeclarationValidation();
         try {
             TestDocumentTypeBoundaries();
         } catch (const std::exception& exception) {
             throw std::runtime_error(std::string("TestDocumentTypeBoundaries: ") + exception.what());
         }
         TestInvalidDtdInputs();
+        TestDtdAttributeDefaultsAndValidation();
         try {
             TestDeclaredEntityResolution();
         } catch (const std::exception& exception) {
@@ -22844,6 +24474,7 @@ int main(int argc, char** argv) {
         TestDocumentStructureMutationMatrix();
         TestNamespaceManager();
         TestDomNamespaces();
+        TestInvalidNamespaceDeclarations();
         TestNamespaceScopeRoundTrip();
         TestXmlReader();
         TestXmlReaderNamespaces();

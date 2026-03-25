@@ -2,6 +2,7 @@
 // XmlReader and DTD parsing internal helpers.
 
 #include "XmlDomInternal.h"
+#include "XmlConvert.h"
 
 namespace System::Xml {
 
@@ -556,6 +557,17 @@ struct ParsedXmlDeclarationData {
     std::string standalone;
 };
 
+using DtdRequiredAttributeDeclarations = std::unordered_map<std::string, std::unordered_set<std::string>>;
+using DtdDefaultAttributeDeclarations = std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
+using DtdFixedAttributeDeclarations = std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
+using DtdEnumeratedAttributeDeclarations = std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
+using DtdIdAttributeDeclarations = std::unordered_map<std::string, std::string>;
+using DtdNotationAttributeDeclarations = std::unordered_map<std::string, std::string>;
+using DtdNmTokenAttributeDeclarations = std::unordered_map<std::string, std::unordered_map<std::string, bool>>;
+using DtdNameAttributeDeclarations = std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
+using DtdDeclaredAttributeNames = std::unordered_map<std::string, std::unordered_set<std::string>>;
+using DtdEmptyElementDeclarations = std::unordered_set<std::string>;
+
 
 }  // namespace
 
@@ -596,6 +608,9 @@ std::string ReadSubsetQuotedValue(std::string_view text, std::size_t& position) 
 ParsedXmlDeclarationData ParseXmlDeclarationValue(std::string_view value) {
     ParsedXmlDeclarationData declaration;
     std::size_t position = 0;
+    bool sawVersion = false;
+    bool sawEncoding = false;
+    bool sawStandalone = false;
 
     while (position < value.size()) {
         SkipXmlWhitespaceAt(value, position);
@@ -625,14 +640,44 @@ ParsedXmlDeclarationData ParseXmlDeclarationValue(std::string_view value) {
         }
 
         if (token.name == "version") {
+            if (sawEncoding || sawStandalone) {
+                throw XmlException("Malformed XML declaration");
+            }
+            if (sawVersion) {
+                throw XmlException("Malformed XML declaration");
+            }
+            sawVersion = true;
             declaration.version = std::string(value.substr(token.rawValueStart, token.rawValueEnd - token.rawValueStart));
+            ValidateXmlDeclarationVersion(declaration.version);
         } else if (token.name == "encoding") {
+            if (!sawVersion || sawStandalone) {
+                throw XmlException("Malformed XML declaration");
+            }
+            if (sawEncoding) {
+                throw XmlException("Malformed XML declaration");
+            }
+            sawEncoding = true;
             declaration.encoding = std::string(value.substr(token.rawValueStart, token.rawValueEnd - token.rawValueStart));
+            ValidateXmlDeclarationEncoding(declaration.encoding);
         } else if (token.name == "standalone") {
+            if (!sawVersion) {
+                throw XmlException("Malformed XML declaration");
+            }
+            if (sawStandalone) {
+                throw XmlException("Malformed XML declaration");
+            }
+            sawStandalone = true;
             declaration.standalone = std::string(value.substr(token.rawValueStart, token.rawValueEnd - token.rawValueStart));
+            if (!declaration.standalone.empty() && declaration.standalone != "yes" && declaration.standalone != "no") {
+                throw XmlException("Malformed XML declaration");
+            }
         } else {
             throw XmlException("Malformed XML declaration");
         }
+    }
+
+    if (!sawVersion) {
+        throw XmlException("Malformed XML declaration");
     }
 
     return declaration;
@@ -736,6 +781,294 @@ bool SkipSubsetDeclaration(std::string_view text, std::size_t& position) {
     return false;
 }
 
+std::optional<std::string> ReadSubsetAttlistToken(std::string_view text, std::size_t& position) {
+    SkipSubsetWhitespace(text, position);
+    if (position >= text.size()) {
+        return std::nullopt;
+    }
+
+    const char ch = text[position];
+    if (ch == '\'' || ch == '"') {
+        return ReadSubsetQuotedValue(text, position);
+    }
+
+    if (ch == '(') {
+        const std::size_t start = position;
+        int depth = 0;
+        do {
+            if (text[position] == '(') {
+                ++depth;
+            } else if (text[position] == ')') {
+                --depth;
+            }
+            ++position;
+        } while (position < text.size() && depth > 0);
+        return std::string(text.substr(start, position - start));
+    }
+
+    const std::size_t start = position;
+    while (position < text.size() && !IsWhitespace(text[position]) && text[position] != '>') {
+        ++position;
+    }
+    return std::string(text.substr(start, position - start));
+}
+
+void UpsertDtdValueDeclaration(
+    DtdDefaultAttributeDeclarations& declarations,
+    const std::string& elementName,
+    std::string attributeName,
+    std::string value) {
+    auto& elementDeclarations = declarations[elementName];
+    if (elementDeclarations.find(attributeName) == elementDeclarations.end()) {
+        elementDeclarations.emplace(std::move(attributeName), std::move(value));
+    }
+}
+
+void UpsertDtdFixedDeclaration(
+    DtdFixedAttributeDeclarations& declarations,
+    const std::string& elementName,
+    std::string attributeName,
+    std::string value) {
+    auto& elementDeclarations = declarations[elementName];
+    if (elementDeclarations.find(attributeName) == elementDeclarations.end()) {
+        elementDeclarations.emplace(std::move(attributeName), std::move(value));
+    }
+}
+
+void AddDtdRequiredDeclaration(
+    DtdRequiredAttributeDeclarations& declarations,
+    const std::string& elementName,
+    std::string attributeName) {
+    declarations[elementName].insert(std::move(attributeName));
+}
+
+void UpsertDtdEnumeratedDeclaration(
+    DtdEnumeratedAttributeDeclarations& declarations,
+    const std::string& elementName,
+    std::string attributeName,
+    std::string enumerationValueSet) {
+    auto& elementDeclarations = declarations[elementName];
+    if (elementDeclarations.find(attributeName) == elementDeclarations.end()) {
+        elementDeclarations.emplace(std::move(attributeName), std::move(enumerationValueSet));
+    }
+}
+
+bool IsValidDtdEnumerationValueSet(std::string_view valueSet) {
+    return valueSet.size() >= 3 && valueSet.front() == '(' && valueSet.back() == ')';
+}
+
+bool IsValidDtdNmtoken(std::string_view value) {
+    try {
+        (void)XmlConvert::VerifyNmToken(value);
+        return true;
+    } catch (const XmlException&) {
+        return false;
+    }
+}
+
+bool IsValidDtdName(std::string_view value) {
+    try {
+        (void)XmlConvert::VerifyName(value);
+        return true;
+    } catch (const XmlException&) {
+        return false;
+    }
+}
+
+template <typename Callback>
+void ForEachDtdNamesValueToken(std::string_view value, Callback&& callback) {
+    std::size_t position = 0;
+    while (position < value.size()) {
+        while (position < value.size() && IsWhitespace(value[position])) {
+            ++position;
+        }
+        if (position >= value.size()) {
+            break;
+        }
+
+        const std::size_t start = position;
+        while (position < value.size() && !IsWhitespace(value[position])) {
+            ++position;
+        }
+
+        callback(value.substr(start, position - start));
+    }
+}
+
+bool IsValidDtdNamesValue(std::string_view value, bool allowMultipleTokens) {
+    if (value.empty()) {
+        return false;
+    }
+
+    std::size_t tokenCount = 0;
+    bool valid = true;
+    ForEachDtdNamesValueToken(value, [&](std::string_view token) {
+        if (!IsValidDtdName(token)) {
+            valid = false;
+            return;
+        }
+
+        ++tokenCount;
+        if (!allowMultipleTokens && tokenCount > 1) {
+            valid = false;
+        }
+    });
+
+    return valid && tokenCount > 0;
+}
+
+bool IsValidDtdEnumeratedValueSet(std::string_view valueSet, bool requireNames) {
+    if (!IsValidDtdEnumerationValueSet(valueSet)) {
+        return false;
+    }
+
+    const std::string_view inner = valueSet.substr(1, valueSet.size() - 2);
+    std::unordered_set<std::string> declaredValues;
+    std::size_t start = 0;
+    bool sawValue = false;
+    while (start <= inner.size()) {
+        const std::size_t separator = inner.find('|', start);
+        const std::string token = Trim(std::string(inner.substr(
+            start,
+            separator == std::string_view::npos ? std::string_view::npos : separator - start)));
+        if (token.empty()) {
+            return false;
+        }
+        if (requireNames ? !IsValidDtdName(token) : !IsValidDtdNmtoken(token)) {
+            return false;
+        }
+        if (!declaredValues.insert(token).second) {
+            return false;
+        }
+
+        sawValue = true;
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+
+    return sawValue;
+}
+
+bool IsValidXmlSpaceEnumerationValueSet(std::string_view valueSet) {
+    if (!IsValidDtdEnumerationValueSet(valueSet)) {
+        return false;
+    }
+
+    const std::string_view inner = valueSet.substr(1, valueSet.size() - 2);
+    std::size_t start = 0;
+    bool sawValue = false;
+    while (start <= inner.size()) {
+        const std::size_t separator = inner.find('|', start);
+        const std::string token = Trim(std::string(inner.substr(
+            start,
+            separator == std::string_view::npos ? std::string_view::npos : separator - start)));
+        if (token != "default" && token != "preserve") {
+            return false;
+        }
+
+        sawValue = true;
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+
+    return sawValue;
+}
+
+bool IsValidDtdNmTokensValue(std::string_view value, bool allowMultipleTokens) {
+    if (value.empty()) {
+        return false;
+    }
+
+    std::size_t position = 0;
+    std::size_t tokenCount = 0;
+    while (position < value.size()) {
+        while (position < value.size() && IsWhitespace(value[position])) {
+            ++position;
+        }
+        if (position >= value.size()) {
+            break;
+        }
+
+        const std::size_t start = position;
+        while (position < value.size() && !IsWhitespace(value[position])) {
+            ++position;
+        }
+
+        if (!IsValidDtdNmtoken(value.substr(start, position - start))) {
+            return false;
+        }
+
+        ++tokenCount;
+        if (!allowMultipleTokens && tokenCount > 1) {
+            return false;
+        }
+    }
+
+    return tokenCount > 0;
+}
+
+void UpsertDtdNmTokenDeclaration(
+    DtdNmTokenAttributeDeclarations& declarations,
+    const std::string& elementName,
+    std::string attributeName,
+    bool allowMultipleTokens) {
+    auto& elementDeclarations = declarations[elementName];
+    if (elementDeclarations.find(attributeName) == elementDeclarations.end()) {
+        elementDeclarations.emplace(std::move(attributeName), allowMultipleTokens);
+    }
+}
+
+void UpsertDtdNameDeclaration(
+    DtdNameAttributeDeclarations& declarations,
+    const std::string& elementName,
+    std::string attributeName,
+    std::string attributeType) {
+    auto& elementDeclarations = declarations[elementName];
+    if (elementDeclarations.find(attributeName) == elementDeclarations.end()) {
+        elementDeclarations.emplace(std::move(attributeName), std::move(attributeType));
+    }
+}
+
+bool IsValidDtdAttlistAttributeType(std::string_view attributeType) {
+    return attributeType == "CDATA"
+        || attributeType == "ID"
+        || attributeType == "IDREF"
+        || attributeType == "IDREFS"
+        || attributeType == "ENTITY"
+        || attributeType == "ENTITIES"
+        || attributeType == "NMTOKEN"
+    || attributeType == "NMTOKENS";
+}
+
+bool AttributeValueMatchesDtdEnumeration(std::string_view value, std::string_view enumerationValueSet) {
+    if (enumerationValueSet.size() < 2 || enumerationValueSet.front() != '(' || enumerationValueSet.back() != ')') {
+        return false;
+    }
+
+    const std::string_view inner = enumerationValueSet.substr(1, enumerationValueSet.size() - 2);
+    std::size_t start = 0;
+    while (start <= inner.size()) {
+        std::size_t separator = inner.find('|', start);
+        std::string candidate = Trim(std::string(inner.substr(
+            start,
+            separator == std::string_view::npos ? std::string_view::npos : separator - start)));
+        if (candidate == value) {
+            return true;
+        }
+
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+
+    return false;
+}
+
 bool ReadSubsetConditionalSection(
     std::string_view text,
     std::size_t& position,
@@ -816,6 +1149,11 @@ void ParseDocumentTypeInternalSubset(
     std::vector<std::shared_ptr<XmlNode>>& notations) {
     std::string_view text(internalSubset);
     std::size_t position = 0;
+    std::unordered_set<std::string> declaredEntityNames;
+    std::unordered_set<std::string> declaredNotationNames;
+    const auto isPredefinedEntityName = [](std::string_view name) {
+        return name == "lt" || name == "gt" || name == "amp" || name == "quot" || name == "apos";
+    };
     while (position < text.size()) {
         SkipSubsetWhitespace(text, position);
         if (position >= text.size()) {
@@ -852,6 +1190,15 @@ void ParseDocumentTypeInternalSubset(
             if (name.empty()) {
                 ThrowMalformedDtdDeclaration("entity");
             }
+            if (!parameterEntity) {
+                if (isPredefinedEntityName(name)) {
+                    throw XmlException(
+                        "DTD validation failed: entity declaration '" + name + "' must not redefine a predefined entity");
+                }
+                if (!declaredEntityNames.insert(name).second) {
+                    throw XmlException("DTD validation failed: duplicate entity declaration '" + name + "'");
+                }
+            }
             SkipSubsetWhitespace(text, position);
             std::string replacementText;
             std::string publicId;
@@ -885,6 +1232,9 @@ void ParseDocumentTypeInternalSubset(
                 if (parameterEntity) {
                     ThrowMalformedDtdDeclaration("parameter entity");
                 }
+                if (!replacementText.empty()) {
+                    ThrowMalformedDtdDeclaration("entity");
+                }
                 position += 5;
                 SkipSubsetWhitespace(text, position);
                 notationName = ReadSubsetName(text, position);
@@ -908,6 +1258,9 @@ void ParseDocumentTypeInternalSubset(
             const auto name = ReadSubsetName(text, position);
             if (name.empty()) {
                 ThrowMalformedDtdDeclaration("notation");
+            }
+            if (!declaredNotationNames.insert(name).second) {
+                throw XmlException("DTD validation failed: duplicate notation declaration '" + name + "'");
             }
             SkipSubsetWhitespace(text, position);
 
@@ -974,6 +1327,355 @@ void ParseDocumentTypeInternalSubset(
             ThrowMalformedDtdDeclaration("declaration");
         }
     }
+
+    std::unordered_set<std::string> notationNames;
+    notationNames.reserve(notations.size());
+    for (const auto& notation : notations) {
+        if (notation != nullptr && notation->NodeType() == XmlNodeType::Notation) {
+            notationNames.insert(notation->Name());
+        }
+    }
+
+    for (const auto& entity : entities) {
+        if (entity == nullptr || entity->NodeType() != XmlNodeType::Entity) {
+            continue;
+        }
+
+        const auto& notationName = static_cast<const XmlEntity&>(*entity).NotationName();
+        if (!notationName.empty() && notationNames.find(notationName) == notationNames.end()) {
+            throw XmlException(
+                "DTD validation failed: unparsed entity '" + entity->Name()
+                + "' references undeclared notation '" + notationName + "'");
+        }
+    }
+}
+
+void ParseDocumentTypeAttributeDeclarationsCore(
+    std::string_view internalSubset,
+    DtdDeclaredAttributeNames& declaredAttributes,
+    DtdRequiredAttributeDeclarations& requiredAttributes,
+    DtdDefaultAttributeDeclarations& defaultAttributes,
+    DtdFixedAttributeDeclarations& fixedAttributes,
+    DtdEnumeratedAttributeDeclarations& enumeratedAttributes,
+    DtdIdAttributeDeclarations& idAttributes,
+    DtdNotationAttributeDeclarations& notationAttributes,
+    DtdNmTokenAttributeDeclarations& nmTokenAttributes,
+    DtdNameAttributeDeclarations& nameAttributes) {
+    std::size_t position = 0;
+    while (position < internalSubset.size()) {
+        SkipSubsetWhitespace(internalSubset, position);
+        if (position >= internalSubset.size()) {
+            break;
+        }
+
+        if (StartsWithAt(internalSubset, position, "<!--")) {
+            const auto end = internalSubset.find("-->", position + 4);
+            position = end == std::string_view::npos ? internalSubset.size() : end + 3;
+            continue;
+        }
+
+        if (StartsWithAt(internalSubset, position, "<?")) {
+            const auto end = internalSubset.find("?>", position + 2);
+            position = end == std::string_view::npos ? internalSubset.size() : end + 2;
+            continue;
+        }
+
+        if (!SubsetStartsWithAt(internalSubset, position, "<!")) {
+            ++position;
+            continue;
+        }
+
+        if (SubsetStartsWithAt(internalSubset, position, "<!ATTLIST")) {
+            position += 9;
+            SkipSubsetWhitespace(internalSubset, position);
+            const auto elementName = ReadSubsetName(internalSubset, position);
+            if (elementName.empty()) {
+                ThrowMalformedDtdDeclaration("ATTLIST");
+            }
+
+            while (true) {
+                SkipSubsetWhitespace(internalSubset, position);
+                if (position >= internalSubset.size()) {
+                    ThrowMalformedDtdDeclaration("ATTLIST");
+                }
+                if (internalSubset[position] == '>') {
+                    ++position;
+                    break;
+                }
+
+                const auto attributeName = ReadSubsetName(internalSubset, position);
+                if (attributeName.empty()) {
+                    ThrowMalformedDtdDeclaration("ATTLIST");
+                }
+                const bool firstDeclaration = declaredAttributes[elementName].insert(attributeName).second;
+
+                SkipSubsetWhitespace(internalSubset, position);
+                auto attributeType = ReadSubsetAttlistToken(internalSubset, position);
+                if (!attributeType.has_value()) {
+                    ThrowMalformedDtdDeclaration("ATTLIST");
+                }
+                const bool isIdAttribute = *attributeType == "ID";
+                const bool isNotationAttribute = *attributeType == "NOTATION";
+                const bool isNmTokenAttribute = *attributeType == "NMTOKEN";
+                const bool isNmTokensAttribute = *attributeType == "NMTOKENS";
+                const bool isNameAttribute = *attributeType == "IDREF"
+                    || *attributeType == "IDREFS"
+                    || *attributeType == "ENTITY"
+                    || *attributeType == "ENTITIES";
+                const bool allowsMultipleNames = *attributeType == "IDREFS" || *attributeType == "ENTITIES";
+                if (isIdAttribute && firstDeclaration) {
+                    const auto existingIdAttribute = idAttributes.find(elementName);
+                    if (existingIdAttribute != idAttributes.end() && existingIdAttribute->second != attributeName) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    idAttributes[elementName] = attributeName;
+                }
+                if (isNotationAttribute && firstDeclaration) {
+                    const auto existingNotationAttribute = notationAttributes.find(elementName);
+                    if (existingNotationAttribute != notationAttributes.end() && existingNotationAttribute->second != attributeName) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    notationAttributes[elementName] = attributeName;
+                }
+                if (firstDeclaration && (isNmTokenAttribute || isNmTokensAttribute)) {
+                    UpsertDtdNmTokenDeclaration(
+                        nmTokenAttributes,
+                        elementName,
+                        attributeName,
+                        isNmTokensAttribute);
+                }
+                if (firstDeclaration && isNameAttribute) {
+                    UpsertDtdNameDeclaration(nameAttributes, elementName, attributeName, *attributeType);
+                }
+                std::optional<std::string> enumerationValueSet;
+                if (IsValidDtdEnumeratedValueSet(*attributeType, false)) {
+                    enumerationValueSet = *attributeType;
+                } else if (!IsValidDtdAttlistAttributeType(*attributeType) && *attributeType != "NOTATION") {
+                    ThrowMalformedDtdDeclaration("ATTLIST");
+                }
+                if (*attributeType == "NOTATION") {
+                    auto notationValues = ReadSubsetAttlistToken(internalSubset, position);
+                    if (!notationValues.has_value() || !IsValidDtdEnumeratedValueSet(*notationValues, true)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    enumerationValueSet = *notationValues;
+                }
+                if (firstDeclaration && enumerationValueSet.has_value()) {
+                    UpsertDtdEnumeratedDeclaration(
+                        enumeratedAttributes,
+                        elementName,
+                        attributeName,
+                        *enumerationValueSet);
+                }
+                if (attributeName == "xml:space") {
+                    if (!enumerationValueSet.has_value() || !IsValidXmlSpaceEnumerationValueSet(*enumerationValueSet)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                }
+
+                SkipSubsetWhitespace(internalSubset, position);
+                if (position >= internalSubset.size()) {
+                    ThrowMalformedDtdDeclaration("ATTLIST");
+                }
+
+                if (internalSubset[position] == '\'' || internalSubset[position] == '"') {
+                    if (isIdAttribute) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    std::string defaultValue = ReadSubsetQuotedValue(internalSubset, position);
+                    if (enumerationValueSet.has_value()
+                        && !AttributeValueMatchesDtdEnumeration(defaultValue, *enumerationValueSet)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    if ((isNmTokenAttribute || isNmTokensAttribute)
+                        && !IsValidDtdNmTokensValue(defaultValue, isNmTokensAttribute)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    if (isNameAttribute && !IsValidDtdNamesValue(defaultValue, allowsMultipleNames)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    if (firstDeclaration) {
+                        UpsertDtdValueDeclaration(
+                            defaultAttributes,
+                            elementName,
+                            attributeName,
+                            std::move(defaultValue));
+                    }
+                    continue;
+                }
+
+                auto defaultDeclaration = ReadSubsetAttlistToken(internalSubset, position);
+                if (!defaultDeclaration.has_value()) {
+                    ThrowMalformedDtdDeclaration("ATTLIST");
+                }
+
+                if (*defaultDeclaration == "#REQUIRED") {
+                    if (firstDeclaration) {
+                        AddDtdRequiredDeclaration(requiredAttributes, elementName, attributeName);
+                    }
+                    continue;
+                }
+
+                if (*defaultDeclaration == "#IMPLIED") {
+                    continue;
+                }
+
+                if (*defaultDeclaration == "#FIXED") {
+                    if (isIdAttribute) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    SkipSubsetWhitespace(internalSubset, position);
+                    if (position >= internalSubset.size() || (internalSubset[position] != '\'' && internalSubset[position] != '"')) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    std::string fixedValue = ReadSubsetQuotedValue(internalSubset, position);
+                    if (enumerationValueSet.has_value()
+                        && !AttributeValueMatchesDtdEnumeration(fixedValue, *enumerationValueSet)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    if ((isNmTokenAttribute || isNmTokensAttribute)
+                        && !IsValidDtdNmTokensValue(fixedValue, isNmTokensAttribute)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    if (isNameAttribute && !IsValidDtdNamesValue(fixedValue, allowsMultipleNames)) {
+                        ThrowMalformedDtdDeclaration("ATTLIST");
+                    }
+                    if (firstDeclaration) {
+                        UpsertDtdValueDeclaration(defaultAttributes, elementName, attributeName, fixedValue);
+                        UpsertDtdFixedDeclaration(fixedAttributes, elementName, attributeName, std::move(fixedValue));
+                    }
+                    continue;
+                }
+
+                ThrowMalformedDtdDeclaration("ATTLIST");
+            }
+            continue;
+        }
+
+        if (SubsetStartsWithAt(internalSubset, position, "<![")) {
+            bool includeSection = false;
+            std::string_view conditionalContent;
+            if (!ReadSubsetConditionalSection(internalSubset, position, includeSection, conditionalContent)) {
+                ThrowMalformedDtdDeclaration("conditional section");
+            }
+            if (includeSection) {
+                ParseDocumentTypeAttributeDeclarationsCore(
+                    conditionalContent,
+                    declaredAttributes,
+                    requiredAttributes,
+                    defaultAttributes,
+                    fixedAttributes,
+                    enumeratedAttributes,
+                    idAttributes,
+                    notationAttributes,
+                    nmTokenAttributes,
+                    nameAttributes);
+            }
+            continue;
+        }
+
+        if (!SkipSubsetDeclaration(internalSubset, position)) {
+            ThrowMalformedDtdDeclaration("declaration");
+        }
+    }
+}
+
+void ParseDocumentTypeAttributeDeclarations(
+    std::string_view internalSubset,
+    DtdRequiredAttributeDeclarations& requiredAttributes,
+    DtdDefaultAttributeDeclarations& defaultAttributes,
+    DtdFixedAttributeDeclarations& fixedAttributes,
+    DtdEnumeratedAttributeDeclarations& enumeratedAttributes,
+    DtdIdAttributeDeclarations& idAttributes,
+    DtdNotationAttributeDeclarations& notationAttributes,
+    DtdNmTokenAttributeDeclarations& nmTokenAttributes,
+    DtdNameAttributeDeclarations& nameAttributes) {
+    DtdDeclaredAttributeNames declaredAttributes;
+    ParseDocumentTypeAttributeDeclarationsCore(
+        internalSubset,
+        declaredAttributes,
+        requiredAttributes,
+        defaultAttributes,
+        fixedAttributes,
+        enumeratedAttributes,
+        idAttributes,
+        notationAttributes,
+        nmTokenAttributes,
+        nameAttributes);
+}
+
+void ParseDocumentTypeEmptyElementDeclarationsCore(
+    std::string_view internalSubset,
+    DtdEmptyElementDeclarations& emptyElementDeclarations) {
+    std::size_t position = 0;
+    while (position < internalSubset.size()) {
+        SkipSubsetWhitespace(internalSubset, position);
+        if (position >= internalSubset.size()) {
+            break;
+        }
+
+        if (StartsWithAt(internalSubset, position, "<!--")) {
+            const auto end = internalSubset.find("-->", position + 4);
+            position = end == std::string_view::npos ? internalSubset.size() : end + 3;
+            continue;
+        }
+
+        if (StartsWithAt(internalSubset, position, "<?")) {
+            const auto end = internalSubset.find("?>", position + 2);
+            position = end == std::string_view::npos ? internalSubset.size() : end + 2;
+            continue;
+        }
+
+        if (SubsetStartsWithAt(internalSubset, position, "<!ELEMENT")) {
+            const std::size_t declarationStart = position;
+            position += 9;
+            SkipSubsetWhitespace(internalSubset, position);
+            const auto elementName = ReadSubsetName(internalSubset, position);
+            if (elementName.empty()) {
+                ThrowMalformedDtdDeclaration("ELEMENT");
+            }
+
+            SkipSubsetWhitespace(internalSubset, position);
+            if (StartsWithAt(internalSubset, position, "EMPTY")) {
+                position += 5;
+                SkipSubsetWhitespace(internalSubset, position);
+                if (position >= internalSubset.size() || internalSubset[position] != '>') {
+                    ThrowMalformedDtdDeclaration("ELEMENT");
+                }
+                ++position;
+                emptyElementDeclarations.insert(elementName);
+                continue;
+            }
+
+            position = declarationStart;
+            if (!SkipSubsetDeclaration(internalSubset, position)) {
+                ThrowMalformedDtdDeclaration("ELEMENT");
+            }
+            continue;
+        }
+
+        if (SubsetStartsWithAt(internalSubset, position, "<![")) {
+            bool includeSection = false;
+            std::string_view conditionalContent;
+            if (!ReadSubsetConditionalSection(internalSubset, position, includeSection, conditionalContent)) {
+                ThrowMalformedDtdDeclaration("conditional section");
+            }
+            if (includeSection) {
+                ParseDocumentTypeEmptyElementDeclarationsCore(conditionalContent, emptyElementDeclarations);
+            }
+            continue;
+        }
+
+        if (!SkipSubsetDeclaration(internalSubset, position)) {
+            ThrowMalformedDtdDeclaration("declaration");
+        }
+    }
+}
+
+void ParseDocumentTypeEmptyElementDeclarations(
+    std::string_view internalSubset,
+    DtdEmptyElementDeclarations& emptyElementDeclarations) {
+    ParseDocumentTypeEmptyElementDeclarationsCore(internalSubset, emptyElementDeclarations);
 }
 
 

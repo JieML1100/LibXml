@@ -534,6 +534,9 @@ std::string XmlWriter::LookupNamespacePrefix(std::string_view namespaceUri) cons
     if (namespaceUri == "http://www.w3.org/XML/1998/namespace") {
         return "xml";
     }
+    if (namespaceUri == "http://www.w3.org/2000/xmlns/") {
+        return "xmlns";
+    }
     if (elementStack_.empty()) {
         return {};
     }
@@ -625,6 +628,9 @@ std::string XmlWriter::LookupDirectNamespacePrefix(std::string_view namespaceUri
     if (namespaceUri == "http://www.w3.org/XML/1998/namespace") {
         return "xml";
     }
+    if (namespaceUri == "http://www.w3.org/2000/xmlns/") {
+        return "xmlns";
+    }
 
     for (auto it = directElementStack_.rbegin(); it != directElementStack_.rend(); ++it) {
         if (!it->namespaceDeclarations) {
@@ -698,6 +704,9 @@ void XmlWriter::WriteDirectTopLevelNode(const XmlNode& node) {
 void XmlWriter::WriteStartDocument(std::string_view version, std::string_view encoding, std::string_view standalone) {
     EnsureDocumentOpen("write the XML declaration");
     EnsureNoOpenAttribute("write the XML declaration");
+    ValidateXmlDeclarationVersion(version);
+    ValidateXmlDeclarationEncoding(encoding);
+    ValidateXmlDeclarationStandalone(standalone);
     if (settings_.Conformance == ConformanceLevel::Fragment) {
         throw XmlException("XML declaration is only allowed in document conformance mode");
     }

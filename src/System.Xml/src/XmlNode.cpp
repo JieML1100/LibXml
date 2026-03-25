@@ -13,6 +13,16 @@ const std::vector<std::shared_ptr<XmlNode>>& EmptyXmlNodeChildren() noexcept {
     return empty;
 }
 
+std::string BuildValidatedXmlDeclarationValue(
+    const std::string& version,
+    const std::string& encoding,
+    const std::string& standalone) {
+    ValidateXmlDeclarationVersion(version);
+    ValidateXmlDeclarationEncoding(encoding);
+    ValidateXmlDeclarationStandalone(standalone);
+    return BuildDeclarationValue(version, encoding, standalone);
+}
+
 std::vector<std::shared_ptr<XmlNode>> CloneDocumentTypeDeclarations(const std::vector<std::shared_ptr<XmlNode>>& declarations) {
     std::vector<std::shared_ptr<XmlNode>> clones;
     clones.reserve(declarations.size());
@@ -1398,7 +1408,7 @@ void XmlProcessingInstruction::SetData(std::string_view data) {
 }
 
 XmlDeclaration::XmlDeclaration(std::string version, std::string encoding, std::string standalone)
-        : XmlNode(XmlNodeType::XmlDeclaration, "xml", BuildDeclarationValue(version, encoding, standalone)),
+    : XmlNode(XmlNodeType::XmlDeclaration, "xml", BuildValidatedXmlDeclarationValue(version, encoding, standalone)),
       version_(std::move(version)),
       encoding_(std::move(encoding)),
             standalone_(std::move(standalone)) {
@@ -1443,6 +1453,24 @@ XmlDocumentType::XmlDocumentType(
       internalSubset_(std::move(internalSubset)) {
     if (entities.empty() && notations.empty()) {
         ParseDocumentTypeInternalSubset(internalSubset_, entities_, notations_);
+        DtdRequiredAttributeDeclarations requiredAttributes;
+        DtdDefaultAttributeDeclarations defaultAttributes;
+        DtdFixedAttributeDeclarations fixedAttributes;
+        DtdEnumeratedAttributeDeclarations enumeratedAttributes;
+        DtdIdAttributeDeclarations idAttributes;
+        DtdNotationAttributeDeclarations notationAttributes;
+        DtdNmTokenAttributeDeclarations nmTokenAttributes;
+        DtdNameAttributeDeclarations nameAttributes;
+        ParseDocumentTypeAttributeDeclarations(
+            internalSubset_,
+            requiredAttributes,
+            defaultAttributes,
+            fixedAttributes,
+            enumeratedAttributes,
+            idAttributes,
+            notationAttributes,
+            nmTokenAttributes,
+            nameAttributes);
     } else {
         entities_ = CloneDocumentTypeDeclarations(entities);
         notations_ = CloneDocumentTypeDeclarations(notations);

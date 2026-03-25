@@ -86,6 +86,12 @@ public:
         }
     }
 
+    struct PendingDtdIdReference {
+        std::string value;
+        std::string attributeName;
+        std::string elementName;
+    };
+
     void ParseInto(XmlDocument& document) {
         document_ = &document;
         document.RemoveAll();
@@ -155,7 +161,11 @@ public:
         }
 
         const auto rootStart = position_;
-        appendParsedNode(ParseElement(document), rootStart);
+        auto rootElement = ParseElement(document);
+        if (!documentTypeName_.empty() && rootElement->Name() != documentTypeName_) {
+            Throw("Document type name '" + documentTypeName_ + "' does not match root element name '" + rootElement->Name() + "'");
+        }
+        appendParsedNode(rootElement, rootStart);
         SkipWhitespace();
 
         while (!IsEnd()) {
@@ -182,9 +192,26 @@ public:
                 break;
             }
         }
+
+        ValidatePendingDtdIdReferences();
     }
 
 private:
+    void ValidatePendingDtdIdReferences() const {
+        if (pendingDtdIdReferences_.empty()) {
+            return;
+        }
+
+        for (const auto& reference : pendingDtdIdReferences_) {
+            if (seenDtdIdAttributeValues_.find(reference.value) == seenDtdIdAttributeValues_.end()) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + reference.attributeName
+                    + "' on element '" + reference.elementName
+                    + "' references unknown ID value '" + reference.value + "'");
+            }
+        }
+    }
+
     XmlMarkupKind ClassifyMarkup() const noexcept {
         return ClassifyXmlMarkupWithCharAt(
             position_,
@@ -294,12 +321,154 @@ private:
         return decodeEntities ? DecodeEntities(raw) : std::string(raw);
     }
 
+    void ApplyDtdAttributeDeclarations(XmlElement& element) {
+        const auto fixedIt = dtdFixedAttributes_.find(element.Name());
+        if (fixedIt != dtdFixedAttributes_.end()) {
+            for (const auto& [attributeName, fixedValue] : fixedIt->second) {
+                if (element.HasAttribute(attributeName) && element.GetAttribute(attributeName) != fixedValue) {
+                    throw XmlException(
+                        "DTD validation failed: attribute '" + attributeName
+                        + "' on element '" + element.Name() + "' must match the fixed value '" + fixedValue + "'");
+                }
+            }
+        }
+
+        const auto requiredIt = dtdRequiredAttributes_.find(element.Name());
+        if (requiredIt != dtdRequiredAttributes_.end()) {
+            for (const auto& attributeName : requiredIt->second) {
+                if (!element.HasAttribute(attributeName)) {
+                    throw XmlException(
+                        "DTD validation failed: required attribute '" + attributeName
+                        + "' is missing on element '" + element.Name() + "'");
+                }
+            }
+        }
+
+        const auto defaultIt = dtdDefaultAttributes_.find(element.Name());
+        if (defaultIt != dtdDefaultAttributes_.end()) {
+            for (const auto& [attributeName, defaultValue] : defaultIt->second) {
+                if (!element.HasAttribute(attributeName)) {
+                    element.SetAttribute(attributeName, defaultValue);
+                }
+            }
+        }
+
+        const auto enumeratedIt = dtdEnumeratedAttributes_.find(element.Name());
+        const auto nmTokenIt = dtdNmTokenAttributes_.find(element.Name());
+        const auto nameIt = dtdNameAttributes_.find(element.Name());
+        const auto idIt = dtdIdAttributes_.find(element.Name());
+        if (idIt != dtdIdAttributes_.end() && element.HasAttribute(idIt->second)) {
+            const std::string value = element.GetAttribute(idIt->second);
+            if (!IsValidDtdName(value)) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + idIt->second
+                    + "' on element '" + element.Name()
+                    + "' must be a valid ID value");
+            }
+            if (!seenDtdIdAttributeValues_.insert(value).second) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + idIt->second
+                    + "' on element '" + element.Name()
+                    + "' duplicates ID value '" + value + "'");
+            }
+        }
+
+        if (nmTokenIt != dtdNmTokenAttributes_.end()) {
+            for (const auto& [attributeName, allowMultipleTokens] : nmTokenIt->second) {
+                if (!element.HasAttribute(attributeName)) {
+                    continue;
+                }
+
+                if (!IsValidDtdNmTokensValue(element.GetAttribute(attributeName), allowMultipleTokens)) {
+                    throw XmlException(
+                        "DTD validation failed: attribute '" + attributeName
+                        + "' on element '" + element.Name()
+                        + "' must be a valid "
+                        + std::string(allowMultipleTokens ? "NMTOKENS" : "NMTOKEN")
+                        + " value");
+                }
+            }
+        }
+
+        if (nameIt != dtdNameAttributes_.end()) {
+            for (const auto& [attributeName, attributeType] : nameIt->second) {
+                if (!element.HasAttribute(attributeName)) {
+                    continue;
+                }
+
+                const std::string value = element.GetAttribute(attributeName);
+                const bool allowsMultipleNames = attributeType == "IDREFS" || attributeType == "ENTITIES";
+                if (!IsValidDtdNamesValue(value, allowsMultipleNames)) {
+                    throw XmlException(
+                        "DTD validation failed: attribute '" + attributeName
+                        + "' on element '" + element.Name()
+                        + "' must be a valid " + attributeType + " value");
+                }
+
+                if (attributeType == "ENTITY" || attributeType == "ENTITIES") {
+                    ForEachDtdNamesValueToken(value, [&](std::string_view entityName) {
+                        if (!HasDocumentUnparsedEntityDeclaration(document_, entityName)) {
+                            throw XmlException(
+                                "DTD validation failed: attribute '" + attributeName
+                                + "' on element '" + element.Name()
+                                + "' must reference a declared unparsed " + attributeType + " value");
+                        }
+                    });
+                } else if (attributeType == "IDREF" || attributeType == "IDREFS") {
+                    ForEachDtdNamesValueToken(value, [&](std::string_view idValue) {
+                        pendingDtdIdReferences_.push_back(PendingDtdIdReference{
+                            std::string(idValue),
+                            attributeName,
+                            element.Name()});
+                    });
+                }
+            }
+        }
+
+        if (enumeratedIt == dtdEnumeratedAttributes_.end()) {
+            return;
+        }
+
+        for (const auto& [attributeName, enumerationValueSet] : enumeratedIt->second) {
+            if (!element.HasAttribute(attributeName)) {
+                continue;
+            }
+
+            if (!AttributeValueMatchesDtdEnumeration(element.GetAttribute(attributeName), enumerationValueSet)) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + attributeName
+                    + "' on element '" + element.Name()
+                    + "' must match one of " + enumerationValueSet);
+            }
+        }
+    }
+
+    bool ResolveElementPreserveSpace(const XmlElement& element, bool inheritedPreserveSpace) const {
+        bool preserveSpace = inheritedPreserveSpace;
+        for (const auto& attribute : element.Attributes()) {
+            if (attribute == nullptr || attribute->Name() != "xml:space") {
+                continue;
+            }
+
+            if (IsXmlSpacePreserve(attribute->Value())) {
+                preserveSpace = true;
+            } else if (IsXmlSpaceDefault(attribute->Value())) {
+                preserveSpace = false;
+            }
+        }
+
+        return preserveSpace;
+    }
+
     std::shared_ptr<XmlDeclaration> ParseDeclaration(XmlDocument& document) {
         Consume("<?xml");
 
         std::string version = "1.0";
         std::string encoding;
         std::string standalone;
+        bool sawVersion = false;
+        bool sawEncoding = false;
+        bool sawStandalone = false;
 
         while (true) {
             SkipWhitespace();
@@ -317,14 +486,44 @@ private:
             const std::string value = ParseQuotedValue();
 
             if (name == "version") {
+                if (sawEncoding || sawStandalone) {
+                    Throw("Malformed XML declaration");
+                }
+                if (sawVersion) {
+                    Throw("Malformed XML declaration");
+                }
+                sawVersion = true;
+                ValidateXmlDeclarationVersion(value);
                 version = value;
             } else if (name == "encoding") {
+                if (!sawVersion || sawStandalone) {
+                    Throw("Malformed XML declaration");
+                }
+                if (sawEncoding) {
+                    Throw("Malformed XML declaration");
+                }
+                sawEncoding = true;
+                ValidateXmlDeclarationEncoding(value);
                 encoding = value;
             } else if (name == "standalone") {
+                if (!sawVersion) {
+                    Throw("Malformed XML declaration");
+                }
+                if (sawStandalone) {
+                    Throw("Malformed XML declaration");
+                }
+                sawStandalone = true;
+                if (value != "yes" && value != "no") {
+                    Throw("Malformed XML declaration");
+                }
                 standalone = value;
             } else {
                 Throw("Unsupported XML declaration attribute: " + name);
             }
+        }
+
+        if (!sawVersion) {
+            Throw("Malformed XML declaration");
         }
 
         return document.CreateXmlDeclaration(version, encoding, standalone);
@@ -464,10 +663,47 @@ private:
         if (Read() != '>') {
             Throw("Expected '>' after DOCTYPE");
         }
+
+        dtdRequiredAttributes_.clear();
+        dtdDefaultAttributes_.clear();
+        dtdFixedAttributes_.clear();
+        dtdEnumeratedAttributes_.clear();
+        dtdNmTokenAttributes_.clear();
+        dtdNameAttributes_.clear();
+        dtdIdAttributes_.clear();
+        dtdEmptyElementDeclarations_.clear();
+        seenDtdIdAttributeValues_.clear();
+        pendingDtdIdReferences_.clear();
+        if (!internalSubset.empty()) {
+            ParseDocumentTypeEmptyElementDeclarations(internalSubset, dtdEmptyElementDeclarations_);
+            DtdIdAttributeDeclarations idAttributes;
+            DtdNotationAttributeDeclarations notationAttributes;
+            DtdNmTokenAttributeDeclarations nmTokenAttributes;
+            DtdNameAttributeDeclarations nameAttributes;
+            ParseDocumentTypeAttributeDeclarations(
+                internalSubset,
+                dtdRequiredAttributes_,
+                dtdDefaultAttributes_,
+                dtdFixedAttributes_,
+                dtdEnumeratedAttributes_,
+                idAttributes,
+                notationAttributes,
+                nmTokenAttributes,
+                nameAttributes);
+            dtdIdAttributes_ = std::move(idAttributes);
+            dtdNmTokenAttributes_ = std::move(nmTokenAttributes);
+            dtdNameAttributes_ = std::move(nameAttributes);
+        }
+        documentTypeName_ = name;
         return document.CreateDocumentType(name, publicId, systemId, internalSubset);
     }
 
-    void AppendParsedCharacterData(XmlDocument& document, XmlElement& element) {
+    void AppendParsedCharacterData(XmlDocument& document, XmlElement& element, bool preserveSpace) {
+        if (dtdEmptyElementDeclarations_.find(element.Name()) != dtdEmptyElementDeclarations_.end()) {
+            throw XmlException(
+                "DTD validation failed: element '" + element.Name() + "' declared EMPTY must not contain character data");
+        }
+
         std::string textBuffer;
         std::size_t rawSegmentStart = std::string::npos;
         bool textBufferMaterialized = false;
@@ -482,7 +718,9 @@ private:
                 textBufferMaterialized = true;
             }
 
-            if (document.PreserveWhitespace() && IsWhitespaceOnly(textBuffer)) {
+            if (preserveSpace && IsWhitespaceOnly(textBuffer)) {
+                element.AppendChildForOwnedLoad(document.CreateSignificantWhitespace(textBuffer));
+            } else if (document.PreserveWhitespace() && IsWhitespaceOnly(textBuffer)) {
                 element.AppendChildForOwnedLoad(document.CreateWhitespace(textBuffer));
             } else if (document.PreserveWhitespace() || !IsWhitespaceOnly(textBuffer) || preserveWhitespaceOnly) {
                 element.AppendChildForOwnedLoad(document.CreateTextNode(textBuffer));
@@ -562,11 +800,12 @@ private:
         flushText(position_, sawEntityReference);
     }
 
-    std::shared_ptr<XmlElement> ParseElement(XmlDocument& document) {
+    std::shared_ptr<XmlElement> ParseElement(XmlDocument& document, bool inheritedPreserveSpace = false) {
         Expect('<');
         const std::string name = ParseName();
         auto element = document.CreateElement(name);
         const std::string_view text = input_;
+        bool childPreserveSpace = inheritedPreserveSpace;
 
         while (true) {
             SkipWhitespace();
@@ -580,6 +819,8 @@ private:
                     [&text](std::size_t position, std::string_view token) noexcept {
                         return SubsetStartsWithAt(text, position, token);
                     })) {
+                ApplyDtdAttributeDeclarations(*element);
+                childPreserveSpace = ResolveElementPreserveSpace(*element, inheritedPreserveSpace);
                 if (isEmptyElement) {
                     return element;
                 }
@@ -627,9 +868,18 @@ private:
                 const auto [line, column] = ComputeLineColumn(invalidLt);
                 throw XmlException("'<' is not allowed in attribute values", line, column);
             }
+            std::string attributeValue = DecodeEntities(input_.substr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart));
+            if (attributeToken.name == "xmlns") {
+                ValidateNamespaceDeclarationBinding({}, attributeValue);
+            } else {
+                const auto [attributePrefix, attributeLocalName] = SplitQualifiedNameView(attributeToken.name);
+                if (attributePrefix == "xmlns") {
+                    ValidateNamespaceDeclarationBinding(attributeLocalName, attributeValue);
+                }
+            }
             element->AppendAttributeForLoad(
                 attributeToken.name,
-                DecodeEntities(input_.substr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart)));
+                std::move(attributeValue));
         }
 
         while (true) {
@@ -663,6 +913,10 @@ private:
                 element->AppendChildForOwnedLoad(ParseComment(document));
                 break;
             case XmlMarkupKind::CData:
+                if (dtdEmptyElementDeclarations_.find(name) != dtdEmptyElementDeclarations_.end()) {
+                    throw XmlException(
+                        "DTD validation failed: element '" + name + "' declared EMPTY must not contain character data");
+                }
                 element->AppendChildForOwnedLoad(ParseCData(document));
                 break;
             case XmlMarkupKind::ProcessingInstruction:
@@ -675,13 +929,17 @@ private:
                 Throw("Unsupported markup declaration");
                 break;
             case XmlMarkupKind::Element:
-                element->AppendChildForOwnedLoad(ParseElement(document));
+                if (dtdEmptyElementDeclarations_.find(name) != dtdEmptyElementDeclarations_.end()) {
+                    throw XmlException(
+                        "DTD validation failed: element '" + name + "' declared EMPTY must not contain child elements");
+                }
+                element->AppendChildForOwnedLoad(ParseElement(document, childPreserveSpace));
                 break;
             case XmlMarkupKind::None:
                 if (IsEnd()) {
                     Throw("Unexpected end of input inside element <" + name + ">");
                 }
-                AppendParsedCharacterData(document, *element);
+                AppendParsedCharacterData(document, *element, childPreserveSpace);
                 break;
             case XmlMarkupKind::XmlDeclaration:
                 position_ += 5;
@@ -694,6 +952,17 @@ private:
     std::string_view input_;
     std::size_t position_;
     XmlDocument* document_ = nullptr;
+    DtdRequiredAttributeDeclarations dtdRequiredAttributes_;
+    DtdDefaultAttributeDeclarations dtdDefaultAttributes_;
+    DtdFixedAttributeDeclarations dtdFixedAttributes_;
+    DtdEnumeratedAttributeDeclarations dtdEnumeratedAttributes_;
+    DtdNmTokenAttributeDeclarations dtdNmTokenAttributes_;
+    DtdNameAttributeDeclarations dtdNameAttributes_;
+    DtdIdAttributeDeclarations dtdIdAttributes_;
+    DtdEmptyElementDeclarations dtdEmptyElementDeclarations_;
+    std::unordered_set<std::string> seenDtdIdAttributeValues_;
+    std::vector<PendingDtdIdReference> pendingDtdIdReferences_;
+    std::string documentTypeName_;
 };
 
 std::shared_ptr<XmlDocument> BuildXmlDocumentFromReader(XmlReader& reader) {

@@ -241,9 +241,13 @@ bool XmlNodeReader::MoveToElement() {
 }
 
 std::string XmlNodeReader::LookupNamespace(std::string_view prefix) const {
-    // XmlNodeReader resolves namespaces from the current event's attribute namespace URIs
     const auto* event = CurrentEvent();
     if (event == nullptr) return {};
+
+    if (event->sourceNode != nullptr) {
+        return event->sourceNode->GetNamespaceOfPrefix(prefix);
+    }
+
     for (std::size_t i = 0; i < event->attributes.size(); ++i) {
         const auto& [name, value] = event->attributes[i];
         if (name == "xmlns" && prefix.empty()) return value;
@@ -554,6 +558,7 @@ void XmlNodeReader::BuildEvents(const XmlNode& node, int depth, bool preserveSpa
         const bool isEmptyElement = !element.HasChildNodes() && !element.WritesFullEndElement();
         AppendEvent(
             XmlNodeType::Element,
+            &node,
             element.Name(),
             element.NamespaceURI(),
             {},
@@ -571,13 +576,14 @@ void XmlNodeReader::BuildEvents(const XmlNode& node, int depth, bool preserveSpa
         }
 
         if (!isEmptyElement) {
-            AppendEvent(XmlNodeType::EndElement, element.Name(), element.NamespaceURI(), {}, depth, false, {}, "</" + element.Name() + ">" );
+            AppendEvent(XmlNodeType::EndElement, &node, element.Name(), element.NamespaceURI(), {}, depth, false, {}, "</" + element.Name() + ">" );
         }
         return;
     }
     case XmlNodeType::EntityReference:
         AppendEvent(
             XmlNodeType::EntityReference,
+            &node,
             node.Name(),
             node.NamespaceURI(),
             node.Value(),
@@ -589,9 +595,9 @@ void XmlNodeReader::BuildEvents(const XmlNode& node, int depth, bool preserveSpa
             const XmlNodeType textNodeType = IsWhitespaceOnly(node.Value())
                 ? (preserveSpace ? XmlNodeType::SignificantWhitespace : XmlNodeType::Whitespace)
                 : XmlNodeType::Text;
-            AppendEvent(textNodeType, {}, {}, node.Value(), depth + 1, false, {}, node.Value());
+            AppendEvent(textNodeType, &node, {}, {}, node.Value(), depth + 1, false, {}, node.Value());
         }
-        AppendEvent(XmlNodeType::EndEntity, node.Name(), node.NamespaceURI(), {}, depth, false, {}, node.OuterXml());
+        AppendEvent(XmlNodeType::EndEntity, &node, node.Name(), node.NamespaceURI(), {}, depth, false, {}, node.OuterXml());
         return;
     default:
         const bool anonymousReaderNode = node.NodeType() == XmlNodeType::Text
@@ -601,6 +607,7 @@ void XmlNodeReader::BuildEvents(const XmlNode& node, int depth, bool preserveSpa
             || node.NodeType() == XmlNodeType::SignificantWhitespace;
         AppendEvent(
             node.NodeType(),
+            &node,
             anonymousReaderNode ? std::string{} : node.Name(),
             node.NamespaceURI(),
             node.Value(),
@@ -614,6 +621,7 @@ void XmlNodeReader::BuildEvents(const XmlNode& node, int depth, bool preserveSpa
 
 void XmlNodeReader::AppendEvent(
     XmlNodeType nodeType,
+    const XmlNode* sourceNode,
     std::string name,
     std::string namespaceUri,
     std::string value,
@@ -655,6 +663,7 @@ void XmlNodeReader::AppendEvent(
 
     events_.push_back(NodeEvent{
         nodeType,
+        sourceNode,
         std::move(name),
         std::move(localName),
         std::move(prefix),

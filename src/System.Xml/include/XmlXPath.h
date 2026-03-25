@@ -16,7 +16,7 @@ enum class XmlNodeType;
 class XPathNavigator final {
 public:
     XPathNavigator() = default;
-    explicit XPathNavigator(const XmlNode* node);
+    explicit XPathNavigator(const XmlNode* node, const XmlNode* namespaceParent = nullptr);
 
     bool IsEmpty() const noexcept;
     XmlNodeType NodeType() const;
@@ -47,6 +47,7 @@ public:
 
 private:
     const XmlNode* node_ = nullptr;
+    const XmlNode* namespaceParent_ = nullptr;
 };
 
 class XPathDocument final {

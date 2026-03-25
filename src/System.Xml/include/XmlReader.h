@@ -115,11 +115,32 @@ private:
         unsigned char flags = 0;
     };
 
+    struct PendingDtdIdReference {
+        std::string value;
+        std::string attributeName;
+        std::string elementName;
+    };
+
     struct DtdState {
         std::unordered_map<std::string, std::string> entityDeclarations;
         std::unordered_set<std::string> declaredEntityNames;
         std::unordered_set<std::string> notationDeclarationNames;
         std::unordered_set<std::string> unparsedEntityDeclarationNames;
+        std::unordered_set<std::string> seenIdAttributeValues;
+        std::unordered_set<std::string> emptyElementDeclarations;
+        std::vector<PendingDtdIdReference> pendingIdAttributeReferences;
+        std::unordered_map<std::string, std::string> idAttributes;
+        std::unordered_map<std::string, std::string> notationAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, bool>> nmTokenAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> nameAttributes;
+        std::unordered_map<std::string, std::unordered_set<std::string>> requiredAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> defaultAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> fixedAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> enumeratedAttributes;
+        std::unordered_map<std::string, std::unordered_set<std::string>> externalRequiredAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> externalDefaultAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> externalFixedAttributes;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> externalEnumeratedAttributes;
         std::unordered_map<std::string, std::string> externalEntitySystemIds;
         std::vector<std::shared_ptr<XmlNode>> parsedEntities;
         std::vector<std::shared_ptr<XmlNode>> parsedNotations;
@@ -174,9 +195,25 @@ private:
     void RegisterDtdDeclarations(
         const std::vector<std::shared_ptr<XmlNode>>& entities,
         const std::vector<std::shared_ptr<XmlNode>>& notations);
+    void RegisterDtdAttributeDeclarations(
+        const std::unordered_map<std::string, std::string>& idAttributes,
+        const std::unordered_map<std::string, std::string>& notationAttributes,
+        const std::unordered_map<std::string, std::unordered_map<std::string, bool>>& nmTokenAttributes,
+        const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& nameAttributes,
+        const std::unordered_map<std::string, std::unordered_set<std::string>>& requiredAttributes,
+        const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& defaultAttributes,
+        const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& fixedAttributes,
+        const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& enumeratedAttributes,
+        bool fromExternalSubset = false);
     void LoadExternalSubsetDeclarations(std::string_view systemLiteral);
     void EnsureExternalSubsetDeclarationsLoaded();
+    void ApplyDtdAttributeDeclarations(
+        std::string_view elementName,
+        std::vector<std::pair<std::string, std::string>>& attributes,
+        std::vector<AttributeValueMetadata>& attributeValueMetadata,
+        bool& retainLocalNamespaceDeclarationsForAttributes) const;
     [[noreturn]] void ThrowUnknownEntityReference(std::string_view entity) const;
+    void ValidatePendingDtdIdReferences();
     void FinalizeSuccessfulRead();
     std::string CurrentLocalName() const;
     std::string CurrentPrefix() const;
@@ -260,6 +297,8 @@ private:
     mutable std::vector<std::string> currentAttributeNamespaceUris_;
     std::vector<std::pair<std::string, std::string>> currentLocalNamespaceDeclarations_;
     mutable std::size_t currentEarliestRetainedAttributeValueStart_ = std::string::npos;
+    std::string documentDeclarationStandalone_;
+    std::string documentTypeName_;
     std::string currentDeclarationVersion_;
     std::string currentDeclarationEncoding_;
     std::string currentDeclarationStandalone_;
