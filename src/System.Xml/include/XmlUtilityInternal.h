@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -68,6 +69,10 @@ bool IsWhitespace(char ch) {
 }
 
 bool IsNameStartChar(char ch) {
+    if (static_cast<unsigned char>(ch) >= 0x80) {
+        return true;
+    }
+
     static constexpr bool kIsNameStartCharTable[256] = {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -90,6 +95,10 @@ bool IsNameStartChar(char ch) {
 }
 
 bool IsNameChar(char ch) {
+    if (static_cast<unsigned char>(ch) >= 0x80) {
+        return true;
+    }
+
     static constexpr bool kIsNameCharTable[256] = {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -109,6 +118,119 @@ bool IsNameChar(char ch) {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     };
     return kIsNameCharTable[static_cast<unsigned char>(ch)];
+}
+
+bool IsXmlNameStartCodePoint(std::uint32_t codePoint) noexcept {
+    return codePoint == ':'
+        || (codePoint >= 'A' && codePoint <= 'Z')
+        || codePoint == '_'
+        || (codePoint >= 'a' && codePoint <= 'z')
+        || (codePoint >= 0xC0 && codePoint <= 0xD6)
+        || (codePoint >= 0xD8 && codePoint <= 0xF6)
+        || (codePoint >= 0xF8 && codePoint <= 0x2FF)
+        || (codePoint >= 0x370 && codePoint <= 0x37D)
+        || (codePoint >= 0x37F && codePoint <= 0x1FFF)
+        || (codePoint >= 0x200C && codePoint <= 0x200D)
+        || (codePoint >= 0x2070 && codePoint <= 0x218F)
+        || (codePoint >= 0x2C00 && codePoint <= 0x2FEF)
+        || (codePoint >= 0x3001 && codePoint <= 0xD7FF)
+        || (codePoint >= 0xF900 && codePoint <= 0xFDCF)
+        || (codePoint >= 0xFDF0 && codePoint <= 0xFFFD)
+        || (codePoint >= 0x10000 && codePoint <= 0xEFFFF);
+}
+
+bool IsXmlNameCodePoint(std::uint32_t codePoint) noexcept {
+    return IsXmlNameStartCodePoint(codePoint)
+        || codePoint == '-'
+        || codePoint == '.'
+        || (codePoint >= '0' && codePoint <= '9')
+        || codePoint == 0xB7
+        || (codePoint >= 0x0300 && codePoint <= 0x036F)
+        || (codePoint >= 0x203F && codePoint <= 0x2040);
+}
+
+template <typename CharAtFn>
+bool DecodeUtf8CodePointAt(std::size_t position, CharAtFn&& charAt, std::uint32_t& codePoint, std::size_t& width) noexcept {
+    const auto first = static_cast<unsigned char>(charAt(position));
+    if (first == 0) {
+        return false;
+    }
+
+    if (first < 0x80) {
+        codePoint = first;
+        width = 1;
+        return true;
+    }
+
+    std::uint32_t value = 0;
+    std::uint32_t minValue = 0;
+    if ((first & 0xE0) == 0xC0) {
+        value = first & 0x1Fu;
+        width = 2;
+        minValue = 0x80;
+    } else if ((first & 0xF0) == 0xE0) {
+        value = first & 0x0Fu;
+        width = 3;
+        minValue = 0x800;
+    } else if ((first & 0xF8) == 0xF0) {
+        value = first & 0x07u;
+        width = 4;
+        minValue = 0x10000;
+    } else {
+        return false;
+    }
+
+    for (std::size_t index = 1; index < width; ++index) {
+        const auto continuation = static_cast<unsigned char>(charAt(position + index));
+        if (continuation == 0 || (continuation & 0xC0) != 0x80) {
+            return false;
+        }
+        value = (value << 6) | static_cast<std::uint32_t>(continuation & 0x3Fu);
+    }
+
+    if (value < minValue || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
+        return false;
+    }
+
+    codePoint = value;
+    return true;
+}
+
+template <typename CharAtFn>
+std::size_t ConsumeXmlNameAt(std::size_t position, CharAtFn&& charAt, bool ncName = false) noexcept {
+    std::uint32_t codePoint = 0;
+    std::size_t width = 0;
+    if (!DecodeUtf8CodePointAt(position, charAt, codePoint, width)) {
+        return position;
+    }
+
+    if (!IsXmlNameStartCodePoint(codePoint) || (ncName && codePoint == ':')) {
+        return position;
+    }
+
+    position += width;
+    while (DecodeUtf8CodePointAt(position, charAt, codePoint, width)) {
+        if (!IsXmlNameCodePoint(codePoint) || (ncName && codePoint == ':')) {
+            break;
+        }
+        position += width;
+    }
+
+    return position;
+}
+
+template <typename CharAtFn>
+std::size_t ConsumeXmlNmTokenAt(std::size_t position, CharAtFn&& charAt, bool ncName = false) noexcept {
+    std::uint32_t codePoint = 0;
+    std::size_t width = 0;
+    std::size_t current = position;
+    while (DecodeUtf8CodePointAt(current, charAt, codePoint, width)) {
+        if (!IsXmlNameCodePoint(codePoint) || (ncName && codePoint == ':')) {
+            break;
+        }
+        current += width;
+    }
+    return current;
 }
 
 std::size_t ConsumeNameCharsInBuffer(const char* data, std::size_t length) noexcept {
@@ -297,13 +419,14 @@ std::pair<std::string_view, std::string_view> SplitQualifiedNameView(std::string
 }
 
 bool IsValidXmlNameToken(std::string_view name) {
-    if (name.empty() || !IsNameStartChar(name.front())) {
+    if (name.empty()) {
         return false;
     }
 
-    return std::all_of(name.begin() + 1, name.end(), [](char ch) {
-        return IsNameChar(ch);
+    const auto end = ConsumeXmlNameAt(0, [name](std::size_t index) noexcept {
+        return index < name.size() ? name[index] : '\0';
     });
+    return end == name.size();
 }
 
 bool IsValidXmlQualifiedName(std::string_view name) {

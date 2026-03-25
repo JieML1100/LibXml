@@ -22,10 +22,14 @@ public:
     ~XmlDocument() override;
 
     static std::shared_ptr<XmlDocument> Parse(std::string_view xml);
+    static std::shared_ptr<XmlDocument> Parse(std::string_view xml, const XmlReaderSettings& settings);
 
     void LoadXml(std::string_view xml);
+    void LoadXml(std::string_view xml, const XmlReaderSettings& settings);
     void Load(const std::string& path);
+    void Load(const std::string& path, const XmlReaderSettings& settings);
     void Load(std::istream& stream);
+    void Load(std::istream& stream, const XmlReaderSettings& settings);
     void Save(const std::string& path, const XmlWriterSettings& settings = {}) const;
     void Save(std::ostream& stream, const XmlWriterSettings& settings = {}) const;
     void Validate(const XmlSchemaSet& schemas) const;

@@ -187,7 +187,6 @@ struct XPathStep {
 
 struct XPathContext {
     const XmlNode* node = nullptr;
-    std::shared_ptr<XmlNode> shared;
 };
 
 std::vector<const XmlNode*> ResolveXPathIdTargetNodes(
@@ -211,11 +210,19 @@ std::shared_ptr<XmlNode> FindSharedNode(const XmlNode& node) {
     }
 
     if (node.NodeType() == XmlNodeType::Attribute && parent->NodeType() == XmlNodeType::Element) {
+        if (auto shared = static_cast<const XmlAttribute&>(node).SharedFromOwnerElement(); shared != nullptr) {
+            return shared;
+        }
+
         const auto& attributes = static_cast<const XmlElement*>(parent)->Attributes();
         const auto found = std::find_if(attributes.begin(), attributes.end(), [&node](const auto& attribute) {
             return attribute.get() == &node;
         });
         return found == attributes.end() ? nullptr : *found;
+    }
+
+    if (auto shared = node.SharedFromParent(); shared != nullptr) {
+        return shared;
     }
 
     const auto& siblings = parent->ChildNodes();
@@ -249,6 +256,38 @@ XmlNodeList CreateXPathNodeListFromSingleNode(const XmlNode* node) {
 
     std::vector<std::shared_ptr<XmlNode>> nodes;
     nodes.push_back(std::move(shared));
+    return XmlNodeList(std::move(nodes));
+}
+
+XmlNodeList CreateXPathNodeListFromContexts(const std::vector<XPathContext>& contexts) {
+    std::vector<std::shared_ptr<XmlNode>> nodes;
+    nodes.reserve(contexts.size());
+    for (const auto& context : contexts) {
+        if (context.node == nullptr) {
+            continue;
+        }
+
+        if (auto shared = GetXPathResultSharedNode(*context.node); shared != nullptr) {
+            nodes.push_back(std::move(shared));
+        }
+    }
+
+    return XmlNodeList(std::move(nodes));
+}
+
+XmlNodeList CreateXPathNodeListFromRawNodes(const std::vector<const XmlNode*>& rawNodes) {
+    std::vector<std::shared_ptr<XmlNode>> nodes;
+    nodes.reserve(rawNodes.size());
+    for (const auto* node : rawNodes) {
+        if (node == nullptr) {
+            continue;
+        }
+
+        if (auto shared = GetXPathResultSharedNode(*node); shared != nullptr) {
+            nodes.push_back(std::move(shared));
+        }
+    }
+
     return XmlNodeList(std::move(nodes));
 }
 
@@ -314,6 +353,7 @@ bool IsXPathNodeSetTargetKind(XPathStep::PredicateTarget::Kind kind) {
 }
 
 void SortXPathUnionNodesInDocumentOrder(std::vector<std::shared_ptr<XmlNode>>& nodes);
+void SortXPathUnionNodesInDocumentOrder(std::vector<const XmlNode*>& nodes);
 
 bool UsesCompiledXPathPredicateTargetPath(const XPathStep::PredicateTarget& target) {
     return target.kind == XPathStep::PredicateTarget::Kind::ChildPath
@@ -406,13 +446,12 @@ const XmlNode* MatchSimpleXPathPredicateSelfTarget(
     }
 }
 
-std::vector<std::shared_ptr<XmlNode>> CollectXPathNodeSetInDocumentOrder(const XmlNodeList& matches) {
-    std::vector<std::shared_ptr<XmlNode>> nodes;
+std::vector<const XmlNode*> CollectXPathNodeSetInDocumentOrder(const XmlNodeList& matches) {
+    std::vector<const XmlNode*> nodes;
     nodes.reserve(matches.Count());
-    for (std::size_t matchIndex = 0; matchIndex < matches.Count(); ++matchIndex) {
-        const auto& match = matches.Item(matchIndex);
+    for (const auto& match : matches) {
         if (match != nullptr) {
-            nodes.push_back(match);
+            nodes.push_back(match.get());
         }
     }
 
@@ -544,9 +583,66 @@ bool TryParseXPathProcessingInstructionNodeTest(
 
 bool IsWrappedXPathExpression(std::string_view expression);
 
+bool MatchesXPathElement(const XmlNode& node, const XPathStep& step, const XmlNamespaceManager* namespaces);
+
 void CollectFollowingContexts(const XmlNode& node, std::vector<XPathContext>& contexts);
 
 void CollectPrecedingContexts(const XmlNode& node, std::vector<XPathContext>& contexts);
+
+bool CollectPrecedingCandidates(
+    const std::shared_ptr<XmlNode>& current,
+    const XmlNode& target,
+    const std::unordered_set<const XmlNode*>& ancestors,
+    std::vector<XPathContext>& preceding) {
+    if (current == nullptr) {
+        return false;
+    }
+
+    if (current.get() == &target) {
+        return true;
+    }
+
+    if (ancestors.find(current.get()) == ancestors.end()) {
+        preceding.push_back({current.get()});
+    }
+
+    for (const auto& child : current->ChildNodes()) {
+        if (CollectPrecedingCandidates(child, target, ancestors, preceding)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool CollectMatchingPrecedingCandidates(
+    const std::shared_ptr<XmlNode>& current,
+    const XmlNode& target,
+    const std::unordered_set<const XmlNode*>& ancestors,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& preceding) {
+    if (current == nullptr) {
+        return false;
+    }
+
+    if (current.get() == &target) {
+        return true;
+    }
+
+    if (ancestors.find(current.get()) == ancestors.end()
+        && MatchesXPathElement(*current, step, namespaces)) {
+        preceding.push_back({current.get()});
+    }
+
+    for (const auto& child : current->ChildNodes()) {
+        if (CollectMatchingPrecedingCandidates(child, target, ancestors, step, namespaces, preceding)) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 void SortXPathUnionNodesInDocumentOrder(std::vector<std::shared_ptr<XmlNode>>& nodes);
 
@@ -1444,6 +1540,20 @@ std::string TrimAsciiWhitespace(std::string value) {
     return std::string(first, last);
 }
 
+std::string_view TrimAsciiWhitespaceView(std::string_view value) {
+    std::size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+
+    std::size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+
+    return value.substr(start, end - start);
+}
+
 bool IsWrappedXPathExpression(std::string_view expression) {
     if (expression.size() < 2 || expression.front() != '(' || expression.back() != ')') {
         return false;
@@ -1478,8 +1588,8 @@ bool IsWrappedXPathExpression(std::string_view expression) {
     return depth == 0;
 }
 
-std::vector<std::string> SplitXPathExpressionTopLevel(std::string_view expression, std::string_view separator) {
-    std::vector<std::string> parts;
+std::vector<std::string_view> SplitXPathExpressionTopLevel(std::string_view expression, std::string_view separator) {
+    std::vector<std::string_view> parts;
     std::size_t start = 0;
     int depth = 0;
     int bracketDepth = 0;
@@ -1521,7 +1631,7 @@ std::vector<std::string> SplitXPathExpressionTopLevel(std::string_view expressio
 
         if (depth == 0 && bracketDepth == 0 && index + separator.size() <= expression.size()
             && expression.substr(index, separator.size()) == separator) {
-            parts.push_back(TrimAsciiWhitespace(std::string(expression.substr(start, index - start))));
+            parts.push_back(TrimAsciiWhitespaceView(expression.substr(start, index - start)));
             start = index + separator.size();
             index += separator.size() - 1;
         }
@@ -1531,7 +1641,7 @@ std::vector<std::string> SplitXPathExpressionTopLevel(std::string_view expressio
         return {};
     }
 
-    parts.push_back(TrimAsciiWhitespace(std::string(expression.substr(start))));
+    parts.push_back(TrimAsciiWhitespaceView(expression.substr(start)));
     return parts;
 }
 
@@ -1581,9 +1691,9 @@ std::size_t FindXPathExpressionTopLevelCharacter(std::string_view expression, ch
     return std::string_view::npos;
 }
 
-std::vector<std::string> ParseXPathFunctionArguments(std::string_view expression);
+std::vector<std::string_view> ParseXPathFunctionArguments(std::string_view expression);
 
-std::string ParseXPathQuotedLiteral(const std::string& expression, const std::string& predicate) {
+std::string ParseXPathQuotedLiteral(std::string_view expression, const std::string& predicate) {
     if (expression.size() < 2) {
         ThrowUnsupportedXPathFeature("predicate [" + predicate + "]");
     }
@@ -1593,7 +1703,7 @@ std::string ParseXPathQuotedLiteral(const std::string& expression, const std::st
         ThrowUnsupportedXPathFeature("predicate [" + predicate + "]");
     }
 
-    return expression.substr(1, expression.size() - 2);
+    return std::string(expression.substr(1, expression.size() - 2));
 }
 
 bool TryParseXPathProcessingInstructionNodeTest(
@@ -1633,9 +1743,9 @@ bool TryParseXPathNumber(const std::string& expression, double& value) {
     }
 }
 
-std::vector<std::string> ParseXPathFunctionArguments(std::string_view expression) {
-    std::vector<std::string> arguments;
-    const std::string trimmed = TrimAsciiWhitespace(std::string(expression));
+std::vector<std::string_view> ParseXPathFunctionArguments(std::string_view expression) {
+    std::vector<std::string_view> arguments;
+    const std::string_view trimmed = TrimAsciiWhitespaceView(expression);
     if (trimmed.empty()) {
         return arguments;
     }
@@ -1668,18 +1778,18 @@ std::vector<std::string> ParseXPathFunctionArguments(std::string_view expression
         }
 
         if (depth == 0 && ch == ',') {
-            arguments.push_back(TrimAsciiWhitespace(trimmed.substr(start, index - start)));
+            arguments.push_back(TrimAsciiWhitespaceView(trimmed.substr(start, index - start)));
             start = index + 1;
         }
     }
 
-    arguments.push_back(TrimAsciiWhitespace(trimmed.substr(start)));
+    arguments.push_back(TrimAsciiWhitespaceView(trimmed.substr(start)));
     return arguments;
 }
 
-XPathStep::PredicateTarget ParseXPathPredicateTarget(const std::string& expression, const std::string& predicate);
+XPathStep::PredicateTarget ParseXPathPredicateTarget(std::string_view expression, const std::string& predicate);
 
-std::optional<std::vector<std::string>> TryParseXPathFunctionCallArguments(
+std::optional<std::vector<std::string_view>> TryParseXPathFunctionCallArguments(
     const std::string& normalized,
     std::string_view functionName) {
     if (normalized.rfind(functionName, 0) != 0 || normalized.size() <= functionName.size()) {
@@ -1697,7 +1807,7 @@ std::optional<std::vector<std::string>> TryParseXPathFunctionCallArguments(
 
 void AppendXPathParsedTargetArguments(
     XPathStep::PredicateTarget& target,
-    const std::vector<std::string>& arguments,
+    const std::vector<std::string_view>& arguments,
     const std::string& expression) {
     for (const auto& argument : arguments) {
         target.arguments.push_back(ParseXPathPredicateTarget(argument, expression));
@@ -2066,16 +2176,18 @@ bool IsXPathPredicateExpressionTarget(std::string_view expression) {
         || FindXPathExpressionTopLevelOperator(expression, "<") != std::string::npos;
 }
 
-XPathStep::PredicateTarget ParseXPathPredicateTarget(const std::string& expression, const std::string&) {
-    const std::string normalized = TrimAsciiWhitespace(expression);
+XPathStep::PredicateTarget ParseXPathPredicateTarget(std::string_view expression, const std::string& predicateText) {
+    (void)predicateText;
+    const std::string expressionText(expression);
+    const std::string normalized = TrimAsciiWhitespace(expressionText);
     XPathStep::PredicateTarget target;
     if (IsWrappedXPathExpression(normalized)) {
-        return ParseXPathPredicateTarget(normalized.substr(1, normalized.size() - 2), expression);
+        return ParseXPathPredicateTarget(normalized.substr(1, normalized.size() - 2), expressionText);
     }
 
     if (!normalized.empty() && (normalized.front() == '\'' || normalized.front() == '"')) {
         target.kind = XPathStep::PredicateTarget::Kind::Literal;
-        target.literal = ParseXPathQuotedLiteral(normalized, expression);
+        target.literal = ParseXPathQuotedLiteral(normalized, expressionText);
         return target;
     }
 
@@ -2119,18 +2231,18 @@ XPathStep::PredicateTarget ParseXPathPredicateTarget(const std::string& expressi
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "not", XPathStep::PredicateTarget::Kind::Not, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "not", XPathStep::PredicateTarget::Kind::Not, 1)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "lang", XPathStep::PredicateTarget::Kind::Boolean, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "lang", XPathStep::PredicateTarget::Kind::Boolean, 1)) {
         target.literal = "lang";
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "contains", XPathStep::PredicateTarget::Kind::Contains, 2)
-        || TryParseXPathFixedArityTarget(target, normalized, expression, "starts-with", XPathStep::PredicateTarget::Kind::StartsWith, 2)
-        || TryParseXPathFixedArityTarget(target, normalized, expression, "ends-with", XPathStep::PredicateTarget::Kind::EndsWith, 2)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "contains", XPathStep::PredicateTarget::Kind::Contains, 2)
+        || TryParseXPathFixedArityTarget(target, normalized, expressionText, "starts-with", XPathStep::PredicateTarget::Kind::StartsWith, 2)
+        || TryParseXPathFixedArityTarget(target, normalized, expressionText, "ends-with", XPathStep::PredicateTarget::Kind::EndsWith, 2)) {
         return target;
     }
 
@@ -2142,7 +2254,7 @@ XPathStep::PredicateTarget ParseXPathPredicateTarget(const std::string& expressi
 
     if (!normalized.empty() && normalized.front() == '-') {
         target.kind = XPathStep::PredicateTarget::Kind::Negate;
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(1), expression));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(1), expressionText));
         return target;
     }
 
@@ -2151,122 +2263,122 @@ XPathStep::PredicateTarget ParseXPathPredicateTarget(const std::string& expressi
         target.kind = normalized[additive] == '+'
             ? XPathStep::PredicateTarget::Kind::Add
             : XPathStep::PredicateTarget::Kind::Subtract;
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, additive), expression));
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(additive + 1), expression));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, additive), expressionText));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(additive + 1), expressionText));
         return target;
     }
 
     const auto divOperator = FindXPathExpressionTopLevelOperatorRightmost(normalized, " div ");
     if (divOperator != std::string::npos) {
         target.kind = XPathStep::PredicateTarget::Kind::Divide;
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, divOperator), expression));
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(divOperator + 5), expression));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, divOperator), expressionText));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(divOperator + 5), expressionText));
         return target;
     }
 
     const auto modOperator = FindXPathExpressionTopLevelOperatorRightmost(normalized, " mod ");
     if (modOperator != std::string::npos) {
         target.kind = XPathStep::PredicateTarget::Kind::Modulo;
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, modOperator), expression));
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(modOperator + 5), expression));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, modOperator), expressionText));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(modOperator + 5), expressionText));
         return target;
     }
 
     const auto multiplyOperator = FindXPathTopLevelMultiplyOperator(normalized);
     if (multiplyOperator != std::string::npos) {
         target.kind = XPathStep::PredicateTarget::Kind::Multiply;
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, multiplyOperator), expression));
-        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(multiplyOperator + 1), expression));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(0, multiplyOperator), expressionText));
+        target.arguments.push_back(ParseXPathPredicateTarget(normalized.substr(multiplyOperator + 1), expressionText));
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "boolean", XPathStep::PredicateTarget::Kind::Boolean, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "boolean", XPathStep::PredicateTarget::Kind::Boolean, 1)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "number", XPathStep::PredicateTarget::Kind::Number)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "number", XPathStep::PredicateTarget::Kind::Number)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "string", XPathStep::PredicateTarget::Kind::String)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "string", XPathStep::PredicateTarget::Kind::String)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "id", XPathStep::PredicateTarget::Kind::Id, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "id", XPathStep::PredicateTarget::Kind::Id, 1)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "name", XPathStep::PredicateTarget::Kind::Name)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "name", XPathStep::PredicateTarget::Kind::Name)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "local-name", XPathStep::PredicateTarget::Kind::LocalName)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "local-name", XPathStep::PredicateTarget::Kind::LocalName)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "namespace-uri", XPathStep::PredicateTarget::Kind::NamespaceUri)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "namespace-uri", XPathStep::PredicateTarget::Kind::NamespaceUri)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "unparsed-entity-uri", XPathStep::PredicateTarget::Kind::UnparsedEntityUri, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "unparsed-entity-uri", XPathStep::PredicateTarget::Kind::UnparsedEntityUri, 1)) {
         return target;
     }
 
     if (const auto arguments = TryParseXPathFunctionCallArguments(normalized, "concat"); arguments.has_value()) {
         if (arguments->size() < 2) {
-            ThrowUnsupportedXPathFeature("predicate [" + expression + "]");
+            ThrowUnsupportedXPathFeature("predicate [" + expressionText + "]");
         }
         target.kind = XPathStep::PredicateTarget::Kind::Concat;
-        AppendXPathParsedTargetArguments(target, *arguments, expression);
+        AppendXPathParsedTargetArguments(target, *arguments, expressionText);
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "translate", XPathStep::PredicateTarget::Kind::Translate, 3)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "translate", XPathStep::PredicateTarget::Kind::Translate, 3)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "normalize-space", XPathStep::PredicateTarget::Kind::NormalizeSpace)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "normalize-space", XPathStep::PredicateTarget::Kind::NormalizeSpace)) {
         return target;
     }
 
-    if (TryParseXPathUnaryOptionalTarget(target, normalized, expression, "string-length", XPathStep::PredicateTarget::Kind::StringLength)) {
+    if (TryParseXPathUnaryOptionalTarget(target, normalized, expressionText, "string-length", XPathStep::PredicateTarget::Kind::StringLength)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "count", XPathStep::PredicateTarget::Kind::Count, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "count", XPathStep::PredicateTarget::Kind::Count, 1)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "sum", XPathStep::PredicateTarget::Kind::Sum, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "sum", XPathStep::PredicateTarget::Kind::Sum, 1)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "floor", XPathStep::PredicateTarget::Kind::Floor, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "floor", XPathStep::PredicateTarget::Kind::Floor, 1)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "ceiling", XPathStep::PredicateTarget::Kind::Ceiling, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "ceiling", XPathStep::PredicateTarget::Kind::Ceiling, 1)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "round", XPathStep::PredicateTarget::Kind::Round, 1)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "round", XPathStep::PredicateTarget::Kind::Round, 1)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "substring-before", XPathStep::PredicateTarget::Kind::SubstringBefore, 2)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "substring-before", XPathStep::PredicateTarget::Kind::SubstringBefore, 2)) {
         return target;
     }
 
-    if (TryParseXPathFixedArityTarget(target, normalized, expression, "substring-after", XPathStep::PredicateTarget::Kind::SubstringAfter, 2)) {
+    if (TryParseXPathFixedArityTarget(target, normalized, expressionText, "substring-after", XPathStep::PredicateTarget::Kind::SubstringAfter, 2)) {
         return target;
     }
 
     if (const auto arguments = TryParseXPathFunctionCallArguments(normalized, "substring"); arguments.has_value()) {
         if (arguments->size() != 2 && arguments->size() != 3) {
-            ThrowUnsupportedXPathFeature("predicate [" + expression + "]");
+            ThrowUnsupportedXPathFeature("predicate [" + expressionText + "]");
         }
         target.kind = XPathStep::PredicateTarget::Kind::Substring;
-        AppendXPathParsedTargetArguments(target, *arguments, expression);
+        AppendXPathParsedTargetArguments(target, *arguments, expressionText);
         return target;
     }
 
@@ -2293,7 +2405,7 @@ XPathStep::PredicateTarget ParseXPathPredicateTarget(const std::string& expressi
     return target;
 }
 
-XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate);
+XPathStep::Predicate ParseXPathPredicateExpression(std::string_view predicate);
 bool EvaluateXPathPredicate(
     const XPathContext& context,
     const XPathStep::Predicate& predicate,
@@ -2750,7 +2862,7 @@ bool TryResolveXPathPredicateTargetNode(
             return false;
         }
 
-        resolved = sortedMatches.front().get();
+        resolved = sortedMatches.front();
         return true;
     }
 
@@ -3485,7 +3597,7 @@ std::vector<std::string> ExtractXPathPredicateTargetValues(
             const auto matches = EvaluateXPathFromNode(node, target.pathExpression, namespaces);
             const auto sortedMatches = CollectXPathNodeSetInDocumentOrder(matches);
             values.reserve(sortedMatches.size());
-            for (const auto& match : sortedMatches) {
+            for (const auto* match : sortedMatches) {
                 if (match != nullptr) {
                     values.push_back(GetXPathPredicatePathNodeStringValue(*match));
                 }
@@ -3924,8 +4036,9 @@ XPathStep::Predicate ParseXPathPredicate(const std::string& predicate) {
     return ParseXPathPredicateExpression(normalized);
 }
 
-XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate) {
-    std::string normalized = TrimAsciiWhitespace(predicate);
+XPathStep::Predicate ParseXPathPredicateExpression(std::string_view predicate) {
+    const std::string predicateText(predicate);
+    std::string normalized = TrimAsciiWhitespace(std::string(predicate));
     while (IsWrappedXPathExpression(normalized)) {
         normalized = TrimAsciiWhitespace(normalized.substr(1, normalized.size() - 2));
     }
@@ -3954,7 +4067,7 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
 
     if (const auto arguments = TryParseXPathFunctionCallArguments(normalized, "not"); arguments.has_value()) {
         if (arguments->size() != 1) {
-            ThrowUnsupportedXPathFeature("predicate [" + predicate + "]");
+            ThrowUnsupportedXPathFeature("predicate [" + predicateText + "]");
         }
 
         result.kind = XPathStep::Predicate::Kind::Not;
@@ -3992,14 +4105,14 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
     if (normalized.rfind("contains(", 0) == 0
         || normalized.rfind("starts-with(", 0) == 0
         || normalized.rfind("ends-with(", 0) == 0) {
-        return ParseXPathFunctionPredicate(normalized, predicate);
+        return ParseXPathFunctionPredicate(normalized, predicateText);
     }
 
     std::size_t operatorPosition = FindXPathExpressionTopLevelOperator(normalized, "!=");
     if (operatorPosition != std::string::npos) {
         result.kind = XPathStep::Predicate::Kind::NotEquals;
-        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicate);
-        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 2), predicate);
+        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicateText);
+        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 2), predicateText);
         result.hasComparisonTarget = true;
         return result;
     }
@@ -4007,8 +4120,8 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
     operatorPosition = FindXPathExpressionTopLevelOperator(normalized, ">=");
     if (operatorPosition != std::string::npos) {
         result.kind = XPathStep::Predicate::Kind::GreaterThanOrEqual;
-        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicate);
-        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 2), predicate);
+        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicateText);
+        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 2), predicateText);
         result.hasComparisonTarget = true;
         return result;
     }
@@ -4016,8 +4129,8 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
     operatorPosition = FindXPathExpressionTopLevelOperator(normalized, "<=");
     if (operatorPosition != std::string::npos) {
         result.kind = XPathStep::Predicate::Kind::LessThanOrEqual;
-        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicate);
-        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 2), predicate);
+        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicateText);
+        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 2), predicateText);
         result.hasComparisonTarget = true;
         return result;
     }
@@ -4025,8 +4138,8 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
     operatorPosition = FindXPathExpressionTopLevelOperator(normalized, "=");
     if (operatorPosition != std::string::npos) {
         result.kind = XPathStep::Predicate::Kind::Equals;
-        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicate);
-        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 1), predicate);
+        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicateText);
+        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 1), predicateText);
         result.hasComparisonTarget = true;
         return result;
     }
@@ -4034,8 +4147,8 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
     operatorPosition = FindXPathExpressionTopLevelOperator(normalized, ">");
     if (operatorPosition != std::string::npos) {
         result.kind = XPathStep::Predicate::Kind::GreaterThan;
-        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicate);
-        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 1), predicate);
+        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicateText);
+        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 1), predicateText);
         result.hasComparisonTarget = true;
         return result;
     }
@@ -4043,14 +4156,14 @@ XPathStep::Predicate ParseXPathPredicateExpression(const std::string& predicate)
     operatorPosition = FindXPathExpressionTopLevelOperator(normalized, "<");
     if (operatorPosition != std::string::npos) {
         result.kind = XPathStep::Predicate::Kind::LessThan;
-        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicate);
-        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 1), predicate);
+        result.target = ParseXPathPredicateTarget(normalized.substr(0, operatorPosition), predicateText);
+        result.comparisonTarget = ParseXPathPredicateTarget(normalized.substr(operatorPosition + 1), predicateText);
         result.hasComparisonTarget = true;
         return result;
     }
 
     result.kind = XPathStep::Predicate::Kind::Exists;
-    result.target = ParseXPathPredicateTarget(normalized, predicate);
+    result.target = ParseXPathPredicateTarget(normalized, predicateText);
     return result;
 }
 
@@ -4058,20 +4171,21 @@ void ApplyXPathPredicates(
     std::vector<XPathContext>& results,
     const std::vector<XPathStep::Predicate>& predicates,
     const XmlNamespaceManager* namespaces) {
+    std::vector<XPathContext> scratch;
     for (const auto& predicate : predicates) {
-        std::vector<XPathContext> filtered;
-        filtered.reserve(results.size());
+        scratch.clear();
+        scratch.reserve(results.size());
         for (std::size_t index = 0; index < results.size(); ++index) {
             if (EvaluateXPathPredicate(results[index], predicate, namespaces, index + 1, results.size())) {
-                filtered.push_back(results[index]);
+                scratch.push_back(results[index]);
             }
         }
-        results.swap(filtered);
+        results.swap(scratch);
     }
 }
 
-std::vector<std::string> SplitXPathUnion(const std::string& xpath) {
-    std::vector<std::string> parts;
+std::vector<std::string_view> SplitXPathUnion(std::string_view xpath) {
+    std::vector<std::string_view> parts;
     int bracketDepth = 0;
     char quote = '\0';
     std::size_t start = 0;
@@ -4105,15 +4219,15 @@ std::vector<std::string> SplitXPathUnion(const std::string& xpath) {
             continue;
         }
         if (bracketDepth == 0 && ch == '|') {
-            parts.push_back(TrimAsciiWhitespace(xpath.substr(start, index - start)));
+            parts.push_back(TrimAsciiWhitespaceView(xpath.substr(start, index - start)));
             start = index + 1;
         }
     }
-    parts.push_back(TrimAsciiWhitespace(xpath.substr(start)));
+    parts.push_back(TrimAsciiWhitespaceView(xpath.substr(start)));
     return parts;
 }
 
-std::vector<XPathStep> ParseXPathSteps(const std::string& xpath, bool& absolutePath);
+std::vector<XPathStep> ParseXPathSteps(std::string_view xpath, bool& absolutePath);
 
 struct CompiledXPathBranch {
     std::string expression;
@@ -4135,7 +4249,7 @@ CompiledXPathExpression CompileXPathExpression(const std::string& xpath) {
     CompiledXPathExpression compiled;
     compiled.branches.reserve(parts.size());
     for (const auto& part : parts) {
-        std::string normalizedPart = TrimAsciiWhitespace(part);
+        std::string normalizedPart = TrimAsciiWhitespace(std::string(part));
         while (IsWrappedXPathExpression(normalizedPart)) {
             normalizedPart = TrimAsciiWhitespace(normalizedPart.substr(1, normalizedPart.size() - 2));
         }
@@ -4243,6 +4357,42 @@ void SortXPathUnionNodesInDocumentOrder(std::vector<std::shared_ptr<XmlNode>>& n
     });
 }
 
+void SortXPathUnionNodesInDocumentOrder(std::vector<const XmlNode*>& nodes) {
+    if (nodes.size() < 2) {
+        return;
+    }
+
+    std::unordered_map<const XmlNode*, std::size_t> order;
+    std::unordered_set<const XmlNode*> indexedRoots;
+    std::size_t nextOrdinal = 0;
+    for (const auto* node : nodes) {
+        if (node == nullptr) {
+            continue;
+        }
+
+        const XmlNode* root = GetXPathDocumentOrderRoot(*node);
+        if (!indexedRoots.insert(root).second) {
+            continue;
+        }
+
+        BuildXPathDocumentOrderIndex(*root, order, nextOrdinal);
+    }
+
+    std::stable_sort(nodes.begin(), nodes.end(), [&](const XmlNode* left, const XmlNode* right) {
+        if (left == nullptr || right == nullptr) {
+            return left != nullptr && right == nullptr;
+        }
+
+        const auto leftIt = order.find(left);
+        const auto rightIt = order.find(right);
+        if (leftIt == order.end() || rightIt == order.end()) {
+            return left < right;
+        }
+
+        return leftIt->second < rightIt->second;
+    });
+}
+
 void SortXPathContextsInDocumentOrder(std::vector<XPathContext>& contexts) {
     if (contexts.size() < 2) {
         return;
@@ -4273,7 +4423,7 @@ void SortXPathContextsInDocumentOrder(std::vector<XPathContext>& contexts) {
     });
 }
 
-std::vector<XPathStep> ParseXPathSteps(const std::string& xpath, bool& absolutePath) {
+std::vector<XPathStep> ParseXPathSteps(std::string_view xpath, bool& absolutePath) {
     if (xpath.empty()) {
         throw XmlException("XPath expression cannot be empty");
     }
@@ -4315,7 +4465,7 @@ std::vector<XPathStep> ParseXPathSteps(const std::string& xpath, bool& absoluteP
             ++position;
         }
 
-        std::string token = xpath.substr(tokenStart, position - tokenStart);
+        std::string token(xpath.substr(tokenStart, position - tokenStart));
         if (token.empty()) {
             continue;
         }
@@ -4464,18 +4614,71 @@ bool MatchesXPathAttribute(const XmlAttribute& attribute, const XPathStep& step,
 
 void CollectDescendantElementContexts(const XmlNode& node, std::vector<XPathContext>& contexts) {
     for (const auto& child : node.ChildNodes()) {
-        contexts.push_back({child.get(), child});
+        contexts.push_back({child.get()});
         CollectDescendantElementContexts(*child, contexts);
+    }
+}
+
+void CollectMatchingDescendantElementContexts(
+    const XmlNode& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    for (const auto& child : node.ChildNodes()) {
+        if (MatchesXPathElement(*child, step, namespaces)) {
+            contexts.push_back({child.get()});
+        }
+        CollectMatchingDescendantElementContexts(*child, step, namespaces, contexts);
+    }
+}
+
+void CollectMatchingNodeAndDescendants(
+    const std::shared_ptr<XmlNode>& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    if (node == nullptr) {
+        return;
+    }
+
+    if (MatchesXPathElement(*node, step, namespaces)) {
+        contexts.push_back({node.get()});
+    }
+
+    CollectMatchingDescendantElementContexts(*node, step, namespaces, contexts);
+}
+
+void CollectMatchingAttributesFromElement(
+    const XmlElement& element,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    for (const auto& attribute : element.Attributes()) {
+        if (attribute != nullptr
+            && IsXPathVisibleAttribute(*attribute)
+            && MatchesXPathAttribute(*attribute, step, namespaces)) {
+            contexts.push_back({attribute.get()});
+        }
+    }
+}
+
+void CollectMatchingDescendantAttributeContexts(
+    const XmlNode& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    for (const auto& child : node.ChildNodes()) {
+        if (child->NodeType() == XmlNodeType::Element) {
+            CollectMatchingAttributesFromElement(*static_cast<const XmlElement*>(child.get()), step, namespaces, contexts);
+        }
+        CollectMatchingDescendantAttributeContexts(*child, step, namespaces, contexts);
     }
 }
 
 void CollectAncestorContexts(const XmlNode& node, std::vector<XPathContext>& contexts) {
     const XmlNode* current = node.ParentNode();
     while (current != nullptr) {
-        auto shared = GetXPathResultSharedNode(*current);
-        if (shared != nullptr) {
-            contexts.push_back({current, shared});
-        }
+        contexts.push_back({current});
         current = current->ParentNode();
     }
 }
@@ -4493,7 +4696,34 @@ void CollectFollowingSiblingContexts(const XmlNode& node, std::vector<XPathConte
     bool found = false;
     for (const auto& sibling : siblings) {
         if (found) {
-            contexts.push_back({sibling.get(), sibling});
+            contexts.push_back({sibling.get()});
+        } else if (sibling.get() == &node) {
+            found = true;
+        }
+    }
+}
+
+void CollectMatchingFollowingSiblingContexts(
+    const XmlNode& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    if (node.NodeType() == XmlNodeType::Attribute) {
+        return;
+    }
+
+    const XmlNode* parent = node.ParentNode();
+    if (parent == nullptr) {
+        return;
+    }
+
+    const auto& siblings = parent->ChildNodes();
+    bool found = false;
+    for (const auto& sibling : siblings) {
+        if (found) {
+            if (MatchesXPathElement(*sibling, step, namespaces)) {
+                contexts.push_back({sibling.get()});
+            }
         } else if (sibling.get() == &node) {
             found = true;
         }
@@ -4509,17 +4739,59 @@ void CollectPrecedingSiblingContexts(const XmlNode& node, std::vector<XPathConte
     if (parent == nullptr) {
         return;
     }
+
     const auto& siblings = parent->ChildNodes();
-    std::vector<XPathContext> before;
-    for (const auto& sibling : siblings) {
-        if (sibling.get() == &node) {
+    std::size_t nodeIndex = siblings.size();
+    for (std::size_t index = 0; index < siblings.size(); ++index) {
+        if (siblings[index].get() == &node) {
+            nodeIndex = index;
             break;
         }
-        before.push_back({sibling.get(), sibling});
     }
-    // XPath preceding-sibling returns in reverse document order
-    for (auto reverseIndex = before.size(); reverseIndex > 0; --reverseIndex) {
-        contexts.push_back(before[reverseIndex - 1]);
+
+    if (nodeIndex == siblings.size()) {
+        return;
+    }
+
+    // XPath preceding-sibling returns in reverse document order.
+    for (std::size_t index = nodeIndex; index > 0; --index) {
+        const auto& sibling = siblings[index - 1];
+        contexts.push_back({sibling.get()});
+    }
+}
+
+void CollectMatchingPrecedingSiblingContexts(
+    const XmlNode& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    if (node.NodeType() == XmlNodeType::Attribute) {
+        return;
+    }
+
+    const XmlNode* parent = node.ParentNode();
+    if (parent == nullptr) {
+        return;
+    }
+
+    const auto& siblings = parent->ChildNodes();
+    std::size_t nodeIndex = siblings.size();
+    for (std::size_t index = 0; index < siblings.size(); ++index) {
+        if (siblings[index].get() == &node) {
+            nodeIndex = index;
+            break;
+        }
+    }
+
+    if (nodeIndex == siblings.size()) {
+        return;
+    }
+
+    for (std::size_t index = nodeIndex; index > 0; --index) {
+        const auto& sibling = siblings[index - 1];
+        if (MatchesXPathElement(*sibling, step, namespaces)) {
+            contexts.push_back({sibling.get()});
+        }
     }
 }
 
@@ -4544,7 +4816,7 @@ void CollectFollowingContexts(const XmlNode& node, std::vector<XPathContext>& co
             bool found = false;
             for (const auto& sibling : siblings) {
                 if (found) {
-                    contexts.push_back({sibling.get(), sibling});
+                    contexts.push_back({sibling.get()});
                     CollectDescendantElementContexts(*sibling, contexts);
                 } else if (sibling.get() == current) {
                     found = true;
@@ -4565,8 +4837,60 @@ void CollectFollowingContexts(const XmlNode& node, std::vector<XPathContext>& co
         bool found = false;
         for (const auto& sibling : siblings) {
             if (found) {
-                contexts.push_back({sibling.get(), sibling});
+                contexts.push_back({sibling.get()});
                 CollectDescendantElementContexts(*sibling, contexts);
+            } else if (sibling.get() == current) {
+                found = true;
+            }
+        }
+        current = parent;
+    }
+}
+
+void CollectMatchingFollowingContexts(
+    const XmlNode& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    if (node.NodeType() == XmlNodeType::Attribute) {
+        const XmlNode* parent = node.ParentNode();
+        if (parent == nullptr) {
+            return;
+        }
+
+        CollectMatchingDescendantElementContexts(*parent, step, namespaces, contexts);
+
+        const XmlNode* current = parent;
+        while (current != nullptr) {
+            const XmlNode* ancestorParent = current->ParentNode();
+            if (ancestorParent == nullptr) {
+                break;
+            }
+            const auto& siblings = ancestorParent->ChildNodes();
+            bool found = false;
+            for (const auto& sibling : siblings) {
+                if (found) {
+                    CollectMatchingNodeAndDescendants(sibling, step, namespaces, contexts);
+                } else if (sibling.get() == current) {
+                    found = true;
+                }
+            }
+            current = ancestorParent;
+        }
+        return;
+    }
+
+    const XmlNode* current = &node;
+    while (current != nullptr) {
+        const XmlNode* parent = current->ParentNode();
+        if (parent == nullptr) {
+            break;
+        }
+        const auto& siblings = parent->ChildNodes();
+        bool found = false;
+        for (const auto& sibling : siblings) {
+            if (found) {
+                CollectMatchingNodeAndDescendants(sibling, step, namespaces, contexts);
             } else if (sibling.get() == current) {
                 found = true;
             }
@@ -4595,30 +4919,59 @@ void CollectPrecedingContexts(const XmlNode& node, std::vector<XPathContext>& co
         ancestors.insert(ancestor);
     }
 
-    // Collect all nodes in document order from the root, then filter
+    // Collect preceding candidates directly in document order, then reverse once
     const XmlNode* root = &node;
     while (root->ParentNode() != nullptr) {
         root = root->ParentNode();
     }
 
-    std::vector<XPathContext> allNodes;
-    for (const auto& child : root->ChildNodes()) {
-        allNodes.push_back({child.get(), child});
-        CollectDescendantElementContexts(*child, allNodes);
-    }
-
-    // Get all nodes before the current node that are not ancestors
     std::vector<XPathContext> preceding;
-    for (const auto& candidate : allNodes) {
-        if (candidate.node == &node) {
+    for (const auto& child : root->ChildNodes()) {
+        if (CollectPrecedingCandidates(child, node, ancestors, preceding)) {
             break;
-        }
-        if (ancestors.find(candidate.node) == ancestors.end()) {
-            preceding.push_back(candidate);
         }
     }
 
     // Reverse for preceding axis (reverse document order)
+    for (auto reverseIndex = preceding.size(); reverseIndex > 0; --reverseIndex) {
+        contexts.push_back(preceding[reverseIndex - 1]);
+    }
+}
+
+void CollectMatchingPrecedingContexts(
+    const XmlNode& node,
+    const XPathStep& step,
+    const XmlNamespaceManager* namespaces,
+    std::vector<XPathContext>& contexts) {
+    if (node.NodeType() == XmlNodeType::Attribute) {
+        const XmlNode* parent = node.ParentNode();
+        if (parent != nullptr) {
+            CollectMatchingPrecedingContexts(*parent, step, namespaces, contexts);
+        }
+        return;
+    }
+
+    if (node.ParentNode() == nullptr) {
+        return;
+    }
+
+    std::unordered_set<const XmlNode*> ancestors;
+    for (const XmlNode* ancestor = node.ParentNode(); ancestor != nullptr; ancestor = ancestor->ParentNode()) {
+        ancestors.insert(ancestor);
+    }
+
+    const XmlNode* root = &node;
+    while (root->ParentNode() != nullptr) {
+        root = root->ParentNode();
+    }
+
+    std::vector<XPathContext> preceding;
+    for (const auto& child : root->ChildNodes()) {
+        if (CollectMatchingPrecedingCandidates(child, node, ancestors, step, namespaces, preceding)) {
+            break;
+        }
+    }
+
     for (auto reverseIndex = preceding.size(); reverseIndex > 0; --reverseIndex) {
         contexts.push_back(preceding[reverseIndex - 1]);
     }
@@ -4646,7 +4999,7 @@ std::vector<XPathContext> ApplyXPathStep(const std::vector<XPathContext>& curren
                 && !step.commentNode
                 && !step.processingInstructionNode
                 && step.name.name.empty())) {
-            if (context.shared != nullptr) {
+            if (context.node != nullptr) {
                 contextResults.push_back(context);
             }
             appendContextResults(contextResults);
@@ -4654,7 +5007,7 @@ std::vector<XPathContext> ApplyXPathStep(const std::vector<XPathContext>& curren
         }
 
         if (step.axis == XPathStep::Axis::Self) {
-            if (context.shared != nullptr && MatchesXPathElement(*context.node, step, namespaces)) {
+            if (context.node != nullptr && MatchesXPathElement(*context.node, step, namespaces)) {
                 contextResults.push_back(context);
             }
             appendContextResults(contextResults);
@@ -4664,9 +5017,8 @@ std::vector<XPathContext> ApplyXPathStep(const std::vector<XPathContext>& curren
         if (step.axis == XPathStep::Axis::Parent) {
             const XmlNode* parent = context.node->ParentNode();
             if (parent != nullptr) {
-                auto shared = GetXPathResultSharedNode(*parent);
-                if (shared != nullptr && MatchesXPathElement(*parent, step, namespaces)) {
-                    contextResults.push_back({parent, shared});
+                if (MatchesXPathElement(*parent, step, namespaces)) {
+                    contextResults.push_back({parent});
                 }
             }
             appendContextResults(contextResults);
@@ -4674,7 +5026,7 @@ std::vector<XPathContext> ApplyXPathStep(const std::vector<XPathContext>& curren
         }
 
         if (step.axis == XPathStep::Axis::Ancestor || step.axis == XPathStep::Axis::AncestorOrSelf) {
-            if (step.axis == XPathStep::Axis::AncestorOrSelf && context.shared != nullptr) {
+            if (step.axis == XPathStep::Axis::AncestorOrSelf && context.node != nullptr) {
                 if (MatchesXPathElement(*context.node, step, namespaces)) {
                     contextResults.push_back(context);
                 }
@@ -4691,103 +5043,52 @@ std::vector<XPathContext> ApplyXPathStep(const std::vector<XPathContext>& curren
         }
 
         if (step.axis == XPathStep::Axis::FollowingSibling) {
-            std::vector<XPathContext> siblings;
-            CollectFollowingSiblingContexts(*context.node, siblings);
-            for (const auto& sibling : siblings) {
-                if (MatchesXPathElement(*sibling.node, step, namespaces)) {
-                    contextResults.push_back(sibling);
-                }
-            }
+            CollectMatchingFollowingSiblingContexts(*context.node, step, namespaces, contextResults);
             appendContextResults(contextResults);
             continue;
         }
 
         if (step.axis == XPathStep::Axis::PrecedingSibling) {
-            std::vector<XPathContext> siblings;
-            CollectPrecedingSiblingContexts(*context.node, siblings);
-            for (const auto& sibling : siblings) {
-                if (MatchesXPathElement(*sibling.node, step, namespaces)) {
-                    contextResults.push_back(sibling);
-                }
-            }
+            CollectMatchingPrecedingSiblingContexts(*context.node, step, namespaces, contextResults);
             appendContextResults(contextResults);
             continue;
         }
 
         if (step.axis == XPathStep::Axis::Following) {
-            std::vector<XPathContext> following;
-            CollectFollowingContexts(*context.node, following);
-            for (const auto& candidate : following) {
-                if (MatchesXPathElement(*candidate.node, step, namespaces)) {
-                    contextResults.push_back(candidate);
-                }
-            }
+            CollectMatchingFollowingContexts(*context.node, step, namespaces, contextResults);
             appendContextResults(contextResults);
             continue;
         }
 
         if (step.axis == XPathStep::Axis::Preceding) {
-            std::vector<XPathContext> preceding;
-            CollectPrecedingContexts(*context.node, preceding);
-            for (const auto& candidate : preceding) {
-                if (MatchesXPathElement(*candidate.node, step, namespaces)) {
-                    contextResults.push_back(candidate);
-                }
-            }
+            CollectMatchingPrecedingContexts(*context.node, step, namespaces, contextResults);
             appendContextResults(contextResults);
             continue;
         }
 
         if (step.attribute) {
-            std::vector<XPathContext> attributeCandidates;
             if (step.descendant) {
-                std::vector<XPathContext> descendantElements;
-                CollectDescendantElementContexts(*context.node, descendantElements);
-                for (const auto& candidate : descendantElements) {
-                    if (candidate.node->NodeType() != XmlNodeType::Element) {
-                        continue;
-                    }
-                    for (const auto& attribute : static_cast<const XmlElement*>(candidate.node)->Attributes()) {
-                        if (attribute != nullptr && IsXPathVisibleAttribute(*attribute)) {
-                            attributeCandidates.push_back({attribute.get(), attribute});
-                        }
-                    }
-                }
+                CollectMatchingDescendantAttributeContexts(*context.node, step, namespaces, contextResults);
             } else if (context.node->NodeType() == XmlNodeType::Element) {
-                for (const auto& attribute : static_cast<const XmlElement*>(context.node)->Attributes()) {
-                    if (attribute != nullptr && IsXPathVisibleAttribute(*attribute)) {
-                        attributeCandidates.push_back({attribute.get(), attribute});
-                    }
-                }
-            }
-
-            for (const auto& candidate : attributeCandidates) {
-                if (MatchesXPathAttribute(*static_cast<const XmlAttribute*>(candidate.node), step, namespaces)) {
-                    contextResults.push_back(candidate);
-                }
+                CollectMatchingAttributesFromElement(*static_cast<const XmlElement*>(context.node), step, namespaces, contextResults);
             }
             appendContextResults(contextResults);
             continue;
         }
 
-        std::vector<XPathContext> candidates;
         if (step.axis == XPathStep::Axis::DescendantOrSelf
-            && context.shared != nullptr
+            && context.node != nullptr
             && MatchesXPathElement(*context.node, step, namespaces)) {
             contextResults.push_back(context);
         }
 
         if (step.descendant) {
-            CollectDescendantElementContexts(*context.node, candidates);
+            CollectMatchingDescendantElementContexts(*context.node, step, namespaces, contextResults);
         } else {
             for (const auto& child : context.node->ChildNodes()) {
-                candidates.push_back({child.get(), child});
-            }
-        }
-
-        for (const auto& candidate : candidates) {
-            if (MatchesXPathElement(*candidate.node, step, namespaces)) {
-                contextResults.push_back(candidate);
+                if (MatchesXPathElement(*child, step, namespaces)) {
+                    contextResults.push_back({child.get()});
+                }
             }
         }
 
@@ -4836,7 +5137,7 @@ std::vector<XPathContext> FilterXPathStepMatches(const std::vector<XPathContext>
             }
             for (const auto& attribute : static_cast<const XmlElement*>(context.node)->Attributes()) {
                 if (MatchesXPathAttribute(*attribute, step, namespaces)) {
-                    results.push_back({attribute.get(), attribute});
+                    results.push_back({attribute.get()});
                 }
             }
             continue;
@@ -4867,9 +5168,9 @@ XmlNodeList EvaluateCompiledXPathSingleFromDocument(
     std::size_t stepIndex = 0;
 
     if (!compiled.absolutePath) {
-        current.push_back({&document, GetXPathResultSharedNode(document)});
+        current.push_back({&document});
     } else {
-        current.push_back({&document, GetXPathResultSharedNode(document)});
+        current.push_back({&document});
         current = ApplyXPathStep(current, compiled.steps.front(), namespaces);
         stepIndex = 1;
     }
@@ -4881,14 +5182,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromDocument(
         }
     }
 
-    std::vector<std::shared_ptr<XmlNode>> nodes;
-    nodes.reserve(current.size());
-    for (const auto& context : current) {
-        if (context.shared != nullptr) {
-            nodes.push_back(context.shared);
-        }
-    }
-    return XmlNodeList(std::move(nodes));
+    return CreateXPathNodeListFromContexts(current);
 }
 
 XmlNodeList EvaluateXPathSingleFromDocument(const XmlDocument& document, std::string_view xpath, const XmlNamespaceManager* namespaces) {
@@ -4902,19 +5196,18 @@ XmlNodeList EvaluateXPathFromDocument(const XmlDocument& document, std::string_v
         return EvaluateCompiledXPathSingleFromDocument(document, compiled->branches.front(), namespaces);
     }
 
-    std::vector<std::shared_ptr<XmlNode>> merged;
+    std::vector<const XmlNode*> merged;
     std::unordered_set<const XmlNode*> seen;
     for (const auto& branch : compiled->branches) {
         const auto partResult = EvaluateCompiledXPathSingleFromDocument(document, branch, namespaces);
-        for (std::size_t i = 0; i < partResult.Count(); ++i) {
-            const auto& node = partResult.Item(i);
-            if (seen.insert(node.get()).second) {
-                merged.push_back(node);
+        for (const auto& node : partResult) {
+            if (node != nullptr && seen.insert(node.get()).second) {
+                merged.push_back(node.get());
             }
         }
     }
     SortXPathUnionNodesInDocumentOrder(merged);
-    return XmlNodeList(std::move(merged));
+    return CreateXPathNodeListFromRawNodes(merged);
 }
 
 XmlNodeList EvaluateXPathSingleFromElement(const XmlElement& element, std::string_view xpath, const XmlNamespaceManager* namespaces);
@@ -4949,7 +5242,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromElement(
         if (sharedTop == nullptr) {
             return {};
         }
-        current.push_back({topElement, sharedTop});
+        current.push_back({topElement});
         if (compiled.steps.front().descendant) {
             current = ApplyXPathStep(current, compiled.steps.front(), namespaces);
         } else {
@@ -4957,7 +5250,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromElement(
         }
         stepIndex = 1;
     } else {
-        current.push_back({&element, GetXPathResultSharedNode(element)});
+        current.push_back({&element});
     }
 
     for (; stepIndex < compiled.steps.size(); ++stepIndex) {
@@ -4967,14 +5260,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromElement(
         }
     }
 
-    std::vector<std::shared_ptr<XmlNode>> nodes;
-    nodes.reserve(current.size());
-    for (const auto& context : current) {
-        if (context.shared != nullptr) {
-            nodes.push_back(context.shared);
-        }
-    }
-    return XmlNodeList(std::move(nodes));
+    return CreateXPathNodeListFromContexts(current);
 }
 
 XmlNodeList EvaluateXPathSingleFromElement(const XmlElement& element, std::string_view xpath, const XmlNamespaceManager* namespaces) {
@@ -4988,19 +5274,18 @@ XmlNodeList EvaluateXPathFromElement(const XmlElement& element, std::string_view
         return EvaluateCompiledXPathSingleFromElement(element, compiled->branches.front(), namespaces);
     }
 
-    std::vector<std::shared_ptr<XmlNode>> merged;
+    std::vector<const XmlNode*> merged;
     std::unordered_set<const XmlNode*> seen;
     for (const auto& branch : compiled->branches) {
         const auto partResult = EvaluateCompiledXPathSingleFromElement(element, branch, namespaces);
-        for (std::size_t i = 0; i < partResult.Count(); ++i) {
-            const auto& node = partResult.Item(i);
-            if (seen.insert(node.get()).second) {
-                merged.push_back(node);
+        for (const auto& node : partResult) {
+            if (node != nullptr && seen.insert(node.get()).second) {
+                merged.push_back(node.get());
             }
         }
     }
     SortXPathUnionNodesInDocumentOrder(merged);
-    return XmlNodeList(std::move(merged));
+    return CreateXPathNodeListFromRawNodes(merged);
 }
 
 XmlNodeList EvaluateCompiledXPathSingleFromNode(
@@ -5048,7 +5333,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromNode(
             return {};
         }
 
-        current.push_back({top, sharedTop});
+        current.push_back({top});
         if (compiled.steps.front().descendant) {
             current = ApplyXPathStep(current, compiled.steps.front(), namespaces);
         } else {
@@ -5060,7 +5345,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromNode(
         if (shared == nullptr) {
             return {};
         }
-        current.push_back({&node, shared});
+        current.push_back({&node});
     }
 
     for (; stepIndex < compiled.steps.size(); ++stepIndex) {
@@ -5070,14 +5355,7 @@ XmlNodeList EvaluateCompiledXPathSingleFromNode(
         }
     }
 
-    std::vector<std::shared_ptr<XmlNode>> nodes;
-    nodes.reserve(current.size());
-    for (const auto& context : current) {
-        if (context.shared != nullptr) {
-            nodes.push_back(context.shared);
-        }
-    }
-    return XmlNodeList(std::move(nodes));
+    return CreateXPathNodeListFromContexts(current);
 }
 
 XmlNodeList EvaluateXPathFromNode(const XmlNode& node, std::string_view xpath, const XmlNamespaceManager* namespaces) {
@@ -5086,19 +5364,18 @@ XmlNodeList EvaluateXPathFromNode(const XmlNode& node, std::string_view xpath, c
         return EvaluateCompiledXPathSingleFromNode(node, compiled->branches.front(), namespaces);
     }
 
-    std::vector<std::shared_ptr<XmlNode>> merged;
+    std::vector<const XmlNode*> merged;
     std::unordered_set<const XmlNode*> seen;
     for (const auto& branch : compiled->branches) {
         const auto partResult = EvaluateCompiledXPathSingleFromNode(node, branch, namespaces);
-        for (std::size_t i = 0; i < partResult.Count(); ++i) {
-            const auto& match = partResult.Item(i);
+        for (const auto& match : partResult) {
             if (match != nullptr && seen.insert(match.get()).second) {
-                merged.push_back(match);
+                merged.push_back(match.get());
             }
         }
     }
     SortXPathUnionNodesInDocumentOrder(merged);
-    return XmlNodeList(std::move(merged));
+    return CreateXPathNodeListFromRawNodes(merged);
 }
 
 XPathNavigator::XPathNavigator(const XmlNode* node) : node_(node) {

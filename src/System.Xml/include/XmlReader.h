@@ -121,6 +121,10 @@ private:
         std::unordered_set<std::string> notationDeclarationNames;
         std::unordered_set<std::string> unparsedEntityDeclarationNames;
         std::unordered_map<std::string, std::string> externalEntitySystemIds;
+        std::vector<std::shared_ptr<XmlNode>> parsedEntities;
+        std::vector<std::shared_ptr<XmlNode>> parsedNotations;
+        std::string externalSubsetSystemId;
+        bool externalSubsetDeclarationsLoaded = false;
     };
 
     explicit XmlReader(XmlReaderSettings settings = {});
@@ -167,6 +171,12 @@ private:
     std::size_t EarliestRetainedSourceOffset() const noexcept;
     void MaybeDiscardSourcePrefix() const;
     DtdState& EnsureDtdState();
+    void RegisterDtdDeclarations(
+        const std::vector<std::shared_ptr<XmlNode>>& entities,
+        const std::vector<std::shared_ptr<XmlNode>>& notations);
+    void LoadExternalSubsetDeclarations(std::string_view systemLiteral);
+    void EnsureExternalSubsetDeclarationsLoaded();
+    [[noreturn]] void ThrowUnknownEntityReference(std::string_view entity) const;
     void FinalizeSuccessfulRead();
     std::string CurrentLocalName() const;
     std::string CurrentPrefix() const;
@@ -225,8 +235,7 @@ private:
     const std::string& EnsureResolvedBaseUri();
     static XmlReader CreateFromValidatedString(
         std::shared_ptr<const std::string> xml,
-        const XmlReaderSettings& settings,
-        bool skipMaxCharactersPrecheck = false);
+        const XmlReaderSettings& settings);
 
     XmlReaderSettings settings_;
     std::shared_ptr<const XmlReaderInputSource> inputSource_;

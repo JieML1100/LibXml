@@ -112,6 +112,7 @@ public:
     std::shared_ptr<XmlNode> LastChild() const;
     std::shared_ptr<XmlNode> PreviousSibling() const;
     std::shared_ptr<XmlNode> NextSibling() const;
+    std::shared_ptr<XmlNode> SharedFromParent() const;
     bool HasChildNodes() const noexcept;
 
     virtual std::shared_ptr<XmlNode> AppendChild(const std::shared_ptr<XmlNode>& child);
@@ -155,6 +156,7 @@ protected:
 private:
     static constexpr std::size_t DetachedSiblingIndex = (std::numeric_limits<std::size_t>::max)();
 
+    std::size_t FindChildIndexOrThrow(const std::shared_ptr<XmlNode>& child) const;
     void SetSiblingIndex(std::size_t siblingIndex) noexcept;
     std::size_t ResolveSiblingIndex() const noexcept;
     void ReindexChildNodesFrom(std::size_t startIndex) noexcept;
@@ -180,6 +182,18 @@ public:
 
     XmlElement* OwnerElement() noexcept;
     const XmlElement* OwnerElement() const noexcept;
+    std::shared_ptr<XmlAttribute> SharedFromOwnerElement() const;
+
+private:
+    static constexpr std::size_t DetachedAttributeIndex = (std::numeric_limits<std::size_t>::max)();
+
+    void SetAttributeIndex(std::size_t attributeIndex) noexcept;
+    void ResetAttributeIndex() noexcept;
+    std::size_t ResolveAttributeIndex() const noexcept;
+
+    std::size_t attributeIndex_ = DetachedAttributeIndex;
+
+    friend class XmlElement;
 };
 
 class XmlCharacterData : public XmlNode {
@@ -294,6 +308,13 @@ public:
         std::string publicId = {},
         std::string systemId = {},
         std::string internalSubset = {});
+    XmlDocumentType(
+        std::string name,
+        std::string publicId,
+        std::string systemId,
+        std::string internalSubset,
+        std::vector<std::shared_ptr<XmlNode>> entities,
+        std::vector<std::shared_ptr<XmlNode>> notations);
 
     const std::string& PublicId() const noexcept;
     const std::string& SystemId() const noexcept;
@@ -384,7 +405,9 @@ private:
     };
 
     using AttributeNameIndex = std::unordered_map<std::string_view, std::size_t, TransparentStringHash, TransparentStringEqual>;
+    using AttributeLocalNameIndex = std::unordered_map<std::string_view, std::vector<std::size_t>, TransparentStringHash, TransparentStringEqual>;
     using PendingAttributeNameIndex = std::unordered_map<std::string_view, std::size_t, TransparentStringHash, TransparentStringEqual>;
+    using PendingAttributeLocalNameIndex = std::unordered_map<std::string_view, std::vector<std::size_t>, TransparentStringHash, TransparentStringEqual>;
 
     struct PendingLoadAttribute {
         std::size_t nameOffset = 0;
@@ -397,20 +420,26 @@ private:
     bool TryFindNamespaceDeclarationPrefixView(std::string_view namespaceUri, std::string_view& prefix) const noexcept;
     std::string_view PendingLoadAttributeNameView(const PendingLoadAttribute& attribute) const noexcept;
     std::string_view PendingLoadAttributeValueView(const PendingLoadAttribute& attribute) const noexcept;
-    void MarkAttributeNameIndexesDirty() const noexcept;
-    void EnsureAttributeNameIndexes() const;
+    void MarkAttributeIndexesDirty() const noexcept;
+    void EnsureAttributeIndexes() const;
     std::size_t FindIndexedAttributeIndex(std::string_view name) const noexcept;
     std::size_t FindIndexedPendingLoadAttributeIndex(std::string_view name) const noexcept;
+    const std::vector<std::size_t>* FindIndexedAttributeLocalNameMatches(std::string_view localName) const noexcept;
+    const std::vector<std::size_t>* FindIndexedPendingLoadAttributeLocalNameMatches(std::string_view localName) const noexcept;
+    std::size_t FindAttributeIndex(std::string_view localName, std::string_view namespaceUri) const;
     std::shared_ptr<XmlAttribute> MaterializePendingLoadAttribute(std::size_t index) const;
     std::size_t FindPendingLoadAttributeIndex(std::string_view name) const noexcept;
     std::size_t FindPendingLoadAttributeIndex(std::string_view localName, std::string_view namespaceUri) const;
     void EnsureAttributesMaterialized() const;
     void ReserveAttributesForLoad(std::size_t count, std::size_t totalStorageBytes = 0);
     void AppendAttributeForLoad(std::string name, std::string value);
+    void ReindexAttributesFrom(std::size_t startIndex) noexcept;
     mutable std::vector<std::shared_ptr<XmlAttribute>> attributes_;
     mutable std::vector<PendingLoadAttribute> pendingLoadAttributes_;
     mutable std::unique_ptr<AttributeNameIndex> attributeNameIndex_;
+    mutable std::unique_ptr<AttributeLocalNameIndex> attributeLocalNameIndex_;
     mutable std::unique_ptr<PendingAttributeNameIndex> pendingLoadAttributeNameIndex_;
+    mutable std::unique_ptr<PendingAttributeLocalNameIndex> pendingLoadAttributeLocalNameIndex_;
     mutable bool attributeNameIndexesDirty_ = true;
     mutable std::string pendingLoadAttributeStorage_;
     bool writeFullEndElement_ = false;

@@ -431,7 +431,7 @@ std::filesystem::path CreateTemporaryXmlReplayPath() {
     }
 }
 
-std::shared_ptr<std::istream> SpoolStreamToTemporaryReplayStream(std::istream& stream) {
+std::shared_ptr<std::istream> SpoolStreamToTemporaryReplayStream(std::istream& stream, std::string_view initialBytes = {}) {
     const auto path = CreateTemporaryXmlReplayPath();
     auto replayStream = std::shared_ptr<std::fstream>(
         new std::fstream(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc),
@@ -448,6 +448,14 @@ std::shared_ptr<std::istream> SpoolStreamToTemporaryReplayStream(std::istream& s
         throw XmlException("Failed to create temporary XML replay file");
     }
 
+    if (!initialBytes.empty()) {
+        replayStream->write(initialBytes.data(), static_cast<std::streamsize>(initialBytes.size()));
+        if (!*replayStream) {
+            replayStream.reset();
+            throw XmlException("Failed to write temporary XML replay file");
+        }
+    }
+
     char chunk[64 * 1024];
     while (stream) {
         stream.read(chunk, static_cast<std::streamsize>(sizeof(chunk)));
@@ -455,6 +463,7 @@ std::shared_ptr<std::istream> SpoolStreamToTemporaryReplayStream(std::istream& s
         if (bytesRead <= 0) {
             break;
         }
+
         replayStream->write(chunk, bytesRead);
         if (!*replayStream) {
             break;

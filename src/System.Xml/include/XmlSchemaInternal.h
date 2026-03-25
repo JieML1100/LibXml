@@ -820,7 +820,6 @@ bool HasDocumentNotationDeclaration(const XmlDocument* document, const std::stri
 void PopulateInternalEntityDeclarations(
     const std::vector<std::shared_ptr<XmlNode>>& entities,
     std::unordered_map<std::string, std::string>& declarations) {
-    declarations.clear();
     for (const auto& node : entities) {
         if (!node || node->NodeType() != XmlNodeType::Entity) {
             continue;

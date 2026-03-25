@@ -718,16 +718,37 @@ std::shared_ptr<XmlDocument> XmlDocument::Parse(std::string_view xml) {
     return document;
 }
 
+std::shared_ptr<XmlDocument> XmlDocument::Parse(std::string_view xml, const XmlReaderSettings& settings) {
+    auto document = std::make_shared<XmlDocument>();
+    document->LoadXml(xml, settings);
+    return document;
+}
+
 void XmlDocument::LoadXml(std::string_view xml) {
     XmlParser(xml).ParseInto(*this);
+}
+
+void XmlDocument::LoadXml(std::string_view xml, const XmlReaderSettings& settings) {
+    auto reader = XmlReader::Create(std::string(xml), settings);
+    LoadXmlDocumentFromReader(reader, *this);
 }
 
 void XmlDocument::Load(const std::string& path) {
     LoadXml(ReadFileFullyForXmlDocumentLoad(path));
 }
 
+void XmlDocument::Load(const std::string& path, const XmlReaderSettings& settings) {
+    auto reader = XmlReader::CreateFromFile(path, settings);
+    LoadXmlDocumentFromReader(reader, *this);
+}
+
 void XmlDocument::Load(std::istream& stream) {
     LoadXml(ReadStreamFullyForXmlDocumentLoad(stream));
+}
+
+void XmlDocument::Load(std::istream& stream, const XmlReaderSettings& settings) {
+    auto reader = XmlReader::Create(stream, settings);
+    LoadXmlDocumentFromReader(reader, *this);
 }
 
 void XmlDocument::Save(const std::string& path, const XmlWriterSettings& settings) const {

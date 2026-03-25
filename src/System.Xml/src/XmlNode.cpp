@@ -6,10 +6,42 @@ namespace {
 
 constexpr std::string_view kXmlNamespaceUri = "http://www.w3.org/XML/1998/namespace";
 constexpr std::string_view kXmlnsNamespaceUri = "http://www.w3.org/2000/xmlns/";
+constexpr std::size_t kAttributeIndexThreshold = 8;
 
 const std::vector<std::shared_ptr<XmlNode>>& EmptyXmlNodeChildren() noexcept {
     static const std::vector<std::shared_ptr<XmlNode>> empty;
     return empty;
+}
+
+std::vector<std::shared_ptr<XmlNode>> CloneDocumentTypeDeclarations(const std::vector<std::shared_ptr<XmlNode>>& declarations) {
+    std::vector<std::shared_ptr<XmlNode>> clones;
+    clones.reserve(declarations.size());
+    for (const auto& declaration : declarations) {
+        if (declaration == nullptr) {
+            continue;
+        }
+
+        switch (declaration->NodeType()) {
+        case XmlNodeType::Entity: {
+            const auto* entity = static_cast<const XmlEntity*>(declaration.get());
+            clones.push_back(std::make_shared<XmlEntity>(
+                entity->Name(),
+                entity->Value(),
+                entity->PublicId(),
+                entity->SystemId(),
+                entity->NotationName()));
+            break;
+        }
+        case XmlNodeType::Notation: {
+            const auto* notation = static_cast<const XmlNotation*>(declaration.get());
+            clones.push_back(std::make_shared<XmlNotation>(notation->Name(), notation->PublicId(), notation->SystemId()));
+            break;
+        }
+        default:
+            throw XmlException("Unsupported DOCTYPE declaration node type");
+        }
+    }
+    return clones;
 }
 
 bool PrefixResolvesToNamespaceUri(const XmlElement* element, std::string_view prefix, std::string_view namespaceUri) noexcept {
@@ -19,16 +51,6 @@ bool PrefixResolvesToNamespaceUri(const XmlElement* element, std::string_view pr
 
     std::string_view resolvedNamespaceUri;
     return LookupNamespaceUriOnElementView(element, prefix, resolvedNamespaceUri) && resolvedNamespaceUri == namespaceUri;
-}
-
-std::size_t FindChildIndexOrThrow(const XmlNode& parent, const std::shared_ptr<XmlNode>& child) {
-    const auto& children = parent.ChildNodes();
-    const auto found = std::find(children.begin(), children.end(), child);
-    if (found == children.end()) {
-        throw XmlException("Reference child is not a child of the current node");
-    }
-
-    return static_cast<std::size_t>(std::distance(children.begin(), found));
 }
 
 }  // namespace
@@ -93,6 +115,36 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
         auto node = document.AllocateOwnedNode<XmlElement>(std::move(reader.currentName_));
         reader.AppendCurrentAttributesForLoad(*node);
         return node;
+    };
+
+    const auto collectDocumentTypeDeclarations = [&reader](const auto& declaration) {
+        std::vector<std::shared_ptr<XmlNode>> entities;
+        std::vector<std::shared_ptr<XmlNode>> notations;
+
+        if (reader.dtdState_ != nullptr) {
+            entities = reader.dtdState_->parsedEntities;
+            notations = reader.dtdState_->parsedNotations;
+        }
+
+        if ((!entities.empty() || !notations.empty()) || reader.settings_.DtdProcessing != DtdProcessing::Parse) {
+            return std::pair{std::move(entities), std::move(notations)};
+        }
+
+        if (!declaration.internalSubset.empty()) {
+            ParseDocumentTypeInternalSubset(declaration.internalSubset, entities, notations);
+        }
+
+        if (reader.settings_.Resolver != nullptr && !declaration.systemId.empty()) {
+            const std::string absoluteUri = reader.settings_.Resolver->ResolveUri(
+                reader.baseUri_,
+                declaration.systemId);
+            const std::string externalSubset = Trim(reader.settings_.Resolver->GetEntity(absoluteUri));
+            if (!externalSubset.empty()) {
+                ParseDocumentTypeInternalSubset(externalSubset, entities, notations);
+            }
+        }
+
+        return std::pair{std::move(entities), std::move(notations)};
     };
 
     const auto appendNode = [&](std::shared_ptr<XmlNode> node, bool ownerAlreadyAssigned) {
@@ -175,16 +227,19 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
         }
         case XmlNodeType::DocumentType: {
             const auto declaration = ParseDocumentTypeDeclaration(reader.ReadOuterXml());
-            appendNode(document.CreateDocumentType(
+            auto [entities, notations] = collectDocumentTypeDeclarations(declaration);
+            appendNode(document.AllocateOwnedNode<XmlDocumentType>(
                 declaration.name,
                 declaration.publicId,
                 declaration.systemId,
-                declaration.internalSubset),
+                declaration.internalSubset,
+                std::move(entities),
+                std::move(notations)),
                 false);
             break;
         }
         case XmlNodeType::EntityReference:
-            appendNode(document.CreateEntityReference(reader.Name()), true);
+            appendNode(document.AllocateOwnedNode<XmlEntityReference>(reader.Name(), reader.Value()), true);
             entityExpansionDepth = 1;
             break;
         case XmlNodeType::EndEntity:
@@ -458,6 +513,21 @@ std::shared_ptr<XmlNode> XmlNode::NextSibling() const {
     return siblings[siblingIndex + 1];
 }
 
+std::shared_ptr<XmlNode> XmlNode::SharedFromParent() const {
+    if (parent_ == nullptr || NodeType() == XmlNodeType::Attribute) {
+        return nullptr;
+    }
+
+    const auto& siblings = parent_->ChildNodes();
+    const auto siblingIndex = ResolveSiblingIndex();
+    if (siblingIndex == DetachedSiblingIndex || siblingIndex >= siblings.size()) {
+        return nullptr;
+    }
+
+    const auto& sibling = siblings[siblingIndex];
+    return sibling != nullptr && sibling.get() == this ? sibling : nullptr;
+}
+
 bool XmlNode::HasChildNodes() const noexcept {
     return childNodes_ != nullptr && !childNodes_->empty();
 }
@@ -571,7 +641,7 @@ std::shared_ptr<XmlNode> XmlNode::InsertBefore(
         return AppendChild(newChild);
     }
 
-    const auto index = FindChildIndexOrThrow(*this, referenceChild);
+    const auto index = FindChildIndexOrThrow(referenceChild);
     ValidateChildInsertion(newChild);
 
     if (newChild->NodeType() == XmlNodeType::DocumentFragment) {
@@ -628,7 +698,7 @@ std::shared_ptr<XmlNode> XmlNode::InsertAfter(
         return newChild;
     }
 
-    const auto index = FindChildIndexOrThrow(*this, referenceChild);
+    const auto index = FindChildIndexOrThrow(referenceChild);
     ValidateChildInsertion(newChild);
 
     if (newChild->NodeType() == XmlNodeType::DocumentFragment) {
@@ -673,7 +743,7 @@ std::shared_ptr<XmlNode> XmlNode::ReplaceChild(
         return oldChild;
     }
 
-    const auto index = FindChildIndexOrThrow(*this, oldChild);
+    const auto index = FindChildIndexOrThrow(oldChild);
     ValidateChildInsertion(newChild, oldChild.get());
 
     if (newChild->NodeType() == XmlNodeType::DocumentFragment) {
@@ -723,7 +793,7 @@ std::shared_ptr<XmlNode> XmlNode::ReplaceChild(
 }
 
 std::shared_ptr<XmlNode> XmlNode::RemoveChild(const std::shared_ptr<XmlNode>& child) {
-    const auto index = FindChildIndexOrThrow(*this, child);
+    const auto index = FindChildIndexOrThrow(child);
     auto& children = MutableChildNodes();
     auto removed = children[index];
     if (ownerDocument_ != nullptr) {
@@ -768,13 +838,11 @@ std::shared_ptr<XmlNode> XmlNode::SelectSingleNode(std::string_view xpath, const
 }
 
 XmlNodeList XmlNode::SelectNodes(std::string_view xpath) const {
-    const std::string xpathStr(xpath);
-    return EvaluateXPathFromNode(*this, xpathStr, nullptr);
+    return EvaluateXPathFromNode(*this, xpath, nullptr);
 }
 
 XmlNodeList XmlNode::SelectNodes(std::string_view xpath, const XmlNamespaceManager& namespaces) const {
-    const std::string xpathStr(xpath);
-    return EvaluateXPathFromNode(*this, xpathStr, &namespaces);
+    return EvaluateXPathFromNode(*this, xpath, &namespaces);
 }
 
 std::string XmlNode::InnerText() const {
@@ -944,12 +1012,16 @@ std::shared_ptr<XmlNode> XmlNode::CloneNode(bool deep) const {
                 documentType->Name(),
                 documentType->PublicId(),
                 documentType->SystemId(),
-                documentType->InternalSubset())
+                documentType->InternalSubset(),
+                documentType->entities_,
+                documentType->notations_)
             : std::make_shared<XmlDocumentType>(
                 documentType->Name(),
                 documentType->PublicId(),
                 documentType->SystemId(),
-                documentType->InternalSubset());
+                documentType->InternalSubset(),
+                documentType->entities_,
+                documentType->notations_);
         break;
     }
     case XmlNodeType::DocumentFragment:
@@ -1012,6 +1084,29 @@ void XmlNode::SetParent(XmlNode* parent) noexcept {
     }
 }
 
+std::size_t XmlNode::FindChildIndexOrThrow(const std::shared_ptr<XmlNode>& child) const {
+    if (child == nullptr || child->ParentNode() != this) {
+        throw XmlException("Reference child is not a child of the current node");
+    }
+
+    const auto& children = ChildNodes();
+    const auto siblingIndex = child->ResolveSiblingIndex();
+    if (siblingIndex != DetachedSiblingIndex && siblingIndex < children.size() && children[siblingIndex].get() == child.get()) {
+        return siblingIndex;
+    }
+
+    const auto found = std::find_if(children.begin(), children.end(), [&child](const auto& current) {
+        return current.get() == child.get();
+    });
+    if (found == children.end()) {
+        throw XmlException("Reference child is not a child of the current node");
+    }
+
+    const auto resolvedIndex = static_cast<std::size_t>(std::distance(children.begin(), found));
+    child->SetSiblingIndex(resolvedIndex);
+    return resolvedIndex;
+}
+
 void XmlNode::SetSiblingIndex(std::size_t siblingIndex) noexcept {
     siblingIndex_ = siblingIndex;
 }
@@ -1066,6 +1161,34 @@ const XmlElement* XmlAttribute::OwnerElement() const noexcept {
     return ParentNode() != nullptr && ParentNode()->NodeType() == XmlNodeType::Element
         ? static_cast<const XmlElement*>(ParentNode())
         : nullptr;
+}
+
+std::shared_ptr<XmlAttribute> XmlAttribute::SharedFromOwnerElement() const {
+    const auto* owner = OwnerElement();
+    if (owner == nullptr) {
+        return nullptr;
+    }
+
+    const auto& attributes = owner->Attributes();
+    const auto attributeIndex = ResolveAttributeIndex();
+    if (attributeIndex == DetachedAttributeIndex || attributeIndex >= attributes.size()) {
+        return nullptr;
+    }
+
+    const auto& attribute = attributes[attributeIndex];
+    return attribute != nullptr && attribute.get() == this ? attribute : nullptr;
+}
+
+void XmlAttribute::SetAttributeIndex(std::size_t attributeIndex) noexcept {
+    attributeIndex_ = attributeIndex;
+}
+
+void XmlAttribute::ResetAttributeIndex() noexcept {
+    attributeIndex_ = DetachedAttributeIndex;
+}
+
+std::size_t XmlAttribute::ResolveAttributeIndex() const noexcept {
+    return attributeIndex_;
 }
 
 // XmlNode::Normalize — merge adjacent Text nodes recursively
@@ -1298,11 +1421,32 @@ XmlDocumentType::XmlDocumentType(
     std::string publicId,
     std::string systemId,
     std::string internalSubset)
+    : XmlDocumentType(
+        std::move(name),
+        std::move(publicId),
+        std::move(systemId),
+        std::move(internalSubset),
+        {},
+        {}) {
+}
+
+XmlDocumentType::XmlDocumentType(
+    std::string name,
+    std::string publicId,
+    std::string systemId,
+    std::string internalSubset,
+    std::vector<std::shared_ptr<XmlNode>> entities,
+    std::vector<std::shared_ptr<XmlNode>> notations)
     : XmlNode(XmlNodeType::DocumentType, std::move(name)),
       publicId_(std::move(publicId)),
       systemId_(std::move(systemId)),
       internalSubset_(std::move(internalSubset)) {
-    ParseDocumentTypeInternalSubset(internalSubset_, entities_, notations_);
+    if (entities.empty() && notations.empty()) {
+        ParseDocumentTypeInternalSubset(internalSubset_, entities_, notations_);
+    } else {
+        entities_ = CloneDocumentTypeDeclarations(entities);
+        notations_ = CloneDocumentTypeDeclarations(notations);
+    }
 }
 
 const std::string& XmlDocumentType::PublicId() const noexcept {
@@ -1358,51 +1502,152 @@ std::string_view XmlElement::PendingLoadAttributeValueView(const PendingLoadAttr
     return std::string_view(pendingLoadAttributeStorage_).substr(attribute.valueOffset, attribute.valueLength);
 }
 
-void XmlElement::MarkAttributeNameIndexesDirty() const noexcept {
+void XmlElement::MarkAttributeIndexesDirty() const noexcept {
     attributeNameIndexesDirty_ = true;
 }
 
-void XmlElement::EnsureAttributeNameIndexes() const {
+void XmlElement::EnsureAttributeIndexes() const {
     if (!attributeNameIndexesDirty_) {
         return;
     }
 
-    if (!attributeNameIndex_) {
-        attributeNameIndex_ = std::make_unique<AttributeNameIndex>();
-    } else {
-        attributeNameIndex_->clear();
-    }
-    attributeNameIndex_->reserve(attributes_.size());
-    for (std::size_t index = 0; index < attributes_.size(); ++index) {
-        const auto& attribute = attributes_[index];
-        if (attribute != nullptr) {
-            attributeNameIndex_->insert_or_assign(attribute->Name(), index);
+    if (attributes_.size() >= kAttributeIndexThreshold) {
+        if (!attributeNameIndex_) {
+            attributeNameIndex_ = std::make_unique<AttributeNameIndex>();
+        } else {
+            attributeNameIndex_->clear();
         }
+        attributeNameIndex_->reserve(attributes_.size());
+
+        if (!attributeLocalNameIndex_) {
+            attributeLocalNameIndex_ = std::make_unique<AttributeLocalNameIndex>();
+        } else {
+            attributeLocalNameIndex_->clear();
+        }
+        attributeLocalNameIndex_->reserve(attributes_.size());
+
+        for (std::size_t index = 0; index < attributes_.size(); ++index) {
+            const auto& attribute = attributes_[index];
+            if (attribute == nullptr) {
+                continue;
+            }
+
+            attributeNameIndex_->insert_or_assign(attribute->Name(), index);
+            (*attributeLocalNameIndex_)[SplitQualifiedNameView(attribute->Name()).second].push_back(index);
+        }
+    } else {
+        attributeNameIndex_.reset();
+        attributeLocalNameIndex_.reset();
     }
 
-    if (!pendingLoadAttributeNameIndex_) {
-        pendingLoadAttributeNameIndex_ = std::make_unique<PendingAttributeNameIndex>();
+    if (pendingLoadAttributes_.size() >= kAttributeIndexThreshold) {
+        if (!pendingLoadAttributeNameIndex_) {
+            pendingLoadAttributeNameIndex_ = std::make_unique<PendingAttributeNameIndex>();
+        } else {
+            pendingLoadAttributeNameIndex_->clear();
+        }
+        pendingLoadAttributeNameIndex_->reserve(pendingLoadAttributes_.size());
+
+        if (!pendingLoadAttributeLocalNameIndex_) {
+            pendingLoadAttributeLocalNameIndex_ = std::make_unique<PendingAttributeLocalNameIndex>();
+        } else {
+            pendingLoadAttributeLocalNameIndex_->clear();
+        }
+        pendingLoadAttributeLocalNameIndex_->reserve(pendingLoadAttributes_.size());
+
+        for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
+            const auto name = PendingLoadAttributeNameView(pendingLoadAttributes_[index]);
+            pendingLoadAttributeNameIndex_->insert_or_assign(name, index);
+            (*pendingLoadAttributeLocalNameIndex_)[SplitQualifiedNameView(name).second].push_back(index);
+        }
     } else {
-        pendingLoadAttributeNameIndex_->clear();
-    }
-    pendingLoadAttributeNameIndex_->reserve(pendingLoadAttributes_.size());
-    for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
-        pendingLoadAttributeNameIndex_->insert_or_assign(PendingLoadAttributeNameView(pendingLoadAttributes_[index]), index);
+        pendingLoadAttributeNameIndex_.reset();
+        pendingLoadAttributeLocalNameIndex_.reset();
     }
 
     attributeNameIndexesDirty_ = false;
 }
 
 std::size_t XmlElement::FindIndexedAttributeIndex(std::string_view name) const noexcept {
-    EnsureAttributeNameIndexes();
-    const auto found = attributeNameIndex_->find(name);
-    return found == attributeNameIndex_->end() ? std::string::npos : found->second;
+    EnsureAttributeIndexes();
+    if (attributeNameIndex_ != nullptr) {
+        const auto found = attributeNameIndex_->find(name);
+        return found == attributeNameIndex_->end() ? std::string::npos : found->second;
+    }
+
+    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
+        return attribute != nullptr && attribute->Name() == name;
+    });
+    return found == attributes_.end() ? std::string::npos : static_cast<std::size_t>(std::distance(attributes_.begin(), found));
 }
 
 std::size_t XmlElement::FindIndexedPendingLoadAttributeIndex(std::string_view name) const noexcept {
-    EnsureAttributeNameIndexes();
-    const auto found = pendingLoadAttributeNameIndex_->find(name);
-    return found == pendingLoadAttributeNameIndex_->end() ? std::string::npos : found->second;
+    EnsureAttributeIndexes();
+    if (pendingLoadAttributeNameIndex_ != nullptr) {
+        const auto found = pendingLoadAttributeNameIndex_->find(name);
+        return found == pendingLoadAttributeNameIndex_->end() ? std::string::npos : found->second;
+    }
+
+    for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
+        if (PendingLoadAttributeNameView(pendingLoadAttributes_[index]) == name) {
+            return index;
+        }
+    }
+    return std::string::npos;
+}
+
+const std::vector<std::size_t>* XmlElement::FindIndexedAttributeLocalNameMatches(std::string_view localName) const noexcept {
+    EnsureAttributeIndexes();
+    if (attributeLocalNameIndex_ == nullptr) {
+        return nullptr;
+    }
+
+    const auto found = attributeLocalNameIndex_->find(localName);
+    return found == attributeLocalNameIndex_->end() ? nullptr : &found->second;
+}
+
+const std::vector<std::size_t>* XmlElement::FindIndexedPendingLoadAttributeLocalNameMatches(std::string_view localName) const noexcept {
+    EnsureAttributeIndexes();
+    if (pendingLoadAttributeLocalNameIndex_ == nullptr) {
+        return nullptr;
+    }
+
+    const auto found = pendingLoadAttributeLocalNameIndex_->find(localName);
+    return found == pendingLoadAttributeLocalNameIndex_->end() ? nullptr : &found->second;
+}
+
+std::size_t XmlElement::FindAttributeIndex(std::string_view localName, std::string_view namespaceUri) const {
+    if (const auto* matches = FindIndexedAttributeLocalNameMatches(localName); matches != nullptr) {
+        for (const auto index : *matches) {
+            const auto& attribute = attributes_[index];
+            const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
+            if (attributeLocalName != localName) {
+                continue;
+            }
+            if (prefix.empty()) {
+                if (namespaceUri.empty()) {
+                    return index;
+                }
+                continue;
+            }
+            if (PrefixResolvesToNamespaceUri(this, prefix, namespaceUri)) {
+                return index;
+            }
+        }
+        return std::string::npos;
+    }
+
+    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
+        const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
+        if (attributeLocalName != localName) {
+            return false;
+        }
+        if (prefix.empty()) {
+            return namespaceUri.empty();
+        }
+        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
+    });
+    return found == attributes_.end() ? std::string::npos : static_cast<std::size_t>(std::distance(attributes_.begin(), found));
 }
 
 bool XmlElement::TryFindNamespaceDeclarationValueView(std::string_view prefix, std::string_view& value) const noexcept {
@@ -1493,6 +1738,26 @@ std::size_t XmlElement::FindPendingLoadAttributeIndex(std::string_view name) con
 }
 
 std::size_t XmlElement::FindPendingLoadAttributeIndex(std::string_view localName, std::string_view namespaceUri) const {
+    if (const auto* matches = FindIndexedPendingLoadAttributeLocalNameMatches(localName); matches != nullptr) {
+        for (const auto index : *matches) {
+            const auto& pendingAttribute = pendingLoadAttributes_[index];
+            const auto [prefix, pendingLocalName] = SplitQualifiedNameView(PendingLoadAttributeNameView(pendingAttribute));
+            if (pendingLocalName != localName) {
+                continue;
+            }
+            if (prefix.empty()) {
+                if (namespaceUri.empty()) {
+                    return index;
+                }
+                continue;
+            }
+            if (PrefixResolvesToNamespaceUri(this, prefix, namespaceUri)) {
+                return index;
+            }
+        }
+        return std::string::npos;
+    }
+
     for (std::size_t index = 0; index < pendingLoadAttributes_.size(); ++index) {
         const auto& pendingAttribute = pendingLoadAttributes_[index];
         const auto [prefix, pendingLocalName] = SplitQualifiedNameView(PendingLoadAttributeNameView(pendingAttribute));
@@ -1544,13 +1809,15 @@ void XmlElement::EnsureAttributesMaterialized() const {
                 std::string(PendingLoadAttributeValueView(pendingAttribute)));
         attribute->SetParent(const_cast<XmlElement*>(this));
         attribute->SetOwnerDocument(const_cast<XmlDocument*>(ownerDocument));
+            attribute->SetAttributeIndex(attributes_.size());
         attributes_.push_back(std::move(attribute));
     }
 
     pendingLoadAttributes_.clear();
     pendingLoadAttributeStorage_.clear();
     pendingLoadAttributeNameIndex_.reset();
-    MarkAttributeNameIndexesDirty();
+    pendingLoadAttributeLocalNameIndex_.reset();
+    MarkAttributeIndexesDirty();
 }
 
 const std::vector<std::shared_ptr<XmlAttribute>>& XmlElement::Attributes() const {
@@ -1573,17 +1840,8 @@ bool XmlElement::HasAttribute(std::string_view name) const {
 }
 
 bool XmlElement::HasAttribute(std::string_view localName, std::string_view namespaceUri) const {
-    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
-        const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
-        if (attributeLocalName != localName) {
-            return false;
-        }
-        if (prefix.empty()) {
-            return namespaceUri.empty();
-        }
-        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
-    });
-    return found != attributes_.end() || FindPendingLoadAttributeIndex(localName, namespaceUri) != std::string::npos;
+    return FindAttributeIndex(localName, namespaceUri) != std::string::npos
+        || FindPendingLoadAttributeIndex(localName, namespaceUri) != std::string::npos;
 }
 
 std::string XmlElement::GetAttribute(std::string_view name) const {
@@ -1592,18 +1850,8 @@ std::string XmlElement::GetAttribute(std::string_view name) const {
 }
 
 std::string XmlElement::GetAttribute(std::string_view localName, std::string_view namespaceUri) const {
-    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
-        const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
-        if (attributeLocalName != localName) {
-            return false;
-        }
-        if (prefix.empty()) {
-            return namespaceUri.empty();
-        }
-        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
-    });
-    if (found != attributes_.end()) {
-        return (*found)->Value();
+    if (const auto index = FindAttributeIndex(localName, namespaceUri); index != std::string::npos) {
+        return attributes_[index]->Value();
     }
 
     const auto pendingIndex = FindPendingLoadAttributeIndex(localName, namespaceUri);
@@ -1626,19 +1874,8 @@ std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(std::string_view name
 }
 
 std::shared_ptr<XmlAttribute> XmlElement::GetAttributeNode(std::string_view localName, std::string_view namespaceUri) const {
-    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
-        const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
-        if (attributeLocalName != localName) {
-            return false;
-        }
-        if (prefix.empty()) {
-            return namespaceUri.empty();
-        }
-        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
-    });
-
-    if (found != attributes_.end()) {
-        return *found;
+    if (const auto index = FindAttributeIndex(localName, namespaceUri); index != std::string::npos) {
+        return attributes_[index];
     }
 
     const auto pendingIndex = FindPendingLoadAttributeIndex(localName, namespaceUri);
@@ -1661,9 +1898,18 @@ std::shared_ptr<XmlAttribute> XmlElement::SetAttribute(std::string_view name, st
         : std::make_shared<XmlAttribute>(std::string(name), std::string(value));
     attribute->SetParent(this);
     attribute->SetOwnerDocumentRecursive(OwnerDocument());
+    attribute->SetAttributeIndex(attributes_.size());
     attributes_.push_back(attribute);
-    MarkAttributeNameIndexesDirty();
+    MarkAttributeIndexesDirty();
     return attribute;
+}
+
+void XmlElement::ReindexAttributesFrom(std::size_t startIndex) noexcept {
+    for (std::size_t index = startIndex; index < attributes_.size(); ++index) {
+        if (attributes_[index] != nullptr) {
+            attributes_[index]->SetAttributeIndex(index);
+        }
+    }
 }
 
 void XmlElement::ReserveAttributesForLoad(std::size_t count, std::size_t totalStorageBytes) {
@@ -1683,7 +1929,7 @@ void XmlElement::AppendAttributeForLoad(std::string name, std::string value) {
         name.size(),
         valueOffset,
         value.size()});
-    MarkAttributeNameIndexesDirty();
+    MarkAttributeIndexesDirty();
 }
 
 void XmlElement::SetAttribute(std::string_view localName, std::string_view namespaceUri, std::string_view value) {
@@ -1742,14 +1988,17 @@ std::shared_ptr<XmlAttribute> XmlElement::SetAttributeNode(const std::shared_ptr
     if (found != attributes_.end()) {
         replaced = *found;
         replaced->SetParent(nullptr);
+        replaced->ResetAttributeIndex();
+        attribute->SetAttributeIndex(static_cast<std::size_t>(found - attributes_.begin()));
         *found = attribute;
     } else {
+        attribute->SetAttributeIndex(attributes_.size());
         attributes_.push_back(attribute);
     }
 
     attribute->SetParent(this);
     attribute->SetOwnerDocumentRecursive(OwnerDocument());
-    MarkAttributeNameIndexesDirty();
+    MarkAttributeIndexesDirty();
     return replaced;
 }
 
@@ -1776,7 +2025,7 @@ void XmlElement::SetInnerXml(std::string_view xml) {
 bool XmlElement::RemoveAttribute(std::string_view name) {
     if (const auto pendingIndex = FindPendingLoadAttributeIndex(name); pendingIndex != std::string::npos) {
         pendingLoadAttributes_.erase(pendingLoadAttributes_.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
-        MarkAttributeNameIndexesDirty();
+        MarkAttributeIndexesDirty();
         return true;
     }
 
@@ -1786,35 +2035,30 @@ bool XmlElement::RemoveAttribute(std::string_view name) {
     }
 
     attributes_[index]->SetParent(nullptr);
+    attributes_[index]->ResetAttributeIndex();
     attributes_.erase(attributes_.begin() + static_cast<std::ptrdiff_t>(index));
-    MarkAttributeNameIndexesDirty();
+    ReindexAttributesFrom(index);
+    MarkAttributeIndexesDirty();
     return true;
 }
 
 bool XmlElement::RemoveAttribute(std::string_view localName, std::string_view namespaceUri) {
     if (const auto pendingIndex = FindPendingLoadAttributeIndex(localName, namespaceUri); pendingIndex != std::string::npos) {
         pendingLoadAttributes_.erase(pendingLoadAttributes_.begin() + static_cast<std::ptrdiff_t>(pendingIndex));
-        MarkAttributeNameIndexesDirty();
+        MarkAttributeIndexesDirty();
         return true;
     }
 
-    const auto found = std::find_if(attributes_.begin(), attributes_.end(), [&](const auto& attribute) {
-        const auto [prefix, attributeLocalName] = SplitQualifiedNameView(attribute->Name());
-        if (attributeLocalName != localName) {
-            return false;
-        }
-        if (prefix.empty()) {
-            return namespaceUri.empty();
-        }
-        return PrefixResolvesToNamespaceUri(this, prefix, namespaceUri);
-    });
-    if (found == attributes_.end()) {
+    const auto index = FindAttributeIndex(localName, namespaceUri);
+    if (index == std::string::npos) {
         return false;
     }
 
-    (*found)->SetParent(nullptr);
-    attributes_.erase(found);
-    MarkAttributeNameIndexesDirty();
+    attributes_[index]->SetParent(nullptr);
+    attributes_[index]->ResetAttributeIndex();
+    attributes_.erase(attributes_.begin() + static_cast<std::ptrdiff_t>(index));
+    ReindexAttributesFrom(index);
+    MarkAttributeIndexesDirty();
     return true;
 }
 
@@ -1831,8 +2075,11 @@ std::shared_ptr<XmlAttribute> XmlElement::RemoveAttributeNode(const std::shared_
 
     auto removed = *found;
     removed->SetParent(nullptr);
+    removed->ResetAttributeIndex();
+    const auto removedIndex = static_cast<std::size_t>(found - attributes_.begin());
     attributes_.erase(found);
-    MarkAttributeNameIndexesDirty();
+    ReindexAttributesFrom(removedIndex);
+    MarkAttributeIndexesDirty();
     return removed;
 }
 
@@ -1840,10 +2087,13 @@ void XmlElement::RemoveAllAttributes() {
     pendingLoadAttributes_.clear();
     for (const auto& attribute : attributes_) {
         attribute->SetParent(nullptr);
+        attribute->ResetAttributeIndex();
     }
     attributes_.clear();
     attributeNameIndex_.reset();
+    attributeLocalNameIndex_.reset();
     pendingLoadAttributeNameIndex_.reset();
+    pendingLoadAttributeLocalNameIndex_.reset();
     attributeNameIndexesDirty_ = true;
 }
 

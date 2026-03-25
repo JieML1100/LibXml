@@ -49,12 +49,13 @@ bool SubsetStartsWithAt(std::string_view text, std::size_t position, std::string
 }
 
 std::string_view ParseNameAtView(std::string_view text, std::size_t& position) {
-    if (position >= text.size() || !IsNameStartChar(text[position])) {
+    const auto start = position;
+    position = ConsumeXmlNameAt(position, [text](std::size_t index) noexcept {
+        return index < text.size() ? text[index] : '\0';
+    });
+    if (position == start) {
         return {};
     }
-
-    const auto start = position++;
-    position += ConsumeNameCharsInBuffer(text.data() + position, text.size() - position);
 
     return std::string_view(text.data() + start, position - start);
 }

@@ -2,6 +2,51 @@
 
 namespace System::Xml {
 
+namespace {
+
+template <typename TPredicate>
+bool ConsumeUtf8ValidatedSpan(std::string_view text, std::size_t& position, TPredicate&& predicate) {
+    std::uint32_t codePoint = 0;
+    std::size_t width = 0;
+    if (!DecodeUtf8CodePointAt(position, [text](std::size_t index) noexcept {
+            return index < text.size() ? text[index] : '\0';
+        }, codePoint, width)
+        || !predicate(codePoint)) {
+        return false;
+    }
+
+    position += width;
+    return true;
+}
+
+void AppendEncodedByte(std::string& encoded, unsigned char value) {
+    std::ostringstream hex;
+    hex << "_x" << std::uppercase << std::setfill('0') << std::setw(4)
+        << std::hex << static_cast<unsigned>(value) << "_";
+    encoded += hex.str();
+}
+
+template <typename TPredicate>
+void EncodeUtf8NameLike(std::string_view name, std::string& encoded, TPredicate&& predicate) {
+    for (std::size_t index = 0; index < name.size();) {
+        std::uint32_t codePoint = 0;
+        std::size_t width = 0;
+        if (DecodeUtf8CodePointAt(index, [name](std::size_t probe) noexcept {
+                return probe < name.size() ? name[probe] : '\0';
+            }, codePoint, width)
+            && predicate(index == 0, codePoint)) {
+            encoded.append(name.data() + static_cast<std::ptrdiff_t>(index), width);
+            index += width;
+            continue;
+        }
+
+        AppendEncodedByte(encoded, static_cast<unsigned char>(name[index]));
+        ++index;
+    }
+}
+
+}  // namespace
+
 std::string XmlConvert::EncodeName(std::string_view name) {
     if (name.empty()) {
         return {};
@@ -9,23 +54,9 @@ std::string XmlConvert::EncodeName(std::string_view name) {
 
     std::string encoded;
     encoded.reserve(name.size());
-
-    for (std::size_t index = 0; index < name.size(); ++index) {
-        const char ch = name[index];
-        if (index == 0 && !IsStartNameChar(ch)) {
-            std::ostringstream hex;
-            hex << "_x" << std::uppercase << std::setfill('0') << std::setw(4)
-                << std::hex << static_cast<unsigned>(static_cast<unsigned char>(ch)) << "_";
-            encoded += hex.str();
-        } else if (!IsNameChar(ch)) {
-            std::ostringstream hex;
-            hex << "_x" << std::uppercase << std::setfill('0') << std::setw(4)
-                << std::hex << static_cast<unsigned>(static_cast<unsigned char>(ch)) << "_";
-            encoded += hex.str();
-        } else {
-            encoded.push_back(ch);
-        }
-    }
+    EncodeUtf8NameLike(name, encoded, [](bool isFirst, std::uint32_t codePoint) noexcept {
+        return isFirst ? IsXmlNameStartCodePoint(codePoint) : IsXmlNameCodePoint(codePoint);
+    });
 
     return encoded;
 }
@@ -79,24 +110,17 @@ std::string XmlConvert::EncodeLocalName(std::string_view name) {
 
     std::string encoded;
     encoded.reserve(name.size());
-
-    for (std::size_t index = 0; index < name.size(); ++index) {
-        const char ch = name[index];
-        if (ch == ':') {
-            encoded += "_x003A_";
-        } else if (index == 0 && !IsStartNameChar(ch)) {
-            std::ostringstream hex;
-            hex << "_x" << std::uppercase << std::setfill('0') << std::setw(4)
-                << std::hex << static_cast<unsigned>(static_cast<unsigned char>(ch)) << "_";
-            encoded += hex.str();
-        } else if (!IsNameChar(ch)) {
-            std::ostringstream hex;
-            hex << "_x" << std::uppercase << std::setfill('0') << std::setw(4)
-                << std::hex << static_cast<unsigned>(static_cast<unsigned char>(ch)) << "_";
-            encoded += hex.str();
-        } else {
-            encoded.push_back(ch);
+    EncodeUtf8NameLike(name, encoded, [](bool isFirst, std::uint32_t codePoint) noexcept {
+        if (codePoint == ':') {
+            return false;
         }
+        return isFirst ? IsXmlNameStartCodePoint(codePoint) : IsXmlNameCodePoint(codePoint);
+    });
+
+    std::size_t colon = 0;
+    while ((colon = encoded.find(':', colon)) != std::string::npos) {
+        encoded.replace(colon, 1, "_x003A_");
+        colon += 7;
     }
 
     return encoded;
@@ -109,17 +133,9 @@ std::string XmlConvert::EncodeNmToken(std::string_view name) {
 
     std::string encoded;
     encoded.reserve(name.size());
-
-    for (const char ch : name) {
-        if (!IsNameChar(ch)) {
-            std::ostringstream hex;
-            hex << "_x" << std::uppercase << std::setfill('0') << std::setw(4)
-                << std::hex << static_cast<unsigned>(static_cast<unsigned char>(ch)) << "_";
-            encoded += hex.str();
-        } else {
-            encoded.push_back(ch);
-        }
-    }
+    EncodeUtf8NameLike(name, encoded, [](bool, std::uint32_t codePoint) noexcept {
+        return IsXmlNameCodePoint(codePoint);
+    });
 
     return encoded;
 }
@@ -130,12 +146,14 @@ bool XmlConvert::IsXmlChar(char ch) {
 }
 
 bool XmlConvert::IsStartNameChar(char ch) {
-    return std::isalpha(static_cast<unsigned char>(ch)) != 0 || ch == '_' || ch == ':';
+    const auto uch = static_cast<unsigned char>(ch);
+    return uch >= 0x80 || std::isalpha(uch) != 0 || ch == '_' || ch == ':';
 }
 
 bool XmlConvert::IsNCNameStartChar(char ch) {
     // NCName start char = letter or '_' (no colon)
-    return std::isalpha(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+    const auto uch = static_cast<unsigned char>(ch);
+    return uch >= 0x80 || std::isalpha(uch) != 0 || ch == '_';
 }
 
 bool XmlConvert::IsNameChar(char ch) {
@@ -147,12 +165,17 @@ std::string XmlConvert::VerifyName(std::string_view name) {
         throw XmlException("The empty string is not a valid XML name");
     }
 
-    if (!IsStartNameChar(name[0])) {
+    std::size_t position = 0;
+    if (!ConsumeUtf8ValidatedSpan(name, position, [](std::uint32_t codePoint) noexcept {
+            return IsXmlNameStartCodePoint(codePoint);
+        })) {
         throw XmlException("'" + std::string(name) + "' is not a valid XML name");
     }
 
-    for (std::size_t index = 1; index < name.size(); ++index) {
-        if (!IsNameChar(name[index])) {
+    while (position < name.size()) {
+        if (!ConsumeUtf8ValidatedSpan(name, position, [](std::uint32_t codePoint) noexcept {
+                return IsXmlNameCodePoint(codePoint);
+            })) {
             throw XmlException("'" + std::string(name) + "' is not a valid XML name");
         }
     }
@@ -173,13 +196,18 @@ std::string XmlConvert::VerifyNCName(std::string_view name) {
     if (name.empty()) {
         throw XmlException("The empty string is not a valid NCName");
     }
-    // First char: letter or underscore (no colon, no digit)
-    const char first = name[0];
-    if (!std::isalpha(static_cast<unsigned char>(first)) && first != '_') {
+
+    std::size_t position = 0;
+    if (!ConsumeUtf8ValidatedSpan(name, position, [](std::uint32_t codePoint) noexcept {
+            return IsXmlNameStartCodePoint(codePoint) && codePoint != ':';
+        })) {
         throw XmlException("'" + std::string(name) + "' is not a valid NCName");
     }
-    for (std::size_t i = 1; i < name.size(); ++i) {
-        if (!IsNCNameChar(name[i])) {
+
+    while (position < name.size()) {
+        if (!ConsumeUtf8ValidatedSpan(name, position, [](std::uint32_t codePoint) noexcept {
+                return IsXmlNameCodePoint(codePoint) && codePoint != ':';
+            })) {
             throw XmlException("'" + std::string(name) + "' is not a valid NCName");
         }
     }
@@ -191,8 +219,11 @@ std::string XmlConvert::VerifyNmToken(std::string_view name) {
         throw XmlException("The empty string is not a valid NMTOKEN");
     }
 
-    for (const char ch : name) {
-        if (!IsNameChar(ch)) {
+    std::size_t position = 0;
+    while (position < name.size()) {
+        if (!ConsumeUtf8ValidatedSpan(name, position, [](std::uint32_t codePoint) noexcept {
+                return IsXmlNameCodePoint(codePoint);
+            })) {
             throw XmlException("'" + std::string(name) + "' is not a valid NMTOKEN");
         }
     }

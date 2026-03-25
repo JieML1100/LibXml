@@ -29,13 +29,59 @@ void Assert(bool condition, const std::string& message) {
 
 class TestResolver final : public XmlResolver {
 public:
+    TestResolver() = default;
+
+    explicit TestResolver(std::unordered_map<std::string, std::string> entities)
+        : entities_(std::move(entities)) {
+    }
+
     std::string ResolveUri(std::string_view baseUri, std::string_view relativeUri) const override {
+        const auto mapped = entities_.find(std::string(relativeUri));
+        if (mapped != entities_.end()) {
+            return mapped->first;
+        }
+
         return XmlUrlResolver().ResolveUri(baseUri, relativeUri);
     }
 
     std::string GetEntity(std::string_view absoluteUri) const override {
+        const auto mapped = entities_.find(std::string(absoluteUri));
+        if (mapped != entities_.end()) {
+            return mapped->second;
+        }
+
         return XmlUrlResolver().GetEntity(absoluteUri);
     }
+
+private:
+    std::unordered_map<std::string, std::string> entities_;
+};
+
+class ThrowingResolver final : public XmlResolver {
+public:
+    ThrowingResolver(std::string resolveError = {}, std::string getEntityError = {})
+        : resolveError_(std::move(resolveError)), getEntityError_(std::move(getEntityError)) {
+    }
+
+    std::string ResolveUri(std::string_view baseUri, std::string_view relativeUri) const override {
+        if (!resolveError_.empty()) {
+            throw XmlException(resolveError_);
+        }
+
+        return XmlUrlResolver().ResolveUri(baseUri, relativeUri);
+    }
+
+    std::string GetEntity(std::string_view absoluteUri) const override {
+        if (!getEntityError_.empty()) {
+            throw XmlException(getEntityError_);
+        }
+
+        return XmlUrlResolver().GetEntity(absoluteUri);
+    }
+
+private:
+    std::string resolveError_;
+    std::string getEntityError_;
 };
 
 struct XmlConfCase {
@@ -379,11 +425,45 @@ class NonSeekableStringStreamBuf final : public std::streambuf {
 public:
     explicit NonSeekableStringStreamBuf(std::string text)
         : text_(std::move(text)) {
-        char* begin = text_.data();
-        setg(begin, begin, begin + static_cast<std::ptrdiff_t>(text_.size()));
+        setg(nullptr, nullptr, nullptr);
     }
 
 protected:
+    int_type underflow() override {
+        if (readOffset_ >= text_.size()) {
+            return traits_type::eof();
+        }
+
+        currentChar_ = text_[readOffset_];
+        setg(&currentChar_, &currentChar_, &currentChar_ + 1);
+        return traits_type::to_int_type(currentChar_);
+    }
+
+    int_type uflow() override {
+        if (readOffset_ >= text_.size()) {
+            return traits_type::eof();
+        }
+
+        currentChar_ = text_[readOffset_++];
+        setg(nullptr, nullptr, nullptr);
+        return traits_type::to_int_type(currentChar_);
+    }
+
+    std::streamsize xsgetn(char* destination, std::streamsize count) override {
+        const auto available = static_cast<std::streamsize>(text_.size() - readOffset_);
+        const auto actual = (std::min<std::streamsize>)(count, available);
+        if (actual > 0) {
+            std::memcpy(destination, text_.data() + readOffset_, static_cast<std::size_t>(actual));
+            readOffset_ += static_cast<std::size_t>(actual);
+            setg(nullptr, nullptr, nullptr);
+        }
+        return actual;
+    }
+
+    std::streamsize showmanyc() override {
+        return static_cast<std::streamsize>(text_.size() - readOffset_);
+    }
+
     std::streampos seekoff(std::streamoff, std::ios_base::seekdir, std::ios_base::openmode) override {
         return std::streampos(std::streamoff(-1));
     }
@@ -394,6 +474,8 @@ protected:
 
 private:
     std::string text_;
+    std::size_t readOffset_ = 0;
+    char currentChar_ = '\0';
 };
 
 class NonSeekableStringStream final : public std::istream {
@@ -14700,8 +14782,154 @@ void TestXPathHighFrequencyFunctions() {
         "Predicate child paths should allow boolean(node()[self::processing-instruction()]) over mixed child node-sets");
     Assert(predicateMixedNamespacedNodeCoercionDocument->SelectSingleNode("/root/item[boolean(node()[self::*]) and @id='1']") != nullptr,
         "Predicate child paths should allow boolean(node()[self::*]) over mixed child node-sets");
+    const auto predicateMixedBooleanDocument = XmlDocument::Parse(
+        "<root>"
+        "<item id='1'>a<?mark one?><child/><!--tail-->b</item>"
+        "<item id='2'><?mark two?></item>"
+        "<item id='3'>3</item>"
+        "</root>");
+    Assert(predicateMixedBooleanDocument->SelectSingleNode("/root/item[not(node()[self::comment()]) and @id='2']") != nullptr,
+        "Predicate child paths should allow not(node()[self::comment()]) over mixed child node-sets");
+    Assert(predicateMixedBooleanDocument->SelectSingleNode("/root/item[boolean(node()[self::comment()]) and boolean(node()[self::processing-instruction('mark')]) and @id='1']") != nullptr,
+        "Predicate child paths should allow boolean(node()[self::comment()]) and boolean(node()[self::processing-instruction()]) over mixed child node-sets");
+    Assert(predicateMixedBooleanDocument->SelectSingleNode("/root/item[(boolean(node()[self::comment()]) or @id='2') and @id='1']") != nullptr,
+        "Predicate child paths should allow boolean(node()[self::comment()]) or attribute comparisons over mixed child node-sets");
+    Assert(predicateMixedBooleanDocument->SelectSingleNode("/root/item[node()[self::text()]='3' and number(node()[self::text()])=3 and @id='3']") != nullptr,
+        "Predicate child paths should allow combined string and numeric coercions over self-filtered text node-sets");
+    Assert(predicateMixedBooleanDocument->SelectSingleNode("/root/item[not(node()[self::processing-instruction('mark')]) and @id='3']") != nullptr,
+        "Predicate child paths should allow not(node()[self::processing-instruction()]) over mixed child node-sets");
     Assert(predicateMixedNodeCoercionDocument->SelectSingleNode("/root/item[count(node()[position() mod 2 = 1])=3 and @id='1']") != nullptr,
         "Predicate child paths should allow positional arithmetic filters over mixed child node-sets");
+    const auto chainedSelfPredicateDocument = XmlDocument::Parse(
+        "<root><item>a<?mark one?><child/><!--tail-->b<?mark two?></item></root>");
+    Assert(chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][1]") != nullptr
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][1]")->NodeType() == XmlNodeType::Text
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][1]")->Value() == "a",
+        "node()[self::text()][1] should position over the filtered text node-set");
+    Assert(chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][last()]") != nullptr
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][last()]")->NodeType() == XmlNodeType::Text
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][last()]")->Value() == "b",
+        "node()[self::text()][last()] should position over the filtered text node-set");
+    Assert(chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][position()=2]") != nullptr
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][position()=2]")->NodeType() == XmlNodeType::Text
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][position()=2]")->Value() == "b",
+        "node()[self::text()][position()=2] should position over the filtered text node-set");
+    Assert(chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::processing-instruction('mark')][last()]") != nullptr
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::processing-instruction('mark')][last()]")->NodeType() == XmlNodeType::ProcessingInstruction
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::processing-instruction('mark')][last()]")->Value() == "two",
+        "node()[self::processing-instruction()][last()] should position over the filtered PI node-set");
+    Assert(chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::*][1]") != nullptr
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::*][1]")->NodeType() == XmlNodeType::Element
+            && chainedSelfPredicateDocument->SelectSingleNode("/root/item/node()[self::*][1]")->Name() == "child",
+        "node()[self::*][1] should position over the filtered element node-set");
+    const auto chainedSelfArithmeticPredicateDocument = XmlDocument::Parse(
+        "<root><item>a<?mark one?><child/><!--tail-->b<?mark two?>c</item></root>");
+    Assert(chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][last()-1]") != nullptr
+            && chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][last()-1]")->NodeType() == XmlNodeType::Text
+            && chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][last()-1]")->Value() == "b",
+        "node()[self::text()][last()-1] should compute last() over the filtered text node-set");
+    Assert(chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][position()+1=last()]") != nullptr
+            && chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][position()+1=last()]")->NodeType() == XmlNodeType::Text
+            && chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::text()][position()+1=last()]")->Value() == "b",
+        "node()[self::text()][position()+1=last()] should compute arithmetic positions over the filtered text node-set");
+    Assert(chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::processing-instruction('mark')][position()=last()]") != nullptr
+            && chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::processing-instruction('mark')][position()=last()]")->NodeType() == XmlNodeType::ProcessingInstruction
+            && chainedSelfArithmeticPredicateDocument->SelectSingleNode("/root/item/node()[self::processing-instruction('mark')][position()=last()]")->Value() == "two",
+        "node()[self::processing-instruction()][position()=last()] should compute positions over the filtered PI node-set");
+    const auto selfFollowupPathDocument = XmlDocument::Parse(
+        "<root><item id='1'>a<child x='1' y='2'/>b</item><item id='2'><child z='3'/></item></root>");
+    const auto selfFollowupAttributes = selfFollowupPathDocument->SelectNodes("/root/item/node()[self::*]/@*");
+    Assert(selfFollowupAttributes.Count() == 3
+            && selfFollowupAttributes.Item(0) != nullptr && selfFollowupAttributes.Item(0)->Name() == "x"
+            && selfFollowupAttributes.Item(1) != nullptr && selfFollowupAttributes.Item(1)->Name() == "y"
+            && selfFollowupAttributes.Item(2) != nullptr && selfFollowupAttributes.Item(2)->Name() == "z",
+        "node()[self::*]/@* should continue from filtered element nodes in document order");
+    Assert(selfFollowupPathDocument->SelectSingleNode("/root/item[string(node()[self::text()]/self::node())='a' and @id='1']") != nullptr,
+        "Predicate child paths should allow string(node()[self::text()]/self::node()) after self-filtering");
+    Assert(selfFollowupPathDocument->SelectSingleNode("/root/item[count(node()[self::*]/@*)=2 and @id='1']") != nullptr,
+        "Predicate child paths should allow count(node()[self::*]/@*) after self-filtering");
+    Assert(selfFollowupPathDocument->SelectSingleNode("/root/item[boolean(node()[self::*]/@*) and @id='1']") != nullptr,
+        "Predicate child paths should allow boolean(node()[self::*]/@*) after self-filtering");
+    Assert(selfFollowupPathDocument->SelectSingleNode("/root/item[count(node()[self::text()]/self::node())=2 and @id='1']") != nullptr,
+        "Predicate child paths should allow count(node()[self::text()]/self::node()) after self-filtering");
+    const auto selfUnionPredicateDocument = XmlDocument::Parse(
+        "<root xmlns:ns='urn:test'>"
+        "<item id='1'>10<ns:child a='1'/><?mark one?><!--tail-->20</item>"
+        "<item id='2'><ns:child b='2'/><?mark two?></item>"
+        "<item id='3'>3</item>"
+        "</root>");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root[count(item/node()[self::text()] | item/node()[self::processing-instruction('mark')])=5]") != nullptr,
+        "Predicate functions should allow count() over unions of self-filtered node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root[sum(item[@id='1']/node()[self::text()])=30]") != nullptr,
+        "Predicate functions should allow sum() over self-filtered text node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[count(node()[self::*]/@*)=1 and string(node()[self::processing-instruction('mark')])='two' and @id='2']") != nullptr,
+        "Predicate child paths should allow nested count() and string() over self-filtered follow-up paths");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[string((node()[self::processing-instruction('mark')]) | (node()[self::comment()]))='one' and @id='1']") != nullptr,
+        "Predicate child paths should use document-order first-node coercion for unions of self-filtered node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[string((node()[self::comment()]) | (node()[self::processing-instruction('mark')]))='tail' and @id='1']") == nullptr,
+        "Predicate child paths should not preserve operand order when coercing unions of self-filtered node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root[count((item/node()[self::*]/@*) | (item/@id))=5]") != nullptr,
+        "Predicate functions should allow unions of self-filtered follow-up attributes");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[number(node()[self::text()])>9 and @id='1']") != nullptr,
+        "Predicate child paths should allow greater-than comparisons over self-filtered text node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[number(node()[self::text()])<5 and @id='3']") != nullptr,
+        "Predicate child paths should allow less-than comparisons over self-filtered text node-sets");
+    Assert(selfUnionPredicateDocument->SelectNodes("/root/item[boolean(node()[self::processing-instruction('mark')]) or boolean(node()[self::comment()])]/@id").Count() == 2,
+        "Predicate child paths should allow boolean or-combinations over self-filtered node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[string(node()[self::text()]/self::node()[last()])='10' and @id='1']") != nullptr,
+        "Predicate child paths should allow self::node()[last()] after self-filtered text node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[name(node()[self::*]/@*[last()])='a' and @id='1']") != nullptr,
+        "Predicate child paths should allow name() over last attributes reached from self-filtered element node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[node()[self::processing-instruction('mark')]='two' and @id='2']") != nullptr,
+        "Predicate child paths should allow equality against self-filtered PI node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[node()[self::comment()]!='zzz' and @id='1']") != nullptr,
+        "Predicate child paths should allow inequality against self-filtered comment node-sets");
+    Assert(selfUnionPredicateDocument->SelectSingleNode("/root/item[node()[self::text()][position()*2=last()+1] and @id='1']") == nullptr,
+        "Predicate child paths should allow arithmetic predicates over self-filtered text node-sets even when they produce no matches");
+    const auto selfStringFunctionDocument = XmlDocument::Parse(
+        "<root><item id='1'>tail<?mark one?></item><item id='2'>Alpha<?mark two?></item></root>");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[concat(node()[self::text()], '!')='tail!' and @id='1']") != nullptr,
+        "Predicate child paths should allow concat() over self-filtered text node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[translate(node()[self::text()], 'tail', 'TAIL')='TAIL' and @id='1']") != nullptr,
+        "Predicate child paths should allow translate() over self-filtered text node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[normalize-space(node()[self::text()])='tail' and @id='1']") != nullptr,
+        "Predicate child paths should allow normalize-space() over self-filtered text node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[substring(node()[self::text()], 2, 2)='ai' and @id='1']") != nullptr,
+        "Predicate child paths should allow substring() over self-filtered text node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[substring-before(node()[self::processing-instruction('mark')], 'o')='tw' and @id='2']") != nullptr,
+        "Predicate child paths should allow substring-before() over self-filtered PI node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[substring-after(node()[self::processing-instruction('mark')], 'o')='ne' and @id='1']") != nullptr,
+        "Predicate child paths should allow substring-after() over self-filtered PI node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[string-length(node()[self::text()])=4 and @id='1']") != nullptr,
+        "Predicate child paths should allow string-length() over self-filtered text node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[contains(node()[self::processing-instruction('mark')], 'w') and @id='2']") != nullptr,
+        "Predicate child paths should allow contains() over self-filtered PI node-sets");
+    Assert(selfStringFunctionDocument->SelectSingleNode("/root/item[starts-with(node()[self::processing-instruction('mark')], 'tw') and @id='2']") != nullptr,
+        "Predicate child paths should allow starts-with() over self-filtered PI node-sets");
+    const auto selfNumericFunctionDocument = XmlDocument::Parse(
+        "<root><item id='1'>10<?mark one?></item><item id='2'>-2<?mark two?></item><item id='3'>abc</item><item id='4'>5</item></root>");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[floor(number(node()[self::text()]))=10 and @id='1']") != nullptr,
+        "Predicate child paths should allow floor(number(node()[self::text()])) over self-filtered text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[ceiling(number(node()[self::text()]))=-2 and @id='2']") != nullptr,
+        "Predicate child paths should allow ceiling(number(node()[self::text()])) over self-filtered text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[round(number(node()[self::text()]))=10 and @id='1']") != nullptr,
+        "Predicate child paths should allow round(number(node()[self::text()])) over self-filtered text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root[sum(item[@id='1']/node()[self::text()] | item[@id='4']/node()[self::text()])=15]") != nullptr,
+        "Predicate functions should allow sum() over unions of self-filtered text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[number(node()[self::text()])+1=11 and @id='1']") != nullptr,
+        "Predicate child paths should allow addition over self-filtered numeric text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[number(node()[self::text()])-1=-3 and @id='2']") != nullptr,
+        "Predicate child paths should allow subtraction over self-filtered numeric text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[number(node()[self::text()])*2=20 and @id='1']") != nullptr,
+        "Predicate child paths should allow multiplication over self-filtered numeric text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[number(node()[self::text()]) div 2=5 and @id='1']") != nullptr,
+        "Predicate child paths should allow div over self-filtered numeric text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[number(node()[self::text()]) mod 3=1 and @id='1']") != nullptr,
+        "Predicate child paths should allow mod over self-filtered numeric text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[string(number(node()[self::text()]))='NaN' and @id='3']") != nullptr,
+        "Predicate child paths should preserve NaN string coercion over self-filtered text node-sets");
+    Assert(selfNumericFunctionDocument->SelectSingleNode("/root/item[(floor(number(node()[self::text()])) + string-length(node()[self::processing-instruction('mark')]))=13 and @id='1']") != nullptr,
+        "Predicate child paths should allow nested arithmetic expressions over self-filtered node-sets");
 
     const auto explicitDescendantNodeTestFunctionMatch = predicateNodeTestDocument->SelectSingleNode(
         "/root/item[count(descendant::comment())=1 and string(descendant::comment())='beta' and count(descendant::processing-instruction('mark'))=1 and string(descendant::processing-instruction('mark'))='ready']");
@@ -14765,6 +14993,24 @@ void TestXPathHighFrequencyFunctions() {
         "id() should also resolve xml:id attributes");
     Assert(static_cast<XmlElement*>(xmlIdMatch.get())->GetAttribute("xml:id") == "xml-target",
         "id() xml:id predicate result mismatch");
+    const auto nestedLangDocument = XmlDocument::Parse(
+        "<root xml:lang='en'><item code='alpha'>Alpha</item><group xml:lang='fr-CA'><item code='beta'>Beta</item></group></root>");
+    Assert(nestedLangDocument->SelectSingleNode("/root/group/item[lang('fr') and contains(string(.), 'Be')]") != nullptr,
+        "lang() should compose with nested string functions");
+    Assert(nestedLangDocument->SelectSingleNode("/root/item[boolean(lang('en')) and not(lang('fr')) and @code='alpha']") != nullptr,
+        "lang() should compose with boolean() and not() in nested predicates");
+    const auto nestedIdDocument = XmlDocument::Parse(
+        "<!DOCTYPE root [<!ELEMENT root (item*)><!ELEMENT item (#PCDATA)><!ATTLIST item code ID #IMPLIED>]>"
+        "<root>"
+        "<item code='alpha'>Alpha</item>"
+        "<item code='beta'>Beta</item>"
+        "</root>");
+    Assert(nestedIdDocument->SelectNodes("/root/item[count(id('alpha beta'))=2 and contains(string(id('beta')), 'Be')]/@code").Count() == 2,
+        "id() should compose with count() and contains(string(...)) in nested predicates");
+    Assert(nestedIdDocument->SelectNodes("/root/item[name(id('beta'))='item' and local-name(id('beta'))='item']/@code").Count() == 2,
+        "id() should compose with name() and local-name() in nested predicates");
+    Assert(nestedIdDocument->SelectNodes("/root/item[string-length(string(id('alpha')))=5]/@code").Count() == 2,
+        "id() should compose with string-length(string(...)) in nested predicates");
 
     const auto unparsedEntityDocument = XmlDocument::Parse(
         "<!DOCTYPE root [<!NOTATION jpg SYSTEM 'image/jpeg'><!ENTITY cover SYSTEM 'cover.jpg' NDATA jpg>]>"
@@ -17495,15 +17741,66 @@ void TestXmlReaderConfiguration() {
         settings.Schemas = schemas;
         settings.MaxCharactersInDocument = 5;
 
+        bool threwOnCreate = false;
         bool threw = false;
         try {
-            auto limited = XmlReader::Create("<root xmlns=\"urn:maxchars-string\">123456</root>", settings);
-            while (limited.Read()) {
-            }
+            (void)XmlReader::Create("<root xmlns=\"urn:maxchars-string\">123456</root>", settings);
         } catch (const XmlException& ex) {
+            threwOnCreate = true;
             threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
         }
+        Assert(threwOnCreate,
+            "Schema-validating string reader should reject oversized input during Create when MaxCharactersInDocument is exceeded");
         Assert(threw, "Schema-validating string reader should still stop oversized input");
+    }
+
+    {
+        const std::string unicodeElementName = "\xE4\xB8\xAD\xE6\x96\x87\xE6\xA0\xB9";
+        const std::string unicodeAttributeName = "\xE5\xB1\x9E\xE6\x80\xA7\xE5\x90\x8D";
+        const std::string unicodeAttributeValue = "\xE5\x80\xBC";
+        const std::string unicodeChildName = "\xE5\xAD\x90\xE8\x8A\x82\xE7\x82\xB9";
+        const std::string unicodeXml =
+            "<" + unicodeElementName + " " + unicodeAttributeName + "='" + unicodeAttributeValue + "'><"
+            + unicodeChildName + "/></" + unicodeElementName + ">";
+
+        auto unicodeReader = XmlReader::Create(unicodeXml);
+        Assert(unicodeReader.Read() && unicodeReader.Name() == unicodeElementName,
+            "Reader should accept UTF-8 element names");
+        Assert(unicodeReader.MoveToFirstAttribute() && unicodeReader.Name() == unicodeAttributeName,
+            "Reader should accept UTF-8 attribute names");
+        Assert(unicodeReader.Value() == unicodeAttributeValue,
+            "Reader should preserve UTF-8 attribute values while parsing UTF-8 names");
+    }
+
+    {
+        const std::string nonBmpElementName = "\xF0\x90\x8C\x80root";
+        const std::string combiningAttributeName = "a\xCC\x81ttr";
+        const std::string nonBmpChildName = "node\xF0\x90\x8C\x80";
+        const std::string unicodeXml =
+            "<" + nonBmpElementName + " " + combiningAttributeName + "='ok'><"
+            + nonBmpChildName + "/>text</" + nonBmpElementName + ">";
+
+        auto unicodeReader = XmlReader::Create(unicodeXml);
+        Assert(unicodeReader.Read() && unicodeReader.Name() == nonBmpElementName,
+            "Reader should accept non-BMP UTF-8 element names");
+        Assert(unicodeReader.MoveToFirstAttribute() && unicodeReader.Name() == combiningAttributeName,
+            "Reader should accept combining-mark UTF-8 attribute names when the mark is not leading");
+        Assert(unicodeReader.MoveToElement(),
+            "Reader should move back to the element after reading a combining-mark attribute name");
+        Assert(unicodeReader.Read() && unicodeReader.Name() == nonBmpChildName,
+            "Reader should accept non-BMP UTF-8 child element names");
+    }
+
+    {
+        bool threw = false;
+        try {
+            auto invalidReader = XmlReader::Create("<\xCC\x81" "bad/>");
+            while (invalidReader.Read()) {
+            }
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("Invalid XML name") != std::string::npos;
+        }
+        Assert(threw, "Reader should reject names that start with a combining mark");
     }
 
     {
@@ -17596,18 +17893,20 @@ void TestXmlReaderConfiguration() {
         std::string payload(100000, 'x');
         std::string streamXml = "<root xmlns=\"urn:maxchars-stream\">" + payload + "</root>";
         std::istringstream stream(streamXml);
+        bool threwOnCreate = false;
         bool threw = false;
         try {
-            auto limited = XmlReader::Create(stream, settings);
-            while (limited.Read()) {
-            }
+            (void)XmlReader::Create(stream, settings);
         } catch (const XmlException& ex) {
+            threwOnCreate = true;
             threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
         }
         const auto consumedBeforeFailure = stream.tellg();
         Assert(consumedBeforeFailure != std::streampos(-1)
                 && static_cast<std::size_t>(consumedBeforeFailure) < streamXml.size(),
             "Schema-validating seekable stream reader should not force full stream consumption before failing MaxCharactersInDocument");
+        Assert(threwOnCreate,
+            "Schema-validating seekable stream reader should reject oversized input during Create when MaxCharactersInDocument is exceeded");
         Assert(threw, "Schema-validating seekable stream reader should still stop oversized input");
     }
 
@@ -17624,17 +17923,68 @@ void TestXmlReaderConfiguration() {
         settings.MaxCharactersInDocument = 5;
 
         std::string payload(100000, 'x');
+        std::string streamXml =
+            "<root xmlns=\"urn:maxchars-nonseek\">" + payload + "</root>";
         NonSeekableStringStream stream(
-            "<root xmlns=\"urn:maxchars-nonseek\">" + payload + "</root>");
+            streamXml);
+        Assert(stream.tellg() == std::streampos(-1),
+            "Non-seekable schema MaxCharacters test setup should report tellg failure");
+        stream.clear();
+        bool threwOnCreate = false;
         bool threw = false;
         try {
             auto limited = XmlReader::Create(stream, settings);
-            while (limited.Read()) {
+            try {
+                while (limited.Read()) {
+                }
+            } catch (const XmlException& ex) {
+                threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
             }
         } catch (const XmlException& ex) {
+            threwOnCreate = true;
             threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
         }
+        Assert(threwOnCreate,
+            "Schema-validating non-seekable stream reader should reject oversized input during Create when MaxCharactersInDocument is exceeded");
         Assert(threw, "Schema-validating non-seekable stream reader should still stop oversized input");
+    }
+
+    {
+        const auto schemas = std::make_shared<XmlSchemaSet>();
+        schemas->AddXml(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:maxchars-file\">"
+            "  <xs:element name=\"root\" type=\"xs:string\"/>"
+            "</xs:schema>");
+
+        XmlReaderSettings settings;
+        settings.Validation = ValidationType::Schema;
+        settings.Schemas = schemas;
+        settings.MaxCharactersInDocument = 5;
+
+        const auto tempDir = std::filesystem::temp_directory_path() / "libxml-schema-maxchars-file";
+        std::filesystem::remove_all(tempDir);
+        std::filesystem::create_directories(tempDir);
+        const auto xmlPath = tempDir / "oversized.xml";
+
+        {
+            std::string payload(100000, 'x');
+            std::ofstream output(xmlPath, std::ios::binary);
+            output << "<root xmlns=\"urn:maxchars-file\">" << payload << "</root>";
+        }
+
+        bool threwOnCreate = false;
+        bool threw = false;
+        try {
+            (void)XmlReader::CreateFromFile(xmlPath.string(), settings);
+        } catch (const XmlException& ex) {
+            threwOnCreate = true;
+            threw = std::string(ex.what()).find("MaxCharactersInDocument") != std::string::npos;
+        }
+
+        std::filesystem::remove_all(tempDir);
+        Assert(threwOnCreate,
+            "Schema-validating file reader should reject oversized input during Create when MaxCharactersInDocument is exceeded");
+        Assert(threw, "Schema-validating file reader should still stop oversized input");
     }
 
     {
@@ -19797,6 +20147,433 @@ void TestXmlDocumentStreamsAndEvents() {
     }
 
     {
+        const auto tempDir = std::filesystem::temp_directory_path() / "libxml-document-load-resolver";
+        std::filesystem::remove_all(tempDir);
+        std::filesystem::create_directories(tempDir);
+
+        const auto path = tempDir / "catalog.xml";
+        const auto entityPath = tempDir / "cover.txt";
+        {
+            std::ofstream entityStream(entityPath, std::ios::binary);
+            entityStream << "Resolved From File";
+        }
+        {
+            std::ofstream stream(path, std::ios::binary);
+            stream
+                << "<!DOCTYPE root [<!ENTITY cover SYSTEM \"cover.txt\">]>"
+                << "<root><item>&cover;</item></root>";
+        }
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>();
+
+        XmlDocument document;
+        document.Load(path.string(), settings);
+
+        const auto item = std::static_pointer_cast<XmlElement>(document.DocumentElement()->SelectSingleNode("item"));
+        Assert(item != nullptr && item->FirstChild() != nullptr,
+            "Document path load with resolver should materialize the entity reference node");
+        Assert(item->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+            "Document path load with resolver should preserve an EntityReference child");
+        Assert(item->FirstChild()->Value() == "Resolved From File",
+            "Document path load with resolver should preserve resolved external entity text on the EntityReference value");
+        Assert(item->InnerText() == "Resolved From File",
+            "Document path load with resolver should expose resolved external entity text through InnerText");
+
+        std::filesystem::remove_all(tempDir);
+    }
+
+    {
+        std::istringstream input(
+            "<!DOCTYPE root [<!ENTITY cover SYSTEM \"virtual-cover.txt\">]>"
+            "<root><item>&cover;</item></root>");
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(
+            std::unordered_map<std::string, std::string>{{"virtual-cover.txt", "Resolved From Resolver"}});
+
+        XmlDocument document;
+        document.Load(input, settings);
+
+        const auto item = std::static_pointer_cast<XmlElement>(document.DocumentElement()->SelectSingleNode("item"));
+        Assert(item != nullptr && item->FirstChild() != nullptr,
+            "Document stream load with resolver should materialize the entity reference node");
+        Assert(item->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+            "Document stream load with resolver should preserve an EntityReference child");
+        Assert(item->FirstChild()->Value() == "Resolved From Resolver",
+            "Document stream load with resolver should use the configured resolver for external entity content");
+        Assert(item->InnerText() == "Resolved From Resolver",
+            "Document stream load with resolver should expose resolver-provided entity text through InnerText");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(
+            std::unordered_map<std::string, std::string>{{"memory-cover.txt", "Resolved From LoadXml"}});
+
+        XmlDocument document;
+        document.LoadXml(
+            "<!DOCTYPE root [<!ENTITY cover SYSTEM \"memory-cover.txt\">]>"
+            "<root><item>&cover;</item></root>",
+            settings);
+
+        const auto item = std::static_pointer_cast<XmlElement>(document.DocumentElement()->SelectSingleNode("item"));
+        Assert(item != nullptr && item->FirstChild() != nullptr,
+            "Document LoadXml with resolver should materialize the entity reference node");
+        Assert(item->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+            "Document LoadXml with resolver should preserve an EntityReference child");
+        Assert(item->FirstChild()->Value() == "Resolved From LoadXml",
+            "Document LoadXml with resolver should use the configured resolver for external entity content");
+        Assert(item->InnerText() == "Resolved From LoadXml",
+            "Document LoadXml with resolver should expose resolver-provided entity text through InnerText");
+    }
+
+    {
+        const std::string xml =
+            "<!DOCTYPE catalog SYSTEM \"catalog.dtd\">"
+            "<catalog><item/></catalog>";
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(
+            std::unordered_map<std::string, std::string>{{"catalog.dtd", ""}});
+
+        auto reader = XmlReader::Create(xml, settings);
+        Assert(reader.Read() && reader.NodeType() == XmlNodeType::DocumentType,
+            "Reader with resolver should keep working for SYSTEM doctypes whose external subset resolves to empty content");
+        Assert(reader.Name() == "catalog"
+                && reader.ReadOuterXml().find("<!DOCTYPE catalog SYSTEM \"catalog.dtd\">") != std::string::npos,
+            "Reader with resolver should preserve the DOCTYPE declaration when the external subset is empty");
+
+        XmlDocument document;
+        document.LoadXml(xml, settings);
+        Assert(document.DocumentType() != nullptr && document.DocumentType()->SystemId() == "catalog.dtd",
+            "Document LoadXml with resolver should preserve SYSTEM doctype metadata when the external subset is empty");
+        Assert(document.DocumentElement() != nullptr && document.DocumentElement()->Name() == "catalog",
+            "Document LoadXml with resolver should still parse the root element when the external subset is empty");
+    }
+
+    {
+        const std::string xml =
+            "<!DOCTYPE catalog SYSTEM \"catalog.dtd\">"
+            "<catalog>&author;</catalog>";
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(
+            std::unordered_map<std::string, std::string>{{
+                "catalog.dtd",
+                "<!ENTITY author 'From External Subset'><!NOTATION txt SYSTEM 'text/plain'><!ENTITY cover SYSTEM 'cover.txt' NDATA txt>"}});
+
+        std::string stage = "create reader";
+        try {
+            auto reader = XmlReader::Create(xml, settings);
+            stage = "read doctype";
+            Assert(reader.Read() && reader.NodeType() == XmlNodeType::DocumentType,
+                "Reader with resolver should expose SYSTEM doctypes whose external subset declares entities and notations");
+            stage = "read outer xml";
+            Assert(reader.ReadOuterXml().find("<!DOCTYPE catalog SYSTEM \"catalog.dtd\">") != std::string::npos,
+                "Reader with resolver should preserve the SYSTEM doctype declaration when the external subset contributes declarations");
+            stage = "read root";
+            Assert(reader.Read() && reader.NodeType() == XmlNodeType::Element && reader.Name() == "catalog",
+                "Reader should continue to the document element after parsing external subset declarations");
+            stage = "read entity reference";
+            Assert(reader.Read() && reader.NodeType() == XmlNodeType::EntityReference && reader.Name() == "author",
+                "Reader should materialize external subset general entity references in element content");
+            stage = "read entity value";
+            Assert(reader.Value() == "From External Subset",
+                "Reader should expose resolver-backed external subset general entity expansions on EntityReference values");
+        } catch (const std::exception& exception) {
+            throw std::runtime_error(std::string("external subset reader path: ") + stage + ": " + exception.what());
+        }
+
+        XmlDocument document;
+        try {
+            document.LoadXml(xml, settings);
+        } catch (const std::exception& exception) {
+            throw std::runtime_error(std::string("external subset document path: ") + exception.what());
+        }
+        Assert(document.DocumentType() != nullptr,
+            "Document LoadXml with resolver should preserve the SYSTEM doctype node when the external subset contributes declarations");
+        Assert(document.DocumentType()->Entities().GetNamedItem("author") != nullptr,
+            "Document LoadXml with resolver should preserve external subset general entity declarations on DocumentType");
+        Assert(document.DocumentType()->Entities().GetNamedItem("cover") != nullptr,
+            "Document LoadXml with resolver should preserve external subset unparsed entity declarations on DocumentType");
+        Assert(document.DocumentType()->Notations().GetNamedItem("txt") != nullptr,
+            "Document LoadXml with resolver should preserve external subset notation declarations on DocumentType");
+        Assert(document.DocumentElement() != nullptr && document.DocumentElement()->Name() == "catalog",
+            "Document LoadXml with resolver should still parse the root element when the external subset contributes declarations");
+        Assert(document.DocumentElement()->FirstChild() != nullptr
+                && document.DocumentElement()->FirstChild()->NodeType() == XmlNodeType::EntityReference,
+            "Document LoadXml with resolver should preserve external subset entity references in element content");
+        Assert(document.DocumentElement()->FirstChild()->Value() == "From External Subset",
+            "Document LoadXml with resolver should preserve resolver-backed external subset expansion text on EntityReference values");
+        Assert(document.DocumentElement()->InnerText() == "From External Subset",
+            "Document LoadXml with resolver should expose resolver-backed external subset expansion text through InnerText");
+
+        const auto clonedDocumentType = std::static_pointer_cast<XmlDocumentType>(document.DocumentType()->CloneNode(true));
+        Assert(clonedDocumentType->Entities().GetNamedItem("author") != nullptr,
+            "CloneNode should preserve external subset entity declarations on DocumentType");
+        Assert(clonedDocumentType->Notations().GetNamedItem("txt") != nullptr,
+            "CloneNode should preserve external subset notation declarations on DocumentType");
+
+        XmlDocument importedOwner;
+        const auto importedDocumentType = std::static_pointer_cast<XmlDocumentType>(importedOwner.ImportNode(*document.DocumentType(), true));
+        Assert(importedDocumentType->Entities().GetNamedItem("author") != nullptr,
+            "ImportNode should preserve external subset entity declarations on DocumentType");
+        Assert(importedDocumentType->Entities().GetNamedItem("cover") != nullptr,
+            "ImportNode should preserve external subset unparsed entity declarations on DocumentType");
+        Assert(importedDocumentType->Notations().GetNamedItem("txt") != nullptr,
+            "ImportNode should preserve external subset notation declarations on DocumentType");
+    }
+
+    {
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(
+            std::unordered_map<std::string, std::string>{{"memory-cover.txt", "toolong"}});
+        settings.MaxCharactersFromEntities = 3;
+
+        bool threw = false;
+        try {
+            (void)XmlDocument::Parse(
+                "<!DOCTYPE root [<!ENTITY cover SYSTEM \"memory-cover.txt\">]>"
+                "<root><item>&cover;</item></root>",
+                settings);
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersFromEntities") != std::string::npos;
+        }
+        Assert(threw,
+            "Document Parse with settings should preserve MaxCharactersFromEntities enforcement for resolver-backed external entities");
+    }
+
+    {
+        std::istringstream input(
+            "<!DOCTYPE root [<!ENTITY cover SYSTEM \"virtual-cover.txt\">]>"
+            "<root><item>&cover;</item></root>");
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>(
+            std::unordered_map<std::string, std::string>{{"virtual-cover.txt", "toolong"}});
+        settings.MaxCharactersFromEntities = 3;
+
+        bool threw = false;
+        try {
+            XmlDocument document;
+            document.Load(input, settings);
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersFromEntities") != std::string::npos;
+        }
+        Assert(threw,
+            "Document stream load with settings should preserve MaxCharactersFromEntities enforcement for resolver-backed external entities");
+    }
+
+    {
+        const auto tempDir = std::filesystem::temp_directory_path() / "libxml-document-load-resolver-maxchars";
+        std::filesystem::remove_all(tempDir);
+        std::filesystem::create_directories(tempDir);
+
+        const auto path = tempDir / "catalog.xml";
+        const auto entityPath = tempDir / "cover.txt";
+        {
+            std::ofstream entityStream(entityPath, std::ios::binary);
+            entityStream << "toolong";
+        }
+        {
+            std::ofstream stream(path, std::ios::binary);
+            stream
+                << "<!DOCTYPE root [<!ENTITY cover SYSTEM \"cover.txt\">]>"
+                << "<root><item>&cover;</item></root>";
+        }
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<TestResolver>();
+        settings.MaxCharactersFromEntities = 3;
+
+        bool threw = false;
+        try {
+            XmlDocument document;
+            document.Load(path.string(), settings);
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("MaxCharactersFromEntities") != std::string::npos;
+        }
+
+        std::filesystem::remove_all(tempDir);
+        Assert(threw,
+            "Document path load with settings should preserve MaxCharactersFromEntities enforcement for resolver-backed external entities");
+    }
+
+    {
+        const std::string xml =
+            "<!DOCTYPE root [<!ENTITY cover SYSTEM \"virtual-cover.txt\">]>"
+            "<root><item>&cover;</item></root>";
+        const std::string errorMessage = "Synthetic resolver GetEntity failure";
+
+        auto assertResolverFailure = [&](const std::string& label, const auto& action) {
+            bool threw = false;
+            try {
+                action();
+            } catch (const XmlException& ex) {
+                threw = std::string(ex.what()).find(errorMessage) != std::string::npos;
+            }
+            Assert(threw, label);
+        };
+
+        assertResolverFailure(
+            "Document stream load with settings should surface resolver GetEntity failures",
+            [&]() {
+                std::istringstream input(xml);
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<ThrowingResolver>(std::string{}, errorMessage);
+
+                XmlDocument document;
+                document.Load(input, settings);
+            });
+
+        assertResolverFailure(
+            "Document LoadXml with settings should surface resolver GetEntity failures",
+            [&]() {
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<ThrowingResolver>(std::string{}, errorMessage);
+
+                XmlDocument document;
+                document.LoadXml(xml, settings);
+            });
+
+        assertResolverFailure(
+            "Document Parse with settings should surface resolver GetEntity failures",
+            [&]() {
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<ThrowingResolver>(std::string{}, errorMessage);
+                (void)XmlDocument::Parse(xml, settings);
+            });
+
+        assertResolverFailure(
+            "Document path load with settings should surface resolver GetEntity failures",
+            [&]() {
+                const auto tempDir = std::filesystem::temp_directory_path() / "libxml-document-load-resolver-getentity-failure";
+                std::filesystem::remove_all(tempDir);
+                std::filesystem::create_directories(tempDir);
+                const auto path = tempDir / "catalog.xml";
+                {
+                    std::ofstream stream(path, std::ios::binary);
+                    stream << xml;
+                }
+
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<ThrowingResolver>(std::string{}, errorMessage);
+
+                try {
+                    XmlDocument document;
+                    document.Load(path.string(), settings);
+                } catch (...) {
+                    std::filesystem::remove_all(tempDir);
+                    throw;
+                }
+
+                std::filesystem::remove_all(tempDir);
+            });
+    }
+
+    {
+        const auto tempDir = std::filesystem::temp_directory_path() / "libxml-document-load-resolver-resolve-failure";
+        std::filesystem::remove_all(tempDir);
+        std::filesystem::create_directories(tempDir);
+        const auto path = tempDir / "catalog.xml";
+        {
+            std::ofstream stream(path, std::ios::binary);
+            stream
+                << "<!DOCTYPE root [<!ENTITY cover SYSTEM \"cover.txt\">]>"
+                << "<root><item>&cover;</item></root>";
+        }
+
+        XmlReaderSettings settings;
+        settings.Resolver = std::make_shared<ThrowingResolver>("Synthetic resolver ResolveUri failure", std::string{});
+
+        bool threw = false;
+        try {
+            XmlDocument document;
+            document.Load(path.string(), settings);
+        } catch (const XmlException& ex) {
+            threw = std::string(ex.what()).find("Synthetic resolver ResolveUri failure") != std::string::npos;
+        }
+
+        std::filesystem::remove_all(tempDir);
+        Assert(threw,
+            "Document path load with settings should surface resolver ResolveUri failures");
+    }
+
+    {
+        const std::string xml =
+            "<!DOCTYPE root [<!ENTITY cover SYSTEM \"missing-cover.txt\">]>"
+            "<root><item>&cover;</item></root>";
+
+        auto assertMissingEntityFailure = [&](const std::string& label, const auto& action) {
+            bool threw = false;
+            try {
+                action();
+            } catch (const XmlException& ex) {
+                const std::string message(ex.what());
+                threw = message.find("Failed to resolve XML entity:") != std::string::npos
+                    && message.find("missing-cover.txt") != std::string::npos;
+            }
+            Assert(threw, label);
+        };
+
+        assertMissingEntityFailure(
+            "Document stream load with default resolver should surface missing external entity files",
+            [&]() {
+                std::istringstream input(xml);
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<TestResolver>();
+
+                XmlDocument document;
+                document.Load(input, settings);
+            });
+
+        assertMissingEntityFailure(
+            "Document LoadXml with default resolver should surface missing external entity files",
+            [&]() {
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<TestResolver>();
+
+                XmlDocument document;
+                document.LoadXml(xml, settings);
+            });
+
+        assertMissingEntityFailure(
+            "Document Parse with default resolver should surface missing external entity files",
+            [&]() {
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<TestResolver>();
+                (void)XmlDocument::Parse(xml, settings);
+            });
+
+        assertMissingEntityFailure(
+            "Document path load with default resolver should surface missing relative external entity files",
+            [&]() {
+                const auto tempDir = std::filesystem::temp_directory_path() / "libxml-document-load-urlresolver-missing-file";
+                std::filesystem::remove_all(tempDir);
+                std::filesystem::create_directories(tempDir);
+                const auto path = tempDir / "catalog.xml";
+                {
+                    std::ofstream stream(path, std::ios::binary);
+                    stream << xml;
+                }
+
+                XmlReaderSettings settings;
+                settings.Resolver = std::make_shared<TestResolver>();
+
+                try {
+                    XmlDocument document;
+                    document.Load(path.string(), settings);
+                } catch (...) {
+                    std::filesystem::remove_all(tempDir);
+                    throw;
+                }
+
+                std::filesystem::remove_all(tempDir);
+            });
+    }
+
+    {
         std::istringstream input("<root>  <child/>  </root>");
         XmlDocument document;
         document.SetPreserveWhitespace(true);
@@ -20752,6 +21529,19 @@ void TestXmlConvert() {
         "EncodeName should pass through valid names");
     Assert(XmlConvert::EncodeName("1bad") == "_x0031_bad",
         "EncodeName should encode leading digits");
+    {
+        const std::string unicodeName = "\xE4\xB8\xAD\xE6\x96\x87\xE5\x90\x8D";
+        Assert(XmlConvert::EncodeName(unicodeName) == unicodeName,
+            "EncodeName should preserve UTF-8 names");
+    }
+    {
+        const std::string nonBmpName = "\xF0\x90\x8C\x80root";
+        const std::string combiningName = "a\xCC\x81name";
+        Assert(XmlConvert::EncodeName(nonBmpName) == nonBmpName,
+            "EncodeName should preserve non-BMP UTF-8 names");
+        Assert(XmlConvert::EncodeName(combiningName) == combiningName,
+            "EncodeName should preserve combining-mark UTF-8 names when the mark is not leading");
+    }
     Assert(XmlConvert::DecodeName("_x0031_bad") == "1bad",
         "DecodeName should decode encoded characters");
     Assert(XmlConvert::DecodeName("valid") == "valid",
@@ -20762,10 +21552,33 @@ void TestXmlConvert() {
         "EncodeLocalName should encode colons");
     Assert(XmlConvert::EncodeLocalName("valid") == "valid",
         "EncodeLocalName should pass through valid local names");
+    {
+        const std::string unicodeLocalName = "\xE4\xB8\xAD\xE6\x96\x87\xE5\x90\x8D";
+        Assert(XmlConvert::EncodeLocalName(unicodeLocalName) == unicodeLocalName,
+            "EncodeLocalName should preserve UTF-8 local names");
+    }
+    {
+        const std::string nonBmpLocalName = "\xF0\x90\x8C\x80local";
+        Assert(XmlConvert::EncodeLocalName(nonBmpLocalName) == nonBmpLocalName,
+            "EncodeLocalName should preserve non-BMP UTF-8 local names");
+    }
 
     // VerifyName
     Assert(XmlConvert::VerifyName("valid") == "valid",
         "VerifyName should return valid names");
+    {
+        const std::string unicodeName = "\xE4\xB8\xAD\xE6\x96\x87\xE5\x90\x8D";
+        Assert(XmlConvert::VerifyName(unicodeName) == unicodeName,
+            "VerifyName should accept UTF-8 names");
+    }
+    {
+        const std::string nonBmpName = "\xF0\x90\x8C\x80root";
+        const std::string combiningName = "a\xCC\x81name";
+        Assert(XmlConvert::VerifyName(nonBmpName) == nonBmpName,
+            "VerifyName should accept non-BMP UTF-8 names");
+        Assert(XmlConvert::VerifyName(combiningName) == combiningName,
+            "VerifyName should accept combining-mark UTF-8 names when the mark is not leading");
+    }
     {
         bool threw = false;
         try { (void)XmlConvert::VerifyName(""); } catch (const XmlException&) { threw = true; }
@@ -20776,10 +21589,40 @@ void TestXmlConvert() {
         try { (void)XmlConvert::VerifyName("1bad"); } catch (const XmlException&) { threw = true; }
         Assert(threw, "VerifyName should throw for names starting with digits");
     }
+    {
+        bool threw = false;
+        try { (void)XmlConvert::VerifyName("\xE5\x90\x8D#\xE5\xAD\x97"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "VerifyName should reject invalid UTF-8 name characters");
+    }
+    {
+        bool threw = false;
+        try { (void)XmlConvert::VerifyName("\xCC\x81" "bad"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "VerifyName should reject names that start with a combining mark");
+    }
+    {
+        bool threw = false;
+        try { (void)XmlConvert::VerifyName("\xF0\x90\x8C"); } catch (const XmlException&) { threw = true; }
+        Assert(threw, "VerifyName should reject truncated UTF-8 name sequences");
+    }
 
     // VerifyNmToken
     Assert(XmlConvert::VerifyNmToken("abc-123") == "abc-123",
         "VerifyNmToken should accept valid NMTOKEN values");
+    {
+        const std::string unicodeToken = "\xE4\xB8\xAD\xE6\x96\x87\xE5\x90\x8D-123";
+        Assert(XmlConvert::EncodeNmToken(unicodeToken) == unicodeToken,
+            "EncodeNmToken should preserve UTF-8 NMTOKEN values");
+        Assert(XmlConvert::VerifyNmToken(unicodeToken) == unicodeToken,
+            "VerifyNmToken should accept UTF-8 NMTOKEN values");
+    }
+    {
+        const std::string nonBmpToken = "\xF0\x90\x8C\x80-name";
+        const std::string combiningToken = "token\xCC\x81";
+        Assert(XmlConvert::EncodeNmToken(nonBmpToken) == nonBmpToken,
+            "EncodeNmToken should preserve non-BMP UTF-8 NMTOKEN values");
+        Assert(XmlConvert::VerifyNmToken(combiningToken) == combiningToken,
+            "VerifyNmToken should accept combining-mark UTF-8 NMTOKEN values");
+    }
     {
         bool threw = false;
         try { (void)XmlConvert::VerifyNmToken("a b"); } catch (const XmlException&) { threw = true; }
@@ -20797,8 +21640,10 @@ void TestXmlConvert() {
     Assert(XmlConvert::IsStartNameChar('a'), "IsStartNameChar should return true for 'a'");
     Assert(XmlConvert::IsStartNameChar('_'), "IsStartNameChar should return true for '_'");
     Assert(!XmlConvert::IsStartNameChar('1'), "IsStartNameChar should return false for '1'");
+    Assert(XmlConvert::IsStartNameChar(static_cast<char>(0xE4)), "IsStartNameChar should treat UTF-8 leading bytes as name-start compatible");
     Assert(XmlConvert::IsNameChar('-'), "IsNameChar should return true for '-'");
     Assert(XmlConvert::IsNameChar('.'), "IsNameChar should return true for '.'");
+    Assert(XmlConvert::IsNameChar(static_cast<char>(0xB8)), "IsNameChar should treat UTF-8 continuation bytes as name-char compatible");
 }
 
 void TestReaderConvenienceApis() {
@@ -21639,6 +22484,42 @@ void TestTier2Apis() {
         Assert(!root->HasAttribute("id", "http://example.com"), "NS attribute should be gone after remove");
     }
 
+    {
+        auto doc = XmlDocument{};
+        auto root = doc.CreateElement("root");
+        doc.AppendChild(root);
+
+        root->SetAttribute("xmlns:a", "urn:a");
+        root->SetAttribute("xmlns:b", "urn:b");
+        for (int index = 0; index < 12; ++index) {
+            root->SetAttribute("attr" + std::to_string(index), std::to_string(index));
+        }
+        root->SetAttribute("a:id", "101");
+        root->SetAttribute("b:id", "202");
+
+        Assert(root->HasAttribute("id", "urn:a"), "Large attribute set NS HasAttribute should find prefixed attribute");
+        Assert(root->GetAttribute("id", "urn:b") == "202", "Large attribute set NS GetAttribute should use namespace-aware lookup");
+        auto nsNode = root->GetAttributeNode("id", "urn:a");
+        Assert(nsNode != nullptr && nsNode->Value() == "101", "Large attribute set NS GetAttributeNode should return matching attribute");
+        Assert(root->RemoveAttribute("id", "urn:b"), "Large attribute set NS RemoveAttribute should remove matching namespace attribute");
+        Assert(!root->HasAttribute("id", "urn:b"), "Removed namespace attribute should no longer be found");
+        Assert(root->HasAttribute("id", "urn:a"), "Removing one namespace attribute must not affect sibling localName bucket entries");
+    }
+
+    {
+        auto doc = XmlDocument{};
+        doc.LoadXml("<root xmlns:a='urn:a' xmlns:b='urn:b' n0='0' n1='1' n2='2' n3='3' n4='4' n5='5' n6='6' n7='7' n8='8' n9='9' a:id='p' b:id='q'/>");
+        auto root = doc.DocumentElement();
+
+        Assert(root != nullptr, "Pending-load test should have a document element");
+        Assert(root->HasAttribute("id", "urn:a"), "Pending-load NS HasAttribute should find prefixed attribute before materialization");
+        Assert(root->GetAttribute("id", "urn:b") == "q", "Pending-load NS GetAttribute should find the correct namespace bucket entry");
+        auto pendingNode = root->GetAttributeNode("id", "urn:a");
+        Assert(pendingNode != nullptr && pendingNode->Value() == "p", "Pending-load NS GetAttributeNode should materialize the correct attribute");
+        Assert(root->RemoveAttribute("id", "urn:b"), "Pending-load NS RemoveAttribute should remove matching attribute");
+        Assert(!root->HasAttribute("id", "urn:b"), "Pending-load removed namespace attribute should no longer be found");
+    }
+
     // ── XmlWriter::LookupPrefix ───────────────────────────────────────────────
     {
         XmlWriter w;
@@ -21699,6 +22580,16 @@ void TestTier2Apis() {
         // Valid NCNames
         Assert(XmlConvert::VerifyNCName("valid") == "valid", "VerifyNCName: simple name");
         Assert(XmlConvert::VerifyNCName("_myName") == "_myName", "VerifyNCName: underscore start");
+        {
+            const std::string unicodeName = "\xE4\xB8\xAD\xE6\x96\x87\xE5\x90\x8D";
+            Assert(XmlConvert::VerifyNCName(unicodeName) == unicodeName, "VerifyNCName: UTF-8 name");
+        }
+        {
+            const std::string nonBmpName = "\xF0\x90\x8C\x80root";
+            const std::string combiningName = "a\xCC\x81name";
+            Assert(XmlConvert::VerifyNCName(nonBmpName) == nonBmpName, "VerifyNCName: non-BMP UTF-8 name");
+            Assert(XmlConvert::VerifyNCName(combiningName) == combiningName, "VerifyNCName: combining-mark UTF-8 name");
+        }
 
         // Invalid NCName: colon not allowed
         bool threwColon = false;
@@ -21709,6 +22600,10 @@ void TestTier2Apis() {
         bool threwDigit = false;
         try { XmlConvert::VerifyNCName("1bad"); } catch (...) { threwDigit = true; }
         Assert(threwDigit, "VerifyNCName: digit-start should throw");
+
+        bool threwCombiningStart = false;
+    try { XmlConvert::VerifyNCName("\xCC\x81" "bad"); } catch (...) { threwCombiningStart = true; }
+        Assert(threwCombiningStart, "VerifyNCName: combining-mark start should throw");
 
         // IsNCNameChar
         Assert(XmlConvert::IsNCNameChar('a'), "IsNCNameChar 'a' should be true");
@@ -21748,6 +22643,7 @@ void TestTier3Apis() {
         Assert(XmlConvert::IsNCNameStartChar('a'), "IsNCNameStartChar 'a'");
         Assert(XmlConvert::IsNCNameStartChar('Z'), "IsNCNameStartChar 'Z'");
         Assert(XmlConvert::IsNCNameStartChar('_'), "IsNCNameStartChar '_'");
+        Assert(XmlConvert::IsNCNameStartChar(static_cast<char>(0xE4)), "IsNCNameStartChar UTF-8 leading byte");
         Assert(!XmlConvert::IsNCNameStartChar(':'), "IsNCNameStartChar ':' should be false");
         Assert(!XmlConvert::IsNCNameStartChar('0'), "IsNCNameStartChar '0' should be false");
         Assert(!XmlConvert::IsNCNameStartChar('-'), "IsNCNameStartChar '-' should be false");
@@ -21853,9 +22749,17 @@ int main(int argc, char** argv) {
 
         TestParseDocument();
         TestDocumentTypeDeclarations();
-        TestDocumentTypeBoundaries();
+        try {
+            TestDocumentTypeBoundaries();
+        } catch (const std::exception& exception) {
+            throw std::runtime_error(std::string("TestDocumentTypeBoundaries: ") + exception.what());
+        }
         TestInvalidDtdInputs();
-        TestDeclaredEntityResolution();
+        try {
+            TestDeclaredEntityResolution();
+        } catch (const std::exception& exception) {
+            throw std::runtime_error(std::string("TestDeclaredEntityResolution: ") + exception.what());
+        }
         TestEntitySemanticsConsistency();
         TestEntityResolutionFailures();
         TestDocumentTypeEntityNotationRoundTrip();
@@ -21913,7 +22817,11 @@ int main(int argc, char** argv) {
         TestXmlSchemaXsiType();
         TestXmlExceptionLineInfo();
         TestDocumentConfiguration();
-        TestXmlDocumentStreamsAndEvents();
+        try {
+            TestXmlDocumentStreamsAndEvents();
+        } catch (const std::exception& exception) {
+            throw std::runtime_error(std::string("TestXmlDocumentStreamsAndEvents: ") + exception.what());
+        }
         TestWhitespaceNodes();
         TestGetElementsByTagName();
         TestDomCollections();
