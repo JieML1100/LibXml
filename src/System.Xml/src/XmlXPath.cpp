@@ -362,6 +362,27 @@ bool MatchesXPathQualifiedName(const XmlNode& node, const XPathName& name, const
 bool IsXPathTextNode(const XmlNode& node);
 bool IsXPathVisibleNode(const XmlNode& node);
 bool TryParseXPathProcessingInstructionNodeTest(const std::string& expression, std::string& target);
+XPathStep::PredicateTarget ParseXPathPredicateTarget(std::string_view expression, const std::string& predicateText);
+std::vector<XPathStep> ParseXPathSteps(std::string_view xpath, bool& absolutePath);
+std::vector<XPathContext> EvaluateXPathContextsFromContext(
+    const XPathContext& start,
+    std::string_view xpath,
+    const XmlNamespaceManager* namespaces);
+std::vector<std::string> ExtractXPathPredicateTargetValues(
+    const XmlNode& node,
+    const XPathStep::PredicateTarget& target,
+    const XmlNamespaceManager* namespaces,
+    std::size_t position,
+    std::size_t count);
+std::string CoerceXPathTargetValuesToString(
+    const XPathStep::PredicateTarget& target,
+    const std::vector<std::string>& values);
+bool CoerceXPathTargetValuesToBoolean(
+    const XPathStep::PredicateTarget& target,
+    const std::vector<std::string>& values);
+double CoerceXPathTargetValuesToNumber(
+    const XPathStep::PredicateTarget& target,
+    const std::vector<std::string>& values);
 std::string TrimAsciiWhitespace(std::string value);
 
 [[noreturn]] void ThrowUnsupportedXPathFeature(const std::string& detail) {
@@ -529,6 +550,93 @@ bool IsXPathBooleanTargetKind(const XPathStep::PredicateTarget::Kind kind) {
     || kind == XPathStep::PredicateTarget::Kind::StartsWith
     || kind == XPathStep::PredicateTarget::Kind::EndsWith
         || kind == XPathStep::PredicateTarget::Kind::BooleanLiteral;
+}
+
+std::string NormalizeXPathPublicExpression(std::string_view expression) {
+    std::string normalized = TrimAsciiWhitespace(std::string(expression));
+    if (normalized.empty()) {
+        throw XmlException("XPath expression cannot be empty");
+    }
+
+    return normalized;
+}
+
+XPathStep::PredicateTarget ParseXPathPublicTarget(std::string_view expression) {
+    const std::string normalized = NormalizeXPathPublicExpression(expression);
+    return ParseXPathPredicateTarget(normalized, normalized);
+}
+
+void ValidateXPathPublicExpressionSyntax(const std::string& normalized, const XPathStep::PredicateTarget& target) {
+    if (!IsXPathNodeSetTargetKind(target.kind) || target.kind == XPathStep::PredicateTarget::Kind::Id) {
+        return;
+    }
+
+    bool absolutePath = false;
+    (void)ParseXPathSteps(normalized, absolutePath);
+}
+
+std::vector<XPathNavigator> CreateXPathNavigatorVector(const std::vector<XPathContext>& contexts) {
+    std::vector<XPathNavigator> result;
+    result.reserve(contexts.size());
+    for (const auto& context : contexts) {
+        if (context.node != nullptr) {
+            result.emplace_back(context.node, context.namespaceParent);
+        }
+    }
+    return result;
+}
+
+std::vector<XPathNavigator> EvaluateXPathNodeSetValue(
+    const XPathContext& context,
+    const std::string& expression,
+    const XPathStep::PredicateTarget& target,
+    const XmlNamespaceManager* namespaces) {
+    if (context.node == nullptr) {
+        throw XmlException("Cannot evaluate XPath on an empty navigator");
+    }
+
+    if (target.kind == XPathStep::PredicateTarget::Kind::Id) {
+        std::vector<const XmlNode*> nodes = ResolveXPathIdTargetNodes(*context.node, target.arguments.front(), namespaces, 1, 1);
+        SortXPathUnionNodesInDocumentOrder(nodes);
+
+        std::vector<XPathNavigator> result;
+        result.reserve(nodes.size());
+        for (const auto* node : nodes) {
+            if (node != nullptr) {
+                result.emplace_back(node);
+            }
+        }
+        return result;
+    }
+
+    return CreateXPathNavigatorVector(EvaluateXPathContextsFromContext(context, expression, namespaces));
+}
+
+XPathValue EvaluateXPathValueFromContext(
+    const XPathContext& context,
+    std::string_view expression,
+    const XmlNamespaceManager* namespaces) {
+    const std::string normalized = NormalizeXPathPublicExpression(expression);
+    const auto target = ParseXPathPublicTarget(normalized);
+
+    if (IsXPathNodeSetTargetKind(target.kind)) {
+        return XPathValue(EvaluateXPathNodeSetValue(context, normalized, target, namespaces));
+    }
+
+    if (context.node == nullptr) {
+        throw XmlException("Cannot evaluate XPath on an empty navigator");
+    }
+
+    const auto values = ExtractXPathPredicateTargetValues(*context.node, target, namespaces, 1, 1);
+    if (IsXPathBooleanTargetKind(target.kind)) {
+        return XPathValue(CoerceXPathTargetValuesToBoolean(target, values));
+    }
+
+    if (IsXPathNumericTargetKind(target)) {
+        return XPathValue(CoerceXPathTargetValuesToNumber(target, values));
+    }
+
+    return XPathValue(CoerceXPathTargetValuesToString(target, values));
 }
 
 std::string TrimAsciiWhitespace(std::string value);
@@ -3784,11 +3892,11 @@ std::vector<std::string> ExtractXPathPredicateTargetValues(
         return values;
     }
 
-    if (node.NodeType() != XmlNodeType::Element) {
-        return values;
-    }
-
     if (target.kind == XPathStep::PredicateTarget::Kind::Attribute) {
+        if (node.NodeType() != XmlNodeType::Element) {
+            return values;
+        }
+
         for (const auto& attribute : static_cast<const XmlElement*>(&node)->Attributes()) {
             if (!IsXPathNamespaceDeclarationAttribute(*attribute)
                 && MatchesXPathQualifiedName(*attribute, target.name, namespaces)) {
@@ -3813,6 +3921,10 @@ std::vector<std::string> ExtractXPathPredicateTargetValues(
                     values.push_back(GetXPathPredicatePathNodeStringValue(*match));
                 }
             }
+            return values;
+        }
+
+        if (node.NodeType() != XmlNodeType::Element) {
             return values;
         }
 
@@ -5752,6 +5864,97 @@ XPathNavigator::XPathNavigator(const XmlNode* node, const XmlNode* namespacePare
       namespaceParent_(namespaceParent) {
 }
 
+XPathValue::XPathValue(std::vector<XPathNavigator> nodeSet)
+    : type_(XPathValueType::NodeSet),
+      nodeSet_(std::move(nodeSet)) {
+}
+
+XPathValue::XPathValue(std::string stringValue)
+    : type_(XPathValueType::String),
+      stringValue_(std::move(stringValue)) {
+}
+
+XPathValue::XPathValue(double numberValue)
+    : type_(XPathValueType::Number),
+      numberValue_(numberValue) {
+}
+
+XPathValue::XPathValue(bool booleanValue)
+    : type_(XPathValueType::Boolean),
+      booleanValue_(booleanValue) {
+}
+
+XPathValueType XPathValue::Type() const noexcept {
+    return type_;
+}
+
+bool XPathValue::IsNodeSet() const noexcept {
+    return type_ == XPathValueType::NodeSet;
+}
+
+bool XPathValue::IsString() const noexcept {
+    return type_ == XPathValueType::String;
+}
+
+bool XPathValue::IsNumber() const noexcept {
+    return type_ == XPathValueType::Number;
+}
+
+bool XPathValue::IsBoolean() const noexcept {
+    return type_ == XPathValueType::Boolean;
+}
+
+const std::vector<XPathNavigator>& XPathValue::AsNodeSet() const {
+    if (!IsNodeSet()) {
+        throw XmlException("XPath result is not a node-set");
+    }
+
+    return nodeSet_;
+}
+
+const std::string& XPathValue::AsString() const {
+    if (!IsString()) {
+        throw XmlException("XPath result is not a string");
+    }
+
+    return stringValue_;
+}
+
+double XPathValue::AsNumber() const {
+    if (!IsNumber()) {
+        throw XmlException("XPath result is not a number");
+    }
+
+    return numberValue_;
+}
+
+bool XPathValue::AsBoolean() const {
+    if (!IsBoolean()) {
+        throw XmlException("XPath result is not a boolean");
+    }
+
+    return booleanValue_;
+}
+
+XPathExpression::XPathExpression(std::string expression)
+    : expression_(std::move(expression)) {
+}
+
+XPathExpression XPathExpression::Compile(std::string_view xpath) {
+    const std::string normalized = NormalizeXPathPublicExpression(xpath);
+    const auto target = ParseXPathPublicTarget(normalized);
+    ValidateXPathPublicExpressionSyntax(normalized, target);
+    return XPathExpression(normalized);
+}
+
+const std::string& XPathExpression::Expression() const noexcept {
+    return expression_;
+}
+
+bool XPathExpression::Empty() const noexcept {
+    return expression_.empty();
+}
+
 bool XPathNavigator::IsEmpty() const noexcept {
     return node_ == nullptr;
 }
@@ -6054,6 +6257,22 @@ std::vector<XPathNavigator> XPathNavigator::Select(std::string_view xpath, const
         }
     }
     return result;
+}
+
+XPathValue XPathNavigator::Evaluate(std::string_view xpath) const {
+    return EvaluateXPathValueFromContext({node_, namespaceParent_}, xpath, nullptr);
+}
+
+XPathValue XPathNavigator::Evaluate(std::string_view xpath, const XmlNamespaceManager& namespaces) const {
+    return EvaluateXPathValueFromContext({node_, namespaceParent_}, xpath, &namespaces);
+}
+
+XPathValue XPathNavigator::Evaluate(const XPathExpression& expression) const {
+    return Evaluate(expression.Expression());
+}
+
+XPathValue XPathNavigator::Evaluate(const XPathExpression& expression, const XmlNamespaceManager& namespaces) const {
+    return Evaluate(expression.Expression(), namespaces);
 }
 
 const XmlNode* XPathNavigator::UnderlyingNode() const noexcept {

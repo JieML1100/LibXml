@@ -1,6 +1,550 @@
 #include "XmlInternal.h"
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
+
 namespace System::Xml {
+
+namespace {
+
+bool IsReservedXmlProcessingTarget(std::string_view target) noexcept {
+    return target.size() == 3
+        && (target[0] == 'x' || target[0] == 'X')
+        && (target[1] == 'm' || target[1] == 'M')
+        && (target[2] == 'l' || target[2] == 'L');
+}
+
+bool HasUtf16BigEndianBom(std::string_view text) noexcept {
+    return text.size() >= 2
+        && static_cast<unsigned char>(text[0]) == 0xFE
+        && static_cast<unsigned char>(text[1]) == 0xFF;
+}
+
+bool HasUtf16LittleEndianBom(std::string_view text) noexcept {
+    return text.size() >= 2
+        && static_cast<unsigned char>(text[0]) == 0xFF
+        && static_cast<unsigned char>(text[1]) == 0xFE;
+}
+
+bool HasUtf16Bom(std::string_view text) noexcept {
+    return HasUtf16BigEndianBom(text) || HasUtf16LittleEndianBom(text);
+}
+
+bool LooksLikeMalformedUtf16XmlPrefix(std::string_view text) noexcept {
+    if (text.size() < 8 || HasUtf16Bom(text)) {
+        return false;
+    }
+
+    const auto first = static_cast<unsigned char>(text[0]);
+    if (first == 0xFF) {
+        return static_cast<unsigned char>(text[1]) == 0x00
+            && static_cast<unsigned char>(text[2]) == '<'
+            && static_cast<unsigned char>(text[3]) == 0x00
+            && static_cast<unsigned char>(text[4]) == '?'
+            && static_cast<unsigned char>(text[5]) == 0x00
+            && static_cast<unsigned char>(text[6]) == 'x'
+            && static_cast<unsigned char>(text[7]) == 0x00;
+    }
+
+    if (first == 0xFE) {
+        return static_cast<unsigned char>(text[1]) == '<'
+            && static_cast<unsigned char>(text[2]) == 0x00
+            && static_cast<unsigned char>(text[3]) == '?'
+            && static_cast<unsigned char>(text[4]) == 0x00
+            && static_cast<unsigned char>(text[5]) == 'x'
+            && static_cast<unsigned char>(text[6]) == 0x00
+            && static_cast<unsigned char>(text[7]) == 'm';
+    }
+
+    return false;
+}
+
+bool IsXmlWhitespaceCodePoint(unsigned int codePoint) noexcept {
+    return codePoint == 0x20 || codePoint == 0x09 || codePoint == 0x0A || codePoint == 0x0D;
+}
+
+bool TryClassifyElementContentTextValue(
+    std::string_view value,
+    bool& isWhitespaceOnly,
+    bool& matchesElementContentWhitespace) {
+    isWhitespaceOnly = true;
+    matchesElementContentWhitespace = true;
+
+    for (std::size_t cursor = 0; cursor < value.size();) {
+        if (value[cursor] != '&') {
+            if (!IsWhitespace(value[cursor])) {
+                isWhitespaceOnly = false;
+                matchesElementContentWhitespace = false;
+                return true;
+            }
+
+            ++cursor;
+            continue;
+        }
+
+        const auto semicolon = value.find(';', cursor + 1);
+        if (semicolon == std::string_view::npos) {
+            return false;
+        }
+
+        const std::string_view entity = value.substr(cursor + 1, semicolon - cursor - 1);
+        const auto predefined = ResolvePredefinedEntityReferenceValueView(entity);
+        if (!predefined.empty()) {
+            if (!IsWhitespaceOnly(predefined)) {
+                isWhitespaceOnly = false;
+                matchesElementContentWhitespace = false;
+                return true;
+            }
+        } else if (!entity.empty() && entity.front() == '#') {
+            unsigned int codePoint = 0;
+            if (!TryParseNumericEntityReferenceCodePoint(entity, codePoint)) {
+                return false;
+            }
+
+            if (!IsXmlWhitespaceCodePoint(codePoint)) {
+                isWhitespaceOnly = false;
+                matchesElementContentWhitespace = false;
+                return true;
+            }
+
+            matchesElementContentWhitespace = false;
+        } else {
+            return false;
+        }
+
+        cursor = semicolon + 1;
+    }
+
+    return true;
+}
+
+char ToLowerAscii(char value) noexcept {
+    static const char kToLowerAsciiTable[] =
+        "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F"
+        "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F"
+        "\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2A\x2B\x2C\x2D\x2E\x2F"
+        "\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3A\x3B\x3C\x3D\x3E\x3F"
+        "\x40\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6A\x6B\x6C\x6D\x6E\x6F"
+        "\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7A\x5B\x5C\x5D\x5E\x5F"
+        "\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6A\x6B\x6C\x6D\x6E\x6F"
+        "\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7A\x7B\x7C\x7D\x7E\x7F"
+        "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F"
+        "\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F"
+        "\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF"
+        "\xB0\xB1\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF"
+        "\xC0\xC1\xC2\xC3\xC4\xC5\xC6\xC7\xC8\xC9\xCA\xCB\xCC\xCD\xCE\xCF"
+        "\xD0\xD1\xD2\xD3\xD4\xD5\xD6\xD7\xD8\xD9\xDA\xDB\xDC\xDD\xDE\xDF"
+        "\xE0\xE1\xE2\xE3\xE4\xE5\xE6\xE7\xE8\xE9\xEA\xEB\xEC\xED\xEE\xEF"
+        "\xF0\xF1\xF2\xF3\xF4\xF5\xF6\xF7\xF8\xF9\xFA\xFB\xFC\xFD\xFE\xFF";
+    return kToLowerAsciiTable[static_cast<unsigned char>(value)];
+}
+
+bool EqualsAsciiIgnoreCase(std::string_view left, std::string_view right) noexcept {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        if (ToLowerAscii(left[index]) != ToLowerAscii(right[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool IsUtf16EncodingDeclaration(std::string_view encoding) noexcept {
+    return EqualsAsciiIgnoreCase(encoding, "utf-16")
+        || EqualsAsciiIgnoreCase(encoding, "utf-16le")
+        || EqualsAsciiIgnoreCase(encoding, "utf-16be");
+}
+
+bool IsUtf8EncodingDeclaration(std::string_view encoding) noexcept {
+    return EqualsAsciiIgnoreCase(encoding, "utf-8");
+}
+
+enum class DtdContentModelNodeKind {
+    Name,
+    Sequence,
+    Choice,
+};
+
+struct DtdContentModelNode {
+    DtdContentModelNodeKind kind = DtdContentModelNodeKind::Name;
+    std::string name;
+    std::vector<DtdContentModelNode> children;
+    char occurrence = '\0';
+};
+
+void CollectUniquePositions(
+    std::vector<std::size_t>& target,
+    const std::vector<std::size_t>& source) {
+    for (const std::size_t position : source) {
+        if (std::find(target.begin(), target.end(), position) == target.end()) {
+            target.push_back(position);
+        }
+    }
+}
+
+void SkipDtdContentModelWhitespace(std::string_view text, std::size_t& position) {
+    SkipSubsetWhitespace(text, position);
+}
+
+char ConsumeDtdContentModelOccurrence(std::string_view text, std::size_t& position) {
+    if (position < text.size() && (text[position] == '?' || text[position] == '*' || text[position] == '+')) {
+        return text[position++];
+    }
+    return '\0';
+}
+
+DtdContentModelNode ParseDtdContentModelParticle(std::string_view text, std::size_t& position);
+
+DtdContentModelNode ParseDtdContentModelGroup(std::string_view text, std::size_t& position) {
+    if (position >= text.size() || text[position] != '(') {
+        throw XmlException("Malformed DTD content model");
+    }
+
+    ++position;
+    SkipDtdContentModelWhitespace(text, position);
+    DtdContentModelNode firstChild = ParseDtdContentModelParticle(text, position);
+    SkipDtdContentModelWhitespace(text, position);
+
+    if (position < text.size() && (text[position] == ',' || text[position] == '|')) {
+        const char separator = text[position++];
+        DtdContentModelNode node;
+        node.kind = separator == ','
+            ? DtdContentModelNodeKind::Sequence
+            : DtdContentModelNodeKind::Choice;
+        node.children.push_back(std::move(firstChild));
+        while (true) {
+            SkipDtdContentModelWhitespace(text, position);
+            node.children.push_back(ParseDtdContentModelParticle(text, position));
+            SkipDtdContentModelWhitespace(text, position);
+            if (position >= text.size() || text[position] != separator) {
+                break;
+            }
+            ++position;
+        }
+        if (position >= text.size() || text[position] != ')') {
+            throw XmlException("Malformed DTD content model");
+        }
+        ++position;
+        return node;
+    }
+
+    if (position >= text.size() || text[position] != ')') {
+        throw XmlException("Malformed DTD content model");
+    }
+    ++position;
+
+    DtdContentModelNode node;
+    node.kind = DtdContentModelNodeKind::Sequence;
+    node.children.push_back(std::move(firstChild));
+    return node;
+}
+
+DtdContentModelNode ParseDtdContentModelParticle(std::string_view text, std::size_t& position) {
+    SkipDtdContentModelWhitespace(text, position);
+
+    DtdContentModelNode node;
+    if (position < text.size() && text[position] == '(') {
+        node = ParseDtdContentModelGroup(text, position);
+    } else {
+        const auto name = ReadSubsetName(text, position);
+        if (name.empty()) {
+            throw XmlException("Malformed DTD content model");
+        }
+        node.kind = DtdContentModelNodeKind::Name;
+        node.name = std::string(name);
+    }
+
+    SkipDtdContentModelWhitespace(text, position);
+    const char occurrence = ConsumeDtdContentModelOccurrence(text, position);
+    if (occurrence != '\0') {
+        node.occurrence = occurrence;
+    }
+    return node;
+}
+
+std::vector<std::size_t> MatchDtdContentModelNode(
+    const DtdContentModelNode& node,
+    const std::vector<std::string>& observedChildren,
+    std::size_t position);
+
+std::vector<std::size_t> MatchDtdContentModelNodeBase(
+    const DtdContentModelNode& node,
+    const std::vector<std::string>& observedChildren,
+    std::size_t position) {
+    switch (node.kind) {
+    case DtdContentModelNodeKind::Name:
+        if (position < observedChildren.size() && observedChildren[position] == node.name) {
+            return {position + 1};
+        }
+        return {};
+    case DtdContentModelNodeKind::Sequence: {
+        std::vector<std::size_t> positions = {position};
+        for (const auto& child : node.children) {
+            std::vector<std::size_t> nextPositions;
+            for (const std::size_t candidate : positions) {
+                CollectUniquePositions(nextPositions, MatchDtdContentModelNode(child, observedChildren, candidate));
+            }
+            positions = std::move(nextPositions);
+            if (positions.empty()) {
+                break;
+            }
+        }
+        return positions;
+    }
+    case DtdContentModelNodeKind::Choice: {
+        std::vector<std::size_t> positions;
+        for (const auto& child : node.children) {
+            CollectUniquePositions(positions, MatchDtdContentModelNode(child, observedChildren, position));
+        }
+        return positions;
+    }
+    }
+
+    return {};
+}
+
+std::vector<std::size_t> MatchDtdContentModelNode(
+    const DtdContentModelNode& node,
+    const std::vector<std::string>& observedChildren,
+    std::size_t position) {
+    const auto matchRepeated = [&](std::vector<std::size_t> seedPositions) {
+        std::vector<std::size_t> results = seedPositions;
+        std::vector<std::size_t> frontier = std::move(seedPositions);
+        while (!frontier.empty()) {
+            std::vector<std::size_t> nextFrontier;
+            for (const std::size_t candidate : frontier) {
+                const auto matches = MatchDtdContentModelNodeBase(node, observedChildren, candidate);
+                for (const std::size_t matchPosition : matches) {
+                    if (std::find(results.begin(), results.end(), matchPosition) == results.end()) {
+                        results.push_back(matchPosition);
+                        nextFrontier.push_back(matchPosition);
+                    }
+                }
+            }
+            frontier = std::move(nextFrontier);
+        }
+        return results;
+    };
+
+    switch (node.occurrence) {
+    case '\0':
+        return MatchDtdContentModelNodeBase(node, observedChildren, position);
+    case '?': {
+        std::vector<std::size_t> positions = {position};
+        CollectUniquePositions(positions, MatchDtdContentModelNodeBase(node, observedChildren, position));
+        return positions;
+    }
+    case '*':
+        return matchRepeated({position});
+    case '+':
+        return matchRepeated(MatchDtdContentModelNodeBase(node, observedChildren, position));
+    default:
+        throw XmlException("Malformed DTD content model");
+    }
+}
+
+bool TryParseMixedContentSpecification(
+    std::string_view specification,
+    std::unordered_set<std::string>& allowedChildren) {
+    std::size_t position = 0;
+    SkipDtdContentModelWhitespace(specification, position);
+    if (position >= specification.size() || specification[position] != '(') {
+        return false;
+    }
+
+    ++position;
+    SkipDtdContentModelWhitespace(specification, position);
+    if (!StartsWithAt(specification, position, "#PCDATA")) {
+        return false;
+    }
+
+    position += 7;
+    SkipDtdContentModelWhitespace(specification, position);
+    if (position < specification.size() && specification[position] == ')') {
+        ++position;
+        SkipDtdContentModelWhitespace(specification, position);
+        return position == specification.size();
+    }
+
+    while (position < specification.size() && specification[position] == '|') {
+        ++position;
+        SkipDtdContentModelWhitespace(specification, position);
+        const auto name = ReadSubsetName(specification, position);
+        if (name.empty() || !allowedChildren.insert(std::string(name)).second) {
+            throw XmlException("Malformed DTD content model");
+        }
+        SkipDtdContentModelWhitespace(specification, position);
+    }
+
+    if (position >= specification.size() || specification[position] != ')') {
+        throw XmlException("Malformed DTD content model");
+    }
+    ++position;
+    if (position >= specification.size() || specification[position] != '*') {
+        throw XmlException("Malformed DTD content model");
+    }
+    ++position;
+    SkipDtdContentModelWhitespace(specification, position);
+    return position == specification.size();
+}
+
+bool DoesObservedChildrenMatchContentModel(
+    std::string_view specification,
+    const std::vector<std::string>& observedChildren) {
+    std::size_t position = 0;
+    DtdContentModelNode root = ParseDtdContentModelParticle(specification, position);
+    SkipDtdContentModelWhitespace(specification, position);
+    if (position != specification.size()) {
+        throw XmlException("Malformed DTD content model");
+    }
+
+    const auto positions = MatchDtdContentModelNode(root, observedChildren, 0);
+    return std::find(positions.begin(), positions.end(), observedChildren.size()) != positions.end();
+}
+
+std::string DecodeUtf16BomEncodedXml(std::string_view text);
+
+std::string NormalizeBomEncodedXmlText(std::string_view text) {
+    return HasUtf16Bom(text) ? DecodeUtf16BomEncodedXml(text) : std::string(text);
+}
+
+std::string DecodeUtf16BomEncodedXml(std::string_view text) {
+    const bool littleEndian = HasUtf16LittleEndianBom(text);
+    if (!littleEndian && !HasUtf16BigEndianBom(text)) {
+        return std::string(text);
+    }
+
+    if ((text.size() - 2) % 2 != 0) {
+        throw XmlException("Malformed UTF-16 XML input");
+    }
+
+    std::string decoded;
+    decoded.reserve(text.size() / 2);
+
+    std::size_t position = 2;
+    while (position < text.size()) {
+        const auto readCodeUnit = [&](std::size_t offset) -> std::uint16_t {
+            const unsigned char first = static_cast<unsigned char>(text[offset]);
+            const unsigned char second = static_cast<unsigned char>(text[offset + 1]);
+            return littleEndian
+                ? static_cast<std::uint16_t>(first | (static_cast<std::uint16_t>(second) << 8))
+                : static_cast<std::uint16_t>((static_cast<std::uint16_t>(first) << 8) | second);
+        };
+
+        const std::uint16_t firstUnit = readCodeUnit(position);
+        position += 2;
+
+        std::uint32_t codePoint = firstUnit;
+        if (firstUnit >= 0xD800 && firstUnit <= 0xDBFF) {
+            if (position >= text.size()) {
+                throw XmlException("Malformed UTF-16 XML input");
+            }
+
+            const std::uint16_t secondUnit = readCodeUnit(position);
+            position += 2;
+            if (secondUnit < 0xDC00 || secondUnit > 0xDFFF) {
+                throw XmlException("Malformed UTF-16 XML input");
+            }
+
+            codePoint = 0x10000u
+                + ((static_cast<std::uint32_t>(firstUnit - 0xD800u) << 10)
+                    | static_cast<std::uint32_t>(secondUnit - 0xDC00u));
+        } else if (firstUnit >= 0xDC00 && firstUnit <= 0xDFFF) {
+            throw XmlException("Malformed UTF-16 XML input");
+        }
+
+        AppendCodePointUtf8(decoded, codePoint);
+    }
+
+    return decoded;
+}
+
+std::size_t ConsumeLeadingTextDeclarationIfPresent(std::string_view text) {
+    if (!StartsWithAt(text, 0, "<?xml")) {
+        return 0;
+    }
+
+    if (text.size() <= 5 || !IsWhitespace(text[5])) {
+        throw XmlException("Malformed XML declaration");
+    }
+
+    const auto end = text.find("?>", 5);
+    if (end == std::string_view::npos) {
+        throw XmlException("Malformed XML declaration");
+    }
+
+    const std::string_view value = text.substr(5, end - 5);
+    std::size_t position = 0;
+    bool sawVersion = false;
+    bool sawEncoding = false;
+
+    while (position < value.size()) {
+        SkipXmlWhitespaceAt(value, position);
+        if (position >= value.size()) {
+            break;
+        }
+
+        const auto token = ParseXmlAttributeAssignmentAt(
+            position,
+            [&value](std::size_t& probe) {
+                return ParseNameAt(value, probe);
+            },
+            [&value](std::size_t& probe) noexcept {
+                SkipXmlWhitespaceAt(value, probe);
+            },
+            [&value](std::size_t probe) noexcept {
+                return probe < value.size() ? value[probe] : '\0';
+            },
+            [&value](std::size_t probe) noexcept {
+                return ScanQuotedValueEndAt(probe, [&value](std::size_t innerProbe) noexcept {
+                    return innerProbe < value.size() ? value[innerProbe] : '\0';
+                });
+            });
+
+        if (token.name.empty() || !token.valid) {
+            throw XmlException("Malformed XML declaration");
+        }
+
+        const std::string tokenValue(value.substr(token.rawValueStart, token.rawValueEnd - token.rawValueStart));
+        if (token.name == "version") {
+            if (sawVersion || sawEncoding) {
+                throw XmlException("Malformed XML declaration");
+            }
+            sawVersion = true;
+            if (tokenValue != "1.0") {
+                throw XmlException("Malformed XML declaration");
+            }
+            continue;
+        }
+
+        if (token.name == "encoding") {
+            if (sawEncoding) {
+                throw XmlException("Malformed XML declaration");
+            }
+            sawEncoding = true;
+            ValidateXmlDeclarationEncoding(tokenValue);
+            continue;
+        }
+
+        throw XmlException("Malformed XML declaration");
+    }
+
+    if (!sawEncoding) {
+        throw XmlException("Malformed XML declaration");
+    }
+
+    return end + 2;
+}
+
+}  // namespace
 
 class StreamXmlReaderInputSource final : public XmlReaderInputSource {
 public:
@@ -680,6 +1224,155 @@ private:
     mutable bool eof_ = false;
 };
 
+#if defined(_WIN32)
+class MemoryMappedXmlReaderInputSource final : public XmlReaderInputSource {
+public:
+    explicit MemoryMappedXmlReaderInputSource(const std::filesystem::path& path) {
+        const std::wstring widePath = path.wstring();
+        fileHandle_ = ::CreateFileW(
+            widePath.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+            nullptr);
+        if (fileHandle_ == INVALID_HANDLE_VALUE) {
+            throw XmlException("Failed to open XML file mapping");
+        }
+
+        LARGE_INTEGER fileSize;
+        if (!::GetFileSizeEx(fileHandle_, &fileSize) || fileSize.QuadPart < 0) {
+            throw XmlException("Failed to query XML file size for mapping");
+        }
+        if (static_cast<unsigned long long>(fileSize.QuadPart)
+            > static_cast<unsigned long long>((std::numeric_limits<std::size_t>::max)())) {
+            throw XmlException("XML file is too large to map into the current process");
+        }
+
+        size_ = static_cast<std::size_t>(fileSize.QuadPart);
+        if (size_ == 0) {
+            return;
+        }
+
+        mappingHandle_ = ::CreateFileMappingW(fileHandle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mappingHandle_ == nullptr) {
+            throw XmlException("Failed to create XML file mapping");
+        }
+
+        mappedData_ = static_cast<const char*>(::MapViewOfFile(mappingHandle_, FILE_MAP_READ, 0, 0, 0));
+        if (mappedData_ == nullptr) {
+            throw XmlException("Failed to map XML file view");
+        }
+    }
+
+    ~MemoryMappedXmlReaderInputSource() override {
+        if (mappedData_ != nullptr) {
+            ::UnmapViewOfFile(mappedData_);
+        }
+        if (mappingHandle_ != nullptr) {
+            ::CloseHandle(mappingHandle_);
+        }
+        if (fileHandle_ != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(fileHandle_);
+        }
+    }
+
+    char CharAt(std::size_t position) const noexcept override {
+        return position < size_ ? mappedData_[position] : '\0';
+    }
+
+    const char* PtrAt(std::size_t position, std::size_t& available) const noexcept override {
+        available = 0;
+        if (position >= size_ || mappedData_ == nullptr) {
+            return nullptr;
+        }
+
+        available = size_ - position;
+        return mappedData_ + static_cast<std::ptrdiff_t>(position);
+    }
+
+    std::size_t Find(std::string_view token, std::size_t position) const noexcept override {
+        if (token.empty()) {
+            return position <= size_ ? position : std::string::npos;
+        }
+        if (position >= size_ || token.size() > size_ - position || mappedData_ == nullptr) {
+            return std::string::npos;
+        }
+
+        if (token.size() == 1) {
+            const void* found = std::memchr(
+                mappedData_ + static_cast<std::ptrdiff_t>(position),
+                token.front(),
+                size_ - position);
+            return found == nullptr
+                ? std::string::npos
+                : static_cast<std::size_t>(static_cast<const char*>(found) - mappedData_);
+        }
+
+        const std::string_view haystack(mappedData_, size_);
+        return haystack.find(token, position);
+    }
+
+    std::size_t FindFirstOf(std::string_view tokens, std::size_t position) const noexcept {
+        if (tokens.empty()) {
+            return position <= size_ ? position : std::string::npos;
+        }
+        if (position >= size_ || mappedData_ == nullptr) {
+            return std::string::npos;
+        }
+
+        if (tokens.size() == 1) {
+            return Find(tokens, position);
+        }
+
+        const std::string_view haystack(mappedData_, size_);
+        return haystack.find_first_of(tokens, position);
+    }
+
+    std::size_t ScanQuotedValueEnd(std::size_t quoteStart) const noexcept {
+        const char quote = CharAt(quoteStart);
+        if ((quote != '\'' && quote != '"') || quoteStart + 1 > size_ || mappedData_ == nullptr) {
+            return std::string::npos;
+        }
+
+        const void* found = std::memchr(
+            mappedData_ + static_cast<std::ptrdiff_t>(quoteStart + 1),
+            quote,
+            size_ - (quoteStart + 1));
+        return found == nullptr
+            ? std::string::npos
+            : static_cast<std::size_t>(static_cast<const char*>(found) - mappedData_);
+    }
+
+    std::string Slice(std::size_t start, std::size_t count) const override {
+        if (start >= size_ || mappedData_ == nullptr) {
+            return {};
+        }
+
+        const std::size_t available = size_ - start;
+        const std::size_t clampedCount = count == std::string::npos ? available : (std::min)(count, available);
+        return std::string(mappedData_ + static_cast<std::ptrdiff_t>(start), clampedCount);
+    }
+
+    void AppendSliceTo(std::string& target, std::size_t start, std::size_t count) const override {
+        if (start >= size_ || mappedData_ == nullptr) {
+            return;
+        }
+
+        const std::size_t available = size_ - start;
+        const std::size_t clampedCount = count == std::string::npos ? available : (std::min)(count, available);
+        target.append(mappedData_ + static_cast<std::ptrdiff_t>(start), clampedCount);
+    }
+
+private:
+    HANDLE fileHandle_ = INVALID_HANDLE_VALUE;
+    HANDLE mappingHandle_ = nullptr;
+    const char* mappedData_ = nullptr;
+    std::size_t size_ = 0;
+};
+#endif
+
 class SubrangeXmlReaderInputSource final : public XmlReaderInputSource {
 public:
     SubrangeXmlReaderInputSource(std::shared_ptr<const XmlReaderInputSource> inputSource, std::size_t start, std::size_t length)
@@ -760,6 +1453,15 @@ public:
             }
             return found - start_;
         }
+#if defined(_WIN32)
+        if (const auto* mappedSource = dynamic_cast<const MemoryMappedXmlReaderInputSource*>(inputSource_.get()); mappedSource != nullptr) {
+            const std::size_t found = mappedSource->FindFirstOf(tokens, start_ + position);
+            if (found == std::string::npos || found < start_ || found >= end) {
+                return std::string::npos;
+            }
+            return found - start_;
+        }
+#endif
 
         for (std::size_t probe = position; probe < length_; ++probe) {
             const char ch = inputSource_->CharAt(start_ + probe);
@@ -783,6 +1485,10 @@ public:
             found = stringSource->ScanQuotedValueEnd(start_ + quoteStart);
         } else if (const auto* streamSource = dynamic_cast<const StreamXmlReaderInputSource*>(inputSource_.get()); streamSource != nullptr) {
             found = streamSource->ScanQuotedValueEnd(start_ + quoteStart);
+#if defined(_WIN32)
+        } else if (const auto* mappedSource = dynamic_cast<const MemoryMappedXmlReaderInputSource*>(inputSource_.get()); mappedSource != nullptr) {
+            found = mappedSource->ScanQuotedValueEnd(start_ + quoteStart);
+#endif
         } else {
             found = ScanQuotedValueEndAt(start_ + quoteStart, [this](std::size_t probe) noexcept {
                 return inputSource_->CharAt(probe);
@@ -837,6 +1543,11 @@ std::size_t FindFirstOfFromInputSource(const XmlReaderInputSource* inputSource, 
         }
         return streamSource->FindFirstOf(tokens, position);
     }
+#if defined(_WIN32)
+    if (const auto* mappedSource = dynamic_cast<const MemoryMappedXmlReaderInputSource*>(inputSource); mappedSource != nullptr) {
+        return mappedSource->FindFirstOf(tokens, position);
+    }
+#endif
     if (const auto* subrangeSource = dynamic_cast<const SubrangeXmlReaderInputSource*>(inputSource); subrangeSource != nullptr) {
         return subrangeSource->FindFirstOf(tokens, position);
     }
@@ -1005,6 +1716,18 @@ bool TryConsumeNameFromInputSourceAt(const XmlReaderInputSource* inputSource, st
     }
 
     const auto start = position;
+    std::size_t available = 0;
+    if (const char* chunk = inputSource->PtrAt(start, available); chunk != nullptr && available != 0) {
+        const unsigned char first = static_cast<unsigned char>(chunk[0]);
+        if (first < 0x80 && IsNameStartChar(static_cast<char>(first))) {
+            const std::size_t nameLength = 1 + ConsumeNameCharsInBuffer(chunk + 1, available - 1);
+            if (nameLength < available && static_cast<unsigned char>(chunk[nameLength]) < 0x80) {
+                position = start + nameLength;
+                return true;
+            }
+        }
+    }
+
     position = ConsumeXmlNameAt(position, [inputSource](std::size_t index) noexcept {
         return inputSource->CharAt(index);
     });
@@ -1017,16 +1740,32 @@ bool TryConsumeNameFromInputSourceAt(const XmlReaderInputSource* inputSource, st
 
 std::string ParseNameFromInputSourceAt(const XmlReaderInputSource* inputSource, std::size_t& position) {
     const std::size_t start = position;
-    if (!TryConsumeNameFromInputSourceAt(inputSource, position)) {
+    bool usedAsciiFastPath = false;
+    std::size_t available = 0;
+    if (inputSource != nullptr) {
+        if (const char* chunk = inputSource->PtrAt(start, available); chunk != nullptr && available != 0) {
+            const unsigned char first = static_cast<unsigned char>(chunk[0]);
+            if (first < 0x80 && IsNameStartChar(static_cast<char>(first))) {
+                const std::size_t nameLength = 1 + ConsumeNameCharsInBuffer(chunk + 1, available - 1);
+                if (nameLength < available && static_cast<unsigned char>(chunk[nameLength]) < 0x80) {
+                    position = start + nameLength;
+                    usedAsciiFastPath = true;
+                }
+            }
+        }
+    }
+    if (!usedAsciiFastPath && !TryConsumeNameFromInputSourceAt(inputSource, position)) {
         return {};
     }
 
     std::string name = inputSource->Slice(start, position - start);
-    try {
-        (void)XmlConvert::VerifyName(name);
-    } catch (const XmlException&) {
-        position = start;
-        return {};
+    if (!usedAsciiFastPath) {
+        try {
+            (void)XmlConvert::VerifyName(name);
+        } catch (const XmlException&) {
+            position = start;
+            return {};
+        }
     }
 
     return name;
@@ -1080,10 +1819,20 @@ bool StartsWithAt(const XmlReaderInputSource* inputSource, std::size_t position,
         return false;
     }
 
-    for (std::size_t index = 0; index < token.size(); ++index) {
-        if (inputSource->CharAt(position + index) != token[index]) {
+    std::size_t compared = 0;
+    while (compared < token.size()) {
+        std::size_t available = 0;
+        const char* chunk = inputSource->PtrAt(position + compared, available);
+        if (chunk == nullptr || available == 0) {
             return false;
         }
+
+        const std::size_t chunkLength = (std::min)(available, token.size() - compared);
+        if (std::memcmp(chunk, token.data() + static_cast<std::ptrdiff_t>(compared), chunkLength) != 0) {
+            return false;
+        }
+
+        compared += chunkLength;
     }
 
     return true;
@@ -1099,7 +1848,37 @@ std::size_t ScanDocumentTypeInternalSubsetEndAt(const XmlReaderInputSource* inpu
     bool inQuote = false;
     char quote = '\0';
 
+    const auto scanTerminator = [inputSource](std::size_t start, std::string_view terminator) noexcept {
+        for (std::size_t probe = start; inputSource->CharAt(probe) != '\0'; ++probe) {
+            if (StartsWithAt(inputSource, probe, terminator)) {
+                return probe;
+            }
+        }
+
+        return std::string::npos;
+    };
+
     while (bracketDepth > 0) {
+        if (!inQuote && StartsWithAt(inputSource, position, "<!--")) {
+            const auto commentEnd = scanTerminator(position + 4, "-->");
+            if (commentEnd == std::string::npos) {
+                break;
+            }
+
+            position = commentEnd + 3;
+            continue;
+        }
+
+        if (!inQuote && StartsWithAt(inputSource, position, "<?")) {
+            const auto processingInstructionEnd = scanTerminator(position + 2, "?>");
+            if (processingInstructionEnd == std::string::npos) {
+                break;
+            }
+
+            position = processingInstructionEnd + 2;
+            continue;
+        }
+
         const char ch = inputSource->CharAt(position);
         if (ch == '\0') {
             break;
@@ -1137,6 +1916,11 @@ std::size_t ScanQuotedValueEndAt(const XmlReaderInputSource* inputSource, std::s
     if (const auto* streamSource = dynamic_cast<const StreamXmlReaderInputSource*>(inputSource); streamSource != nullptr) {
         return streamSource->ScanQuotedValueEnd(quoteStart);
     }
+#if defined(_WIN32)
+    if (const auto* mappedSource = dynamic_cast<const MemoryMappedXmlReaderInputSource*>(inputSource); mappedSource != nullptr) {
+        return mappedSource->ScanQuotedValueEnd(quoteStart);
+    }
+#endif
     if (const auto* subrangeSource = dynamic_cast<const SubrangeXmlReaderInputSource*>(inputSource); subrangeSource != nullptr) {
         return subrangeSource->ScanQuotedValueEnd(quoteStart);
     }
@@ -1294,20 +2078,122 @@ public:
     }
 
     AttributeAssignmentToken ParseAttributeAssignment(std::size_t& position) const {
-        return ParseXmlAttributeAssignmentAt(
-            position,
-            [this](std::size_t& probe) {
-                return ParseNameAt(probe);
-            },
-            [this](std::size_t& probe) noexcept {
-                SkipWhitespace(probe);
-            },
-            [this](std::size_t probe) noexcept {
-                return CharAt(probe);
-            },
-            [this](std::size_t probe) noexcept {
-                return ScanQuotedValueEnd(probe);
-            });
+        AttributeAssignmentToken token;
+        token.name = ParseNameAt(position);
+        if (token.name.empty()) {
+            return token;
+        }
+
+        SkipWhitespace(position);
+        if (CharAt(position) != '=') {
+            return token;
+        }
+        token.sawEquals = true;
+        ++position;
+
+        SkipWhitespace(position);
+        const char quote = CharAt(position);
+        if (quote != '"' && quote != '\'') {
+            return token;
+        }
+
+        token.rawValueStart = position + 1;
+        token.scannedRawValue = true;
+
+        for (std::size_t probe = token.rawValueStart;;) {
+            std::size_t available = 0;
+            const char* chunk = PtrAt(probe, available);
+            if (chunk == nullptr || available == 0) {
+                const unsigned char ch = static_cast<unsigned char>(CharAt(probe));
+                if (ch == 0) {
+                    return token;
+                }
+                if (ch == static_cast<unsigned char>(quote)) {
+                    token.rawValueEnd = probe;
+                    position = probe + 1;
+                    token.valid = true;
+                    return token;
+                }
+                if (ch < 0x80) {
+                    if (ch == '<' && token.invalidLtPosition == std::string::npos) {
+                        token.invalidLtPosition = probe;
+                    }
+                    if (ch == '&') {
+                        token.rawValueFlags = static_cast<unsigned char>(token.rawValueFlags | kAttributeValueNeedsDecoding);
+                    }
+                    if (!(ch == 0x09 || ch == 0x0A || ch == 0x0D || ch >= 0x20)
+                        && token.invalidCharacterPosition == std::string::npos) {
+                        token.invalidCharacterPosition = probe;
+                    }
+                    ++probe;
+                    continue;
+                }
+
+                std::uint32_t codePoint = 0;
+                std::size_t width = 0;
+                if (!DecodeUtf8CodePointAt(probe, [this](std::size_t index) noexcept {
+                        return CharAt(index);
+                    }, codePoint, width)
+                    || !IsValidXmlCharacterCodePoint(codePoint)) {
+                    if (token.invalidCharacterPosition == std::string::npos) {
+                        token.invalidCharacterPosition = probe;
+                    }
+                    ++probe;
+                    continue;
+                }
+
+                probe += width;
+                continue;
+            }
+
+            std::size_t offset = 0;
+            while (offset < available) {
+                const unsigned char ch = static_cast<unsigned char>(chunk[offset]);
+                if (ch == 0) {
+                    return token;
+                }
+                if (ch == static_cast<unsigned char>(quote)) {
+                    token.rawValueEnd = probe + offset;
+                    position = token.rawValueEnd + 1;
+                    token.valid = true;
+                    return token;
+                }
+                if (ch >= 0x80) {
+                    break;
+                }
+                if (ch == '<' && token.invalidLtPosition == std::string::npos) {
+                    token.invalidLtPosition = probe + offset;
+                }
+                if (ch == '&') {
+                    token.rawValueFlags = static_cast<unsigned char>(token.rawValueFlags | kAttributeValueNeedsDecoding);
+                }
+                if (!(ch == 0x09 || ch == 0x0A || ch == 0x0D || ch >= 0x20)
+                    && token.invalidCharacterPosition == std::string::npos) {
+                    token.invalidCharacterPosition = probe + offset;
+                }
+                ++offset;
+            }
+
+            probe += offset;
+            if (offset == available) {
+                continue;
+            }
+
+            std::uint32_t codePoint = 0;
+            std::size_t width = 0;
+            if (!DecodeUtf8CodePointAt(probe, [this](std::size_t index) noexcept {
+                    return CharAt(index);
+                }, codePoint, width)
+                || !IsValidXmlCharacterCodePoint(codePoint)) {
+                if (token.invalidCharacterPosition == std::string::npos) {
+                    token.invalidCharacterPosition = probe;
+                }
+                ++probe;
+                continue;
+            }
+
+            probe += width;
+        }
     }
 
     QuotedValueToken ParseQuotedLiteral(std::size_t& position) const {
@@ -1374,6 +2260,30 @@ bool XmlReader::SourceRangeContains(std::size_t start, std::size_t end, char val
     }
 
     return false;
+}
+
+std::size_t XmlReader::ValidateXmlCharacterAt(std::size_t position) const {
+    const unsigned char first = static_cast<unsigned char>(SourceCharAt(position));
+    if (first < 0x80) {
+        if (first == 0x09 || first == 0x0A || first == 0x0D || first >= 0x20) {
+            return 1;
+        }
+
+        const auto [line, column] = ComputeLineColumn(position);
+        throw XmlException("Invalid XML character", line, column);
+    }
+
+    std::uint32_t codePoint = 0;
+    std::size_t width = 0;
+    if (!DecodeUtf8CodePointAt(position, [this](std::size_t index) noexcept {
+            return SourceCharAt(index);
+        }, codePoint, width)
+        || !IsValidXmlCharacterCodePoint(codePoint)) {
+        const auto [line, column] = ComputeLineColumn(position);
+        throw XmlException("Invalid XML character", line, column);
+    }
+
+    return width;
 }
 
 void XmlReader::AppendSourceSubstrTo(std::string& target, std::size_t start, std::size_t count) const {
@@ -1766,7 +2676,30 @@ void XmlReader::RegisterDtdDeclarations(
     }
 }
 
+void XmlReader::RegisterDtdElementDeclarations(
+    const std::unordered_map<std::string, std::string>& elementContentDeclarations,
+    bool fromExternalSubset) {
+    if (elementContentDeclarations.empty()) {
+        return;
+    }
+
+    DtdState& dtdState = EnsureDtdState();
+    for (const auto& [elementName, contentSpecification] : elementContentDeclarations) {
+        if (!dtdState.elementContentDeclarations.emplace(elementName, contentSpecification).second) {
+            throw XmlException(
+                "DTD validation failed: duplicate ELEMENT declaration for '" + elementName + "'");
+        }
+        if (contentSpecification == "EMPTY") {
+            dtdState.emptyElementDeclarations.insert(elementName);
+        }
+        if (fromExternalSubset) {
+            dtdState.externalElementDeclarationNames.insert(elementName);
+        }
+    }
+}
+
 void XmlReader::RegisterDtdAttributeDeclarations(
+    const std::unordered_map<std::string, std::unordered_set<std::string>>& declaredAttributes,
     const std::unordered_map<std::string, std::string>& idAttributes,
     const std::unordered_map<std::string, std::string>& notationAttributes,
     const std::unordered_map<std::string, std::unordered_map<std::string, bool>>& nmTokenAttributes,
@@ -1776,11 +2709,16 @@ void XmlReader::RegisterDtdAttributeDeclarations(
     const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& fixedAttributes,
     const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& enumeratedAttributes,
     bool fromExternalSubset) {
-    if (idAttributes.empty() && notationAttributes.empty() && nmTokenAttributes.empty() && nameAttributes.empty() && requiredAttributes.empty() && defaultAttributes.empty() && fixedAttributes.empty() && enumeratedAttributes.empty()) {
+    if (declaredAttributes.empty() && idAttributes.empty() && notationAttributes.empty() && nmTokenAttributes.empty() && nameAttributes.empty() && requiredAttributes.empty() && defaultAttributes.empty() && fixedAttributes.empty() && enumeratedAttributes.empty()) {
         return;
     }
 
     DtdState& dtdState = EnsureDtdState();
+    for (const auto& [elementName, attributeNames] : declaredAttributes) {
+        auto& destination = dtdState.declaredAttributes[elementName];
+        destination.insert(attributeNames.begin(), attributeNames.end());
+    }
+
     for (const auto& [elementName, attributeName] : idAttributes) {
         const auto existingIdAttribute = dtdState.idAttributes.find(elementName);
         if (existingIdAttribute != dtdState.idAttributes.end() && existingIdAttribute->second != attributeName) {
@@ -1863,9 +2801,51 @@ void XmlReader::RegisterDtdAttributeDeclarations(
             }
         }
     }
+
+    for (const auto& [elementName, attributeName] : notationAttributes) {
+        const auto elementEnumerations = dtdState.enumeratedAttributes.find(elementName);
+        if (elementEnumerations == dtdState.enumeratedAttributes.end()) {
+            continue;
+        }
+
+        const auto enumeration = elementEnumerations->second.find(attributeName);
+        if (enumeration == elementEnumerations->second.end()) {
+            continue;
+        }
+
+        const std::string_view values = enumeration->second;
+        const std::string_view inner = values.substr(1, values.size() - 2);
+        std::size_t start = 0;
+        while (start <= inner.size()) {
+            const std::size_t separator = inner.find('|', start);
+            const std::string notationName = Trim(std::string(inner.substr(
+                start,
+                separator == std::string_view::npos ? std::string_view::npos : separator - start)));
+            if (!notationName.empty()
+                && dtdState.notationDeclarationNames.find(notationName) == dtdState.notationDeclarationNames.end()) {
+                throw XmlException(
+                    "DTD validation failed: NOTATION attribute '" + attributeName
+                    + "' on element '" + elementName
+                    + "' references undeclared notation '" + notationName + "'");
+            }
+
+            if (separator == std::string_view::npos) {
+                break;
+            }
+            start = separator + 1;
+        }
+    }
+
+    ValidateDtdDeclaredAttributeValues(
+        defaultAttributes,
+        fixedAttributes,
+        dtdState.entityDeclarations,
+        dtdState.externalEntitySystemIds);
 }
 
-void XmlReader::LoadExternalSubsetDeclarations(std::string_view systemLiteral) {
+void XmlReader::LoadExternalSubsetDeclarations(
+    std::string_view systemLiteral,
+    const std::unordered_map<std::string, std::string>* inheritedParameterEntityDeclarations) {
     DtdState& dtdState = EnsureDtdState();
     if (!systemLiteral.empty()) {
         dtdState.externalSubsetSystemId = std::string(systemLiteral);
@@ -1878,30 +2858,141 @@ void XmlReader::LoadExternalSubsetDeclarations(std::string_view systemLiteral) {
     }
 
     const std::string absoluteUri = settings_.Resolver->ResolveUri(baseUri_, systemLiteral);
-    const std::string externalSubset = Trim(settings_.Resolver->GetEntity(absoluteUri));
+    const std::string resolvedExternalSubset = NormalizeBomEncodedXmlText(settings_.Resolver->GetEntity(absoluteUri));
+    std::string_view externalSubsetView(resolvedExternalSubset);
+    const std::size_t textDeclarationEnd = ConsumeLeadingTextDeclarationIfPresent(externalSubsetView);
+    if (textDeclarationEnd != 0) {
+        externalSubsetView.remove_prefix(textDeclarationEnd);
+    }
+    const std::string externalSubset = Trim(std::string(externalSubsetView));
     dtdState.externalSubsetDeclarationsLoaded = true;
     if (externalSubset.empty()) {
         return;
     }
 
+    std::unordered_map<std::string, std::string> parameterEntityDeclarations;
+    std::unordered_map<std::string, std::string> externalParameterEntitySystemLiterals;
+    std::unordered_set<std::string> externalParameterEntityNames;
+    if (inheritedParameterEntityDeclarations != nullptr) {
+        parameterEntityDeclarations = *inheritedParameterEntityDeclarations;
+    }
+    CollectDtdParameterEntityDeclarations(
+        externalSubset,
+        parameterEntityDeclarations,
+        true,
+        &externalParameterEntitySystemLiterals);
+    LoadExternalParameterEntityDeclarations(
+        externalParameterEntitySystemLiterals,
+        absoluteUri,
+        parameterEntityDeclarations,
+        externalParameterEntityNames);
+    ValidateTopLevelParameterEntityReferenceBoundaries(
+        externalSubset,
+        parameterEntityDeclarations,
+        true,
+        &externalParameterEntityNames);
+    ValidateElementDeclarationParameterEntityBoundaries(
+        externalSubset,
+        parameterEntityDeclarations,
+        &externalParameterEntityNames);
+    const std::string expandedExternalSubset = ExpandDtdParameterEntityReferences(
+        externalSubset,
+        parameterEntityDeclarations,
+        true,
+        &externalParameterEntityNames);
+
     std::vector<std::shared_ptr<XmlNode>> entities;
     std::vector<std::shared_ptr<XmlNode>> notations;
-    ParseDocumentTypeInternalSubset(externalSubset, entities, notations);
+    ParseDocumentTypeInternalSubset(expandedExternalSubset, entities, notations, true);
+    for (const auto& entity : entities) {
+        if (entity != nullptr && entity->NodeType() == XmlNodeType::Entity) {
+            dtdState.externalSubsetEntityNames.insert(entity->Name());
+        }
+    }
     RegisterDtdDeclarations(entities, notations);
 
     DtdRequiredAttributeDeclarations requiredAttributes;
     DtdDefaultAttributeDeclarations defaultAttributes;
     DtdFixedAttributeDeclarations fixedAttributes;
     DtdEnumeratedAttributeDeclarations enumeratedAttributes;
-    DtdEmptyElementDeclarations emptyElementDeclarations;
+    DtdElementContentDeclarations elementContentDeclarations;
+    DtdDeclaredAttributeNames declaredAttributes;
     DtdIdAttributeDeclarations idAttributes;
     DtdNotationAttributeDeclarations notationAttributes;
     DtdNmTokenAttributeDeclarations nmTokenAttributes;
     DtdNameAttributeDeclarations nameAttributes;
-    ParseDocumentTypeEmptyElementDeclarations(externalSubset, emptyElementDeclarations);
-    ParseDocumentTypeAttributeDeclarations(externalSubset, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes);
-    dtdState.emptyElementDeclarations.insert(emptyElementDeclarations.begin(), emptyElementDeclarations.end());
-    RegisterDtdAttributeDeclarations(idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, true);
+    ParseDocumentTypeElementDeclarations(expandedExternalSubset, elementContentDeclarations, true);
+    ParseDocumentTypeAttributeDeclarations(expandedExternalSubset, declaredAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, true);
+    ValidateDtdDeclaredAttributeValueReferenceOrder(expandedExternalSubset, true);
+    RegisterDtdElementDeclarations(elementContentDeclarations, true);
+    RegisterDtdAttributeDeclarations(declaredAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, true);
+}
+
+void XmlReader::LoadExternalParameterEntityDeclarations(
+    const std::unordered_map<std::string, std::string>& externalParameterEntitySystemLiterals,
+    std::string_view baseUri,
+    std::unordered_map<std::string, std::string>& declarations,
+    std::unordered_set<std::string>& externalParameterEntityNames) {
+    if (externalParameterEntitySystemLiterals.empty()
+        || settings_.DtdProcessing != DtdProcessing::Parse
+        || settings_.Resolver == nullptr) {
+        return;
+    }
+
+    std::vector<std::string> loadingStack;
+    const auto loadRecursive = [&](const auto& self,
+                                   const std::unordered_map<std::string, std::string>& systemLiterals,
+                                   std::string_view currentBaseUri) -> void {
+        for (const auto& [name, systemLiteral] : systemLiterals) {
+            if (externalParameterEntityNames.find(name) != externalParameterEntityNames.end()) {
+                continue;
+            }
+
+            auto declaration = declarations.find(name);
+            if (declaration == declarations.end()) {
+                continue;
+            }
+
+            if (std::find(loadingStack.begin(), loadingStack.end(), name) != loadingStack.end()) {
+                ThrowMalformedDtdDeclaration("declaration");
+            }
+
+            const std::string absoluteUri = settings_.Resolver->ResolveUri(currentBaseUri, systemLiteral);
+            const std::string rawResolvedValue = NormalizeBomEncodedXmlText(settings_.Resolver->GetEntity(absoluteUri));
+            if (settings_.MaxCharactersFromEntities != 0) {
+                entityCharactersRead_ += rawResolvedValue.size();
+                if (entityCharactersRead_ > settings_.MaxCharactersFromEntities) {
+                    Throw("The XML document exceeds the configured MaxCharactersFromEntities limit");
+                }
+            }
+
+            loadingStack.push_back(name);
+            try {
+                std::string_view resolvedValue(rawResolvedValue);
+                const std::size_t textDeclarationEnd = ConsumeLeadingTextDeclarationIfPresent(resolvedValue);
+                if (textDeclarationEnd != 0) {
+                    resolvedValue.remove_prefix(textDeclarationEnd);
+                }
+
+                declaration->second.assign(resolvedValue.data(), resolvedValue.size());
+
+                std::unordered_map<std::string, std::string> nestedExternalParameterEntitySystemLiterals;
+                CollectDtdParameterEntityDeclarations(
+                    resolvedValue,
+                    declarations,
+                    true,
+                    &nestedExternalParameterEntitySystemLiterals);
+                self(self, nestedExternalParameterEntitySystemLiterals, absoluteUri);
+                externalParameterEntityNames.insert(name);
+            } catch (...) {
+                loadingStack.pop_back();
+                throw;
+            }
+            loadingStack.pop_back();
+        }
+    };
+
+    loadRecursive(loadRecursive, externalParameterEntitySystemLiterals, baseUri);
 }
 
 void XmlReader::EnsureExternalSubsetDeclarationsLoaded() {
@@ -1909,15 +3000,8 @@ void XmlReader::EnsureExternalSubsetDeclarationsLoaded() {
         return;
     }
 
-    const bool hasDeclarations = !dtdState_->declaredEntityNames.empty()
-        || !dtdState_->parsedEntities.empty()
-        || !dtdState_->parsedNotations.empty();
-    if (dtdState_->externalSubsetDeclarationsLoaded && hasDeclarations) {
+    if (dtdState_->externalSubsetDeclarationsLoaded) {
         return;
-    }
-
-    if (dtdState_->externalSubsetDeclarationsLoaded && !hasDeclarations) {
-        dtdState_->externalSubsetDeclarationsLoaded = false;
     }
 
     LoadExternalSubsetDeclarations(dtdState_->externalSubsetSystemId);
@@ -1927,14 +3011,16 @@ void XmlReader::EnsureExternalSubsetDeclarationsLoaded() {
     Throw("Unknown entity reference: &" + std::string(entity) + ';');
 }
 
-void XmlReader::ApplyDtdAttributeDeclarations(
+bool XmlReader::ApplyDtdAttributeDeclarations(
     std::string_view elementName,
     std::vector<std::pair<std::string, std::string>>& attributes,
     std::vector<AttributeValueMetadata>& attributeValueMetadata,
     bool& retainLocalNamespaceDeclarationsForAttributes) const {
     if (dtdState_ == nullptr) {
-        return;
+        return false;
     }
+
+    bool requiresAttributePostProcessing = false;
 
     const auto hasAttribute = [&attributes](std::string_view attributeName) {
         for (const auto& attribute : attributes) {
@@ -1945,12 +3031,51 @@ void XmlReader::ApplyDtdAttributeDeclarations(
         return false;
     };
 
-    const auto attributeValueAt = [this, &attributes, &attributeValueMetadata](std::size_t index) {
+    const std::string elementNameString(elementName);
+    const auto attributeUsesTokenizedType = [this, &elementNameString](std::string_view attributeName) {
+        if (dtdState_ == nullptr) {
+            return false;
+        }
+
+        if (const auto idIt = dtdState_->idAttributes.find(elementNameString);
+            idIt != dtdState_->idAttributes.end() && idIt->second == attributeName) {
+            return true;
+        }
+        if (const auto notationIt = dtdState_->notationAttributes.find(elementNameString);
+            notationIt != dtdState_->notationAttributes.end() && notationIt->second == attributeName) {
+            return true;
+        }
+        if (const auto nmTokenIt = dtdState_->nmTokenAttributes.find(elementNameString);
+            nmTokenIt != dtdState_->nmTokenAttributes.end()
+                && nmTokenIt->second.find(std::string(attributeName)) != nmTokenIt->second.end()) {
+            return true;
+        }
+        if (const auto nameIt = dtdState_->nameAttributes.find(elementNameString);
+            nameIt != dtdState_->nameAttributes.end()
+                && nameIt->second.find(std::string(attributeName)) != nameIt->second.end()) {
+            return true;
+        }
+        if (const auto enumeratedIt = dtdState_->enumeratedAttributes.find(elementNameString);
+            enumeratedIt != dtdState_->enumeratedAttributes.end()
+                && enumeratedIt->second.find(std::string(attributeName)) != enumeratedIt->second.end()) {
+            return true;
+        }
+
+        return false;
+    };
+
+    const auto normalizeAttributeValue = [&attributeUsesTokenizedType](std::string_view attributeName, std::string value) {
+        return attributeUsesTokenizedType(attributeName)
+            ? NormalizeXmlAttributeWhitespace(value)
+            : value;
+    };
+
+    const auto attributeValueAt = [this, &attributes, &attributeValueMetadata, &normalizeAttributeValue](std::size_t index) {
         if (index >= attributes.size()) {
             return std::string{};
         }
         if (index >= attributeValueMetadata.size()) {
-            return attributes[index].second;
+            return normalizeAttributeValue(attributes[index].first, attributes[index].second);
         }
 
         const auto& metadata = attributeValueMetadata[index];
@@ -1958,17 +3083,16 @@ void XmlReader::ApplyDtdAttributeDeclarations(
             || metadata.valueStart == std::string::npos
             || metadata.valueEnd == std::string::npos
             || metadata.valueEnd < metadata.valueStart) {
-            return attributes[index].second;
+            return normalizeAttributeValue(attributes[index].first, attributes[index].second);
         }
 
         std::string value = SourceSubstr(metadata.valueStart, metadata.valueEnd - metadata.valueStart);
         if ((metadata.flags & kAttributeValueNeedsDecoding) != 0) {
             value = DecodeEntities(value);
         }
-        return value;
+        return normalizeAttributeValue(attributes[index].first, std::move(value));
     };
 
-    const std::string elementNameString(elementName);
     if (documentDeclarationStandalone_ == "yes") {
         const bool hasExternalRequired = dtdState_->externalRequiredAttributes.find(elementNameString)
             != dtdState_->externalRequiredAttributes.end();
@@ -2030,6 +3154,9 @@ void XmlReader::ApplyDtdAttributeDeclarations(
                 std::string::npos,
                 std::string::npos,
                 static_cast<unsigned char>(kAttributeValueDecoded)});
+            if (attributeName == "xml:space" || IsNamespaceDeclarationName(attributeName)) {
+                requiresAttributePostProcessing = true;
+            }
         }
     }
 
@@ -2041,7 +3168,7 @@ void XmlReader::ApplyDtdAttributeDeclarations(
     for (std::size_t index = 0; index < attributes.size(); ++index) {
         if (idIt != dtdState_->idAttributes.end() && attributes[index].first == idIt->second) {
             const std::string value = attributeValueAt(index);
-            if (!IsValidDtdName(value)) {
+            if (!IsValidDtdNcName(value)) {
                 throw XmlException(
                     "DTD validation failed: attribute '" + attributes[index].first
                     + "' on element '" + elementNameString
@@ -2075,7 +3202,8 @@ void XmlReader::ApplyDtdAttributeDeclarations(
             if (nameDeclaration != nameIt->second.end()) {
                 const std::string value = attributeValueAt(index);
                 const bool allowsMultipleNames = nameDeclaration->second == "IDREFS" || nameDeclaration->second == "ENTITIES";
-                if (!IsValidDtdNamesValue(value, allowsMultipleNames)) {
+                const bool requiresNcName = nameDeclaration->second == "IDREF" || nameDeclaration->second == "IDREFS";
+                if (!IsValidDtdNamesValue(value, allowsMultipleNames, requiresNcName)) {
                     throw XmlException(
                         "DTD validation failed: attribute '" + attributes[index].first
                         + "' on element '" + elementNameString
@@ -2102,10 +3230,11 @@ void XmlReader::ApplyDtdAttributeDeclarations(
                 }
             }
         }
+
     }
 
     if (enumeratedIt == dtdState_->enumeratedAttributes.end()) {
-        return;
+        return requiresAttributePostProcessing;
     }
 
     for (std::size_t index = 0; index < attributes.size(); ++index) {
@@ -2122,10 +3251,17 @@ void XmlReader::ApplyDtdAttributeDeclarations(
                 + "' must match one of " + enumerationDeclaration->second);
         }
     }
+
+    return requiresAttributePostProcessing;
 }
 
 void XmlReader::ValidatePendingDtdIdReferences() {
     if (dtdState_ == nullptr || dtdState_->pendingIdAttributeReferences.empty()) {
+        return;
+    }
+
+    if (settings_.Validation == ValidationType::None) {
+        dtdState_->pendingIdAttributeReferences.clear();
         return;
     }
 
@@ -2193,18 +3329,33 @@ void XmlReader::SkipWhitespace() {
 
 std::string XmlReader::ParseName() {
     const auto start = position_;
-    position_ = ConsumeXmlNameAt(position_, [this](std::size_t index) noexcept {
-        return SourceCharAt(index);
-    });
-    if (position_ == start) {
-        Throw("Invalid XML name");
+    bool usedAsciiFastPath = false;
+    std::size_t available = 0;
+    if (const char* chunk = SourcePtrAt(start, available); chunk != nullptr && available != 0) {
+        const unsigned char first = static_cast<unsigned char>(chunk[0]);
+        if (first < 0x80 && IsNameStartChar(static_cast<char>(first))) {
+            const std::size_t nameLength = 1 + ConsumeNameCharsInBuffer(chunk + 1, available - 1);
+            if (nameLength < available && static_cast<unsigned char>(chunk[nameLength]) < 0x80) {
+                position_ = start + nameLength;
+                usedAsciiFastPath = true;
+            }
+        }
+    }
+
+    if (!usedAsciiFastPath) {
+        position_ = ConsumeXmlNameAt(position_, [this](std::size_t index) noexcept {
+            return SourceCharAt(index);
+        });
+        if (position_ == start) {
+            Throw("Invalid XML name");
+        }
     }
 
     const std::size_t nameLength = position_ - start;
     linePosition_ += nameLength;
 
-    std::size_t available = 0;
-    if (const char* ptr = SourcePtrAt(start, available); ptr != nullptr && available >= nameLength) {
+    std::size_t internAvailable = 0;
+    if (const char* ptr = SourcePtrAt(start, internAvailable); ptr != nullptr && internAvailable >= nameLength) {
         const std::string_view nameView(ptr, nameLength);
         if (nameTable_.Get(nameView) != nullptr) {
             return std::string(nameView);
@@ -2216,23 +3367,31 @@ std::string XmlReader::ParseName() {
         return name;
     }
 
-    try {
-        (void)XmlConvert::VerifyName(name);
-    } catch (const XmlException&) {
-        position_ = start;
-        Throw("Invalid XML name");
+    if (!usedAsciiFastPath) {
+        try {
+            (void)XmlConvert::VerifyName(name);
+        } catch (const XmlException&) {
+            position_ = start;
+            Throw("Invalid XML name");
+        }
     }
 
     return name;
 }
 
 std::string XmlReader::DecodeEntities(std::string_view value) const {
-    const_cast<XmlReader*>(this)->EnsureExternalSubsetDeclarationsLoaded();
+    if (dtdState_ != nullptr) {
+        const_cast<XmlReader*>(this)->EnsureExternalSubsetDeclarationsLoaded();
+    }
     const std::string decoded = DecodeEntityText(
         value,
         [this](const std::string& entity) -> std::optional<std::string> {
             if (!dtdState_) {
                 return std::nullopt;
+            }
+            if (documentDeclarationStandalone_ == "yes"
+                && dtdState_->externalSubsetEntityNames.find(entity) != dtdState_->externalSubsetEntityNames.end()) {
+                Throw("Standalone document declaration must not use external general entity references");
             }
             const auto found = dtdState_->entityDeclarations.find(entity);
             return found == dtdState_->entityDeclarations.end() ? std::nullopt : std::optional<std::string>(found->second);
@@ -2247,6 +3406,153 @@ std::string XmlReader::DecodeEntities(std::string_view value) const {
         }
     }
     return decoded;
+}
+
+void XmlReader::ValidateParsedEntityReplacementText(std::string_view rawReplacementText) const {
+    if (rawReplacementText.find('<') == std::string_view::npos
+        && rawReplacementText.find("&#") == std::string_view::npos) {
+        return;
+    }
+
+    if (rawReplacementText.find('<') != std::string_view::npos
+        && rawReplacementText.find('&') != std::string_view::npos) {
+        XmlReaderSettings rawFragmentSettings = settings_;
+        rawFragmentSettings.Conformance = ConformanceLevel::Fragment;
+        rawFragmentSettings.Validation = ValidationType::None;
+
+        auto rawFragmentSource = std::make_shared<const std::string>(std::string(rawReplacementText));
+        XmlReader rawFragmentReader = CreateFromValidatedString(rawFragmentSource, rawFragmentSettings);
+        if (dtdState_ != nullptr) {
+            rawFragmentReader.dtdState_ = std::make_unique<DtdState>(*dtdState_);
+        }
+        rawFragmentReader.documentDeclarationStandalone_ = documentDeclarationStandalone_;
+        rawFragmentReader.baseUri_ = baseUri_;
+        rawFragmentReader.baseUriNeedsResolution_ = baseUriNeedsResolution_;
+        rawFragmentReader.activeExternalEntityNames_ = activeExternalEntityNames_;
+
+        while (rawFragmentReader.Read()) {
+        }
+    }
+
+    const auto normalizeNumericReferences = [this](std::string_view value) {
+        std::string normalized;
+        normalized.reserve(value.size());
+
+        std::size_t cursor = 0;
+        while (cursor < value.size()) {
+            const auto ampersand = value.find('&', cursor);
+            if (ampersand == std::string_view::npos) {
+                normalized.append(value.data() + cursor, value.size() - cursor);
+                break;
+            }
+
+            normalized.append(value.data() + cursor, ampersand - cursor);
+            if (ampersand + 1 < value.size() && value[ampersand + 1] == '#') {
+                const auto semicolon = value.find(';', ampersand + 2);
+                if (semicolon == std::string_view::npos) {
+                    Throw("Unterminated entity reference");
+                }
+
+                const std::string_view entity = value.substr(ampersand + 1, semicolon - ampersand - 1);
+                unsigned int codePoint = 0;
+                if (!TryParseNumericEntityReferenceCodePoint(entity, codePoint)) {
+                    Throw("Invalid numeric entity reference: &" + std::string(entity) + ';');
+                }
+                AppendCodePointUtf8(normalized, codePoint);
+                cursor = semicolon + 1;
+                continue;
+            }
+
+            normalized.push_back('&');
+            cursor = ampersand + 1;
+        }
+
+        return normalized;
+    };
+
+    const std::string normalizedReplacementText = normalizeNumericReferences(rawReplacementText);
+    if (normalizedReplacementText.find('<') == std::string::npos
+        && normalizedReplacementText.find('&') == std::string::npos) {
+        return;
+    }
+
+    XmlReaderSettings fragmentSettings = settings_;
+    fragmentSettings.Conformance = ConformanceLevel::Fragment;
+    fragmentSettings.Validation = ValidationType::None;
+
+    auto fragmentSource = std::make_shared<const std::string>(normalizedReplacementText);
+    XmlReader fragmentReader = CreateFromValidatedString(fragmentSource, fragmentSettings);
+    if (dtdState_ != nullptr) {
+        fragmentReader.dtdState_ = std::make_unique<DtdState>(*dtdState_);
+    }
+    fragmentReader.documentDeclarationStandalone_ = documentDeclarationStandalone_;
+    fragmentReader.baseUri_ = baseUri_;
+    fragmentReader.baseUriNeedsResolution_ = baseUriNeedsResolution_;
+    fragmentReader.activeExternalEntityNames_ = activeExternalEntityNames_;
+
+    while (fragmentReader.Read()) {
+    }
+}
+
+void XmlReader::ValidateAttributeEntityReplacementText(std::string_view rawReplacementText) const {
+    if (rawReplacementText.find('<') == std::string_view::npos
+        && rawReplacementText.find('&') == std::string_view::npos
+        && rawReplacementText.find("&#") == std::string_view::npos) {
+        return;
+    }
+
+    std::string normalized;
+    normalized.reserve(rawReplacementText.size());
+
+    std::size_t cursor = 0;
+    while (cursor < rawReplacementText.size()) {
+        const auto ampersand = rawReplacementText.find('&', cursor);
+        if (ampersand == std::string_view::npos) {
+            normalized.append(rawReplacementText.data() + cursor, rawReplacementText.size() - cursor);
+            break;
+        }
+
+        normalized.append(rawReplacementText.data() + cursor, ampersand - cursor);
+        if (ampersand + 1 < rawReplacementText.size() && rawReplacementText[ampersand + 1] == '#') {
+            const auto semicolon = rawReplacementText.find(';', ampersand + 2);
+            if (semicolon == std::string_view::npos) {
+                Throw("Unterminated entity reference");
+            }
+
+            const std::string_view entity = rawReplacementText.substr(ampersand + 1, semicolon - ampersand - 1);
+            unsigned int codePoint = 0;
+            if (!TryParseNumericEntityReferenceCodePoint(entity, codePoint)) {
+                Throw("Invalid numeric entity reference: &" + std::string(entity) + ';');
+            }
+            AppendCodePointUtf8(normalized, codePoint);
+            cursor = semicolon + 1;
+            continue;
+        }
+
+        normalized.push_back('&');
+        cursor = ampersand + 1;
+    }
+
+    if (normalized.find('<') != std::string::npos) {
+        Throw("'<' is not allowed in attribute values");
+    }
+
+    const std::string expanded = DecodeEntityText(
+        normalized,
+        [this](const std::string& entity) -> std::optional<std::string> {
+            if (!dtdState_) {
+                return std::nullopt;
+            }
+            const auto found = dtdState_->entityDeclarations.find(entity);
+            return found == dtdState_->entityDeclarations.end() ? std::nullopt : std::optional<std::string>(found->second);
+        },
+        [this](const std::string& message) {
+            Throw(message);
+        });
+
+    if (expanded.find('<') != std::string::npos) {
+        Throw("'<' is not allowed in attribute values");
+    }
 }
 
 void XmlReader::QueueNode(
@@ -2314,7 +3620,8 @@ bool XmlReader::TryConsumeBufferedNode() {
         node.elementStart,
         node.contentStart,
         node.closeStart,
-        node.closeEnd);
+        node.closeEnd,
+        true);
     return true;
 }
 
@@ -2388,42 +3695,45 @@ void XmlReader::SetCurrentNode(
     std::size_t elementStart,
     std::size_t contentStart,
     std::size_t closeStart,
-    std::size_t closeEnd) {
+    std::size_t closeEnd,
+    bool namesAlreadyValidated) {
     if (nodeType == XmlNodeType::Element && !name.empty() && static_cast<unsigned char>(name[0]) == 0xCC) {
         name = "INVALID_NAME_MARKER";
     }
 
-    auto ensureValidXmlName = [this](std::string_view candidate) {
-        if (candidate.empty()) {
-            return;
+    if (!namesAlreadyValidated) {
+        auto ensureValidXmlName = [this](std::string_view candidate) {
+            if (candidate.empty()) {
+                return;
+            }
+
+            if (nameTable_.Get(candidate) != nullptr) {
+                return;
+            }
+
+            try {
+                (void)XmlConvert::VerifyName(candidate);
+            } catch (const XmlException&) {
+                Throw("Invalid XML name");
+            }
+        };
+
+        switch (nodeType) {
+        case XmlNodeType::Element:
+        case XmlNodeType::Attribute:
+        case XmlNodeType::EndElement:
+        case XmlNodeType::ProcessingInstruction:
+        case XmlNodeType::DocumentType:
+            ensureValidXmlName(name);
+            break;
+        default:
+            break;
         }
 
-        if (nameTable_.Get(candidate) != nullptr) {
-            return;
-        }
-
-        try {
-            (void)XmlConvert::VerifyName(candidate);
-        } catch (const XmlException&) {
-            Throw("Invalid XML name");
-        }
-    };
-
-    switch (nodeType) {
-    case XmlNodeType::Element:
-    case XmlNodeType::Attribute:
-    case XmlNodeType::EndElement:
-    case XmlNodeType::ProcessingInstruction:
-    case XmlNodeType::DocumentType:
-        ensureValidXmlName(name);
-        break;
-    default:
-        break;
-    }
-
-    if (nodeType == XmlNodeType::Element) {
-        for (const auto& attribute : attributes) {
-            ensureValidXmlName(attribute.first);
+        if (nodeType == XmlNodeType::Element) {
+            for (const auto& attribute : attributes) {
+                ensureValidXmlName(attribute.first);
+            }
         }
     }
 
@@ -2543,11 +3853,15 @@ void XmlReader::ParseDeclaration() {
     bool sawStandalone = false;
 
     while (true) {
+        const auto beforeWhitespace = position_;
         SkipWhitespace();
         if (tokenizer.StartsWith(position_, "?>")) {
             position_ += 2;
             linePosition_ += 2;
             break;
+        }
+        if (position_ == beforeWhitespace) {
+            Throw("Malformed XML declaration");
         }
 
         const auto attributeStart = position_;
@@ -2596,6 +3910,15 @@ void XmlReader::ParseDeclaration() {
             }
             sawEncoding = true;
             ValidateXmlDeclarationEncoding(value);
+            if (IsUtf16EncodingDeclaration(value) && !sourceWasUtf16_) {
+                Throw("Malformed XML declaration");
+            }
+            if (sourceWasUtf16_ && !IsUtf16EncodingDeclaration(value)) {
+                Throw("Malformed XML declaration");
+            }
+            if (sourceWasUtf8Bom_ && !IsUtf8EncodingDeclaration(value)) {
+                Throw("Malformed XML declaration");
+            }
             encoding = value;
         } else if (name == "standalone") {
             if (!sawVersion) {
@@ -2632,7 +3955,14 @@ void XmlReader::ParseDeclaration() {
         std::string::npos,
         std::string::npos,
         start,
-        position_);
+        position_,
+        {},
+        {},
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        true);
     SetCurrentNameParts({}, "xml");
     currentDeclarationVersion_ = declaration.Version();
     currentDeclarationEncoding_ = declaration.Encoding();
@@ -2663,7 +3993,13 @@ void XmlReader::ParseDocumentType() {
     if (tokenizer.StartsWith(position_, "PUBLIC")) {
         position_ += 6;
         linePosition_ += 6;
+        const auto publicWhitespaceStart = position_;
         SkipWhitespace();
+        if (position_ == publicWhitespaceStart
+            && HasSourceChar(position_)
+            && (SourceCharAt(position_) == '\'' || SourceCharAt(position_) == '"')) {
+            Throw("Malformed DOCTYPE declaration");
+        }
         const auto publicLiteralStart = position_;
         std::size_t cursor = position_;
         auto publicIdToken = tokenizer.ParseQuotedLiteral(cursor);
@@ -2677,10 +4013,18 @@ void XmlReader::ParseDocumentType() {
             Throw("Expected quoted value");
         }
         publicId = publicIdToken.rawValue;
+        if (!IsValidPublicIdentifierLiteral(publicId)) {
+            Throw("Malformed DOCTYPE declaration");
+        }
 
         const auto betweenIdsStart = position_;
         tokenizer.SkipWhitespace(position_);
         AdvanceLineInfoFromInputSource(inputSource_.get(), betweenIdsStart, position_, lineNumber_, linePosition_);
+        if (position_ == betweenIdsStart
+            && HasSourceChar(position_)
+            && (SourceCharAt(position_) == '\'' || SourceCharAt(position_) == '"')) {
+            Throw("Malformed DOCTYPE declaration");
+        }
         const auto systemLiteralStart = position_;
         cursor = position_;
         auto systemIdToken = tokenizer.ParseQuotedLiteral(cursor);
@@ -2720,9 +4064,9 @@ void XmlReader::ParseDocumentType() {
         dtdState_->externalSubsetDeclarationsLoaded = false;
     }
 
-    if (!systemId.empty()) {
-        LoadExternalSubsetDeclarations(systemId);
-    }
+    std::unordered_map<std::string, std::string> parameterEntityDeclarations;
+    std::unordered_map<std::string, std::string> externalParameterEntitySystemLiterals;
+    std::unordered_set<std::string> externalParameterEntityNames;
 
     if (Peek() == '[') {
         ++position_;
@@ -2736,24 +4080,48 @@ void XmlReader::ParseDocumentType() {
         AdvanceLineInfoFromInputSource(inputSource_.get(), subsetStart, position_, lineNumber_, linePosition_);
         internalSubset = Trim(SourceSubstr(subsetStart, subsetEnd - subsetStart));
         if (settings_.DtdProcessing == DtdProcessing::Parse) {
+            CollectDtdParameterEntityDeclarations(
+                internalSubset,
+                parameterEntityDeclarations,
+                false,
+                &externalParameterEntitySystemLiterals);
+            LoadExternalParameterEntityDeclarations(
+                externalParameterEntitySystemLiterals,
+                baseUri_,
+                parameterEntityDeclarations,
+                externalParameterEntityNames);
+            ValidateInternalSubsetParameterEntityPlacement(internalSubset);
+            ValidateTopLevelParameterEntityReferenceBoundaries(
+                internalSubset,
+                parameterEntityDeclarations,
+                false,
+                &externalParameterEntityNames);
+            const std::string expandedInternalSubset = ExpandDtdParameterEntityReferences(
+                internalSubset,
+                parameterEntityDeclarations,
+                false,
+                &externalParameterEntityNames);
+            const bool allowConditionalSections = !externalParameterEntityNames.empty();
             std::vector<std::shared_ptr<XmlNode>> entities;
             std::vector<std::shared_ptr<XmlNode>> notations;
-            ParseDocumentTypeInternalSubset(internalSubset, entities, notations);
+            ParseDocumentTypeInternalSubset(expandedInternalSubset, entities, notations, allowConditionalSections);
             RegisterDtdDeclarations(entities, notations);
 
             DtdRequiredAttributeDeclarations requiredAttributes;
             DtdDefaultAttributeDeclarations defaultAttributes;
             DtdFixedAttributeDeclarations fixedAttributes;
             DtdEnumeratedAttributeDeclarations enumeratedAttributes;
-            DtdEmptyElementDeclarations emptyElementDeclarations;
+            DtdElementContentDeclarations elementContentDeclarations;
+            DtdDeclaredAttributeNames declaredAttributes;
             DtdIdAttributeDeclarations idAttributes;
             DtdNotationAttributeDeclarations notationAttributes;
             DtdNmTokenAttributeDeclarations nmTokenAttributes;
             DtdNameAttributeDeclarations nameAttributes;
-            ParseDocumentTypeEmptyElementDeclarations(internalSubset, emptyElementDeclarations);
-            ParseDocumentTypeAttributeDeclarations(internalSubset, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes);
-            EnsureDtdState().emptyElementDeclarations.insert(emptyElementDeclarations.begin(), emptyElementDeclarations.end());
-            RegisterDtdAttributeDeclarations(idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes);
+            ParseDocumentTypeElementDeclarations(expandedInternalSubset, elementContentDeclarations, allowConditionalSections);
+            ParseDocumentTypeAttributeDeclarations(expandedInternalSubset, declaredAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, allowConditionalSections);
+            ValidateDtdDeclaredAttributeValueReferenceOrder(expandedInternalSubset, allowConditionalSections);
+            RegisterDtdElementDeclarations(elementContentDeclarations);
+            RegisterDtdAttributeDeclarations(declaredAttributes, idAttributes, notationAttributes, nmTokenAttributes, nameAttributes, requiredAttributes, defaultAttributes, fixedAttributes, enumeratedAttributes);
         }
         SkipWhitespace();
     }
@@ -2767,14 +4135,14 @@ void XmlReader::ParseDocumentType() {
         EnsureDtdState().externalSubsetSystemId = declaration.systemId;
         if (!dtdState_->externalSubsetDeclarationsLoaded
             || (dtdState_->declaredEntityNames.empty() && dtdState_->parsedEntities.empty() && dtdState_->parsedNotations.empty())) {
-            LoadExternalSubsetDeclarations(declaration.systemId);
+            LoadExternalSubsetDeclarations(declaration.systemId, &parameterEntityDeclarations);
         }
     }
 
     if ((dtdState_ == nullptr || (dtdState_->declaredEntityNames.empty()
             && dtdState_->parsedEntities.empty() && dtdState_->parsedNotations.empty()))
         && settings_.DtdProcessing == DtdProcessing::Parse && settings_.Resolver != nullptr) {
-        LoadExternalSubsetDeclarations(declaration.systemId);
+        LoadExternalSubsetDeclarations(declaration.systemId, &parameterEntityDeclarations);
     }
 
     SetCurrentNode(
@@ -2789,7 +4157,14 @@ void XmlReader::ParseDocumentType() {
         std::string::npos,
         std::string::npos,
         start,
-        position_);
+        position_,
+        {},
+        {},
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        true);
     SetCurrentNameParts({}, currentName_);
     documentTypeName_ = currentName_;
     sawDocumentType_ = true;
@@ -2797,10 +4172,24 @@ void XmlReader::ParseDocumentType() {
 
 void XmlReader::ParseProcessingInstruction() {
     XmlReaderTokenizer tokenizer(inputSource_.get());
+    if (!elementStack_.empty() && dtdState_ != nullptr
+        && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
+        throw XmlException(
+            "DTD validation failed: element '" + elementStack_.back() + "' declared EMPTY must not contain processing instructions");
+    }
     const auto start = position_;
     position_ += 2;
     linePosition_ += 2;
     const std::string target = ParseName();
+    if (!IsNamespaceAwareProcessingInstructionTarget(target)) {
+        Throw("Invalid XML name");
+    }
+    if (IsReservedXmlProcessingTarget(target)) {
+        Throw("XML declaration is only allowed at the beginning of the document");
+    }
+    if (HasSourceChar(position_) && !StartsWith("?>") && !IsWhitespace(Peek())) {
+        Throw("Malformed processing instruction");
+    }
     std::size_t dataStart = std::string::npos;
     std::size_t dataEnd = std::string::npos;
     if (!StartsWith("?>")) {
@@ -2808,11 +4197,8 @@ void XmlReader::ParseProcessingInstruction() {
         if (end == std::string::npos) {
             Throw("Unterminated processing instruction");
         }
-        for (std::size_t probe = position_; probe < end; ++probe) {
-            if (!XmlConvert::IsXmlChar(SourceCharAt(probe))) {
-                const auto [line, column] = ComputeLineColumn(probe);
-                throw XmlException("Invalid XML character", line, column);
-            }
+        for (std::size_t probe = position_; probe < end;) {
+            probe += ValidateXmlCharacterAt(probe);
         }
         dataStart = position_;
         dataEnd = end;
@@ -2841,7 +4227,14 @@ void XmlReader::ParseProcessingInstruction() {
         dataStart,
         dataEnd,
         start,
-        position_);
+        position_,
+        {},
+        {},
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        true);
     {
         const auto [prefixView, localNameView] = SplitQualifiedNameView(currentName_);
         SetCurrentNameParts(prefixView, localNameView);
@@ -2850,6 +4243,11 @@ void XmlReader::ParseProcessingInstruction() {
 
 void XmlReader::ParseComment() {
     XmlReaderTokenizer tokenizer(inputSource_.get());
+    if (!elementStack_.empty() && dtdState_ != nullptr
+        && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
+        throw XmlException(
+            "DTD validation failed: element '" + elementStack_.back() + "' declared EMPTY must not contain comments");
+    }
     const auto start = position_;
     const auto end = tokenizer.ScanDelimitedSectionEnd(position_ + 4, "-->");
     if (end == std::string::npos) {
@@ -2857,11 +4255,8 @@ void XmlReader::ParseComment() {
         throw XmlException("Unterminated comment", line, column);
     }
     const auto valueStart = position_ + 4;
-    for (std::size_t probe = valueStart; probe < end; ++probe) {
-        if (!XmlConvert::IsXmlChar(SourceCharAt(probe))) {
-            const auto [line, column] = ComputeLineColumn(probe);
-            throw XmlException("Invalid XML character", line, column);
-        }
+    for (std::size_t probe = valueStart; probe < end;) {
+        probe += ValidateXmlCharacterAt(probe);
     }
     const std::string commentValue = SourceSubstr(valueStart, end - valueStart);
     const auto invalidDoubleHyphen = commentValue.find("--");
@@ -2869,11 +4264,15 @@ void XmlReader::ParseComment() {
             const auto [line, column] = ComputeLineColumn(valueStart + invalidDoubleHyphen);
             throw XmlException("Comment may not contain '--'", line, column);
     }
+    if (end > valueStart && SourceCharAt(end - 1) == '-') {
+        const auto [line, column] = ComputeLineColumn(end - 1);
+        throw XmlException("Comment may not contain '--'", line, column);
+    }
     const auto valueEnd = end;
     position_ = end + 3;
     AdvanceLineInfoFromInputSource(inputSource_.get(), start, position_, lineNumber_, linePosition_);
 
-    SetCurrentNode(XmlNodeType::Comment, {}, {}, {}, static_cast<int>(elementStack_.size()), false, {}, {}, valueStart, valueEnd, start, position_);
+    SetCurrentNode(XmlNodeType::Comment, {}, {}, {}, static_cast<int>(elementStack_.size()), false, {}, {}, valueStart, valueEnd, start, position_, {}, {}, std::string::npos, std::string::npos, std::string::npos, std::string::npos, true);
 }
 
 void XmlReader::ParseCData() {
@@ -2886,10 +4285,8 @@ void XmlReader::ParseCData() {
     }
     const auto valueStart = position_ + 9;
     const auto valueEnd = end;
-    const auto invalidDoubleHyphen = SourceSubstr(valueStart, end - valueStart).find("--", 0);
-    if (invalidDoubleHyphen != std::string_view::npos) {
-        const auto [line, column] = ComputeLineColumn(valueStart + invalidDoubleHyphen);
-        throw XmlException("Comment may not contain '--'", line, column);
+    for (std::size_t probe = valueStart; probe < valueEnd;) {
+        probe += ValidateXmlCharacterAt(probe);
     }
     if (!elementStack_.empty() && dtdState_ != nullptr
         && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
@@ -2899,12 +4296,25 @@ void XmlReader::ParseCData() {
     position_ = end + 3;
     AdvanceLineInfoFromInputSource(inputSource_.get(), start, position_, lineNumber_, linePosition_);
 
-    SetCurrentNode(XmlNodeType::CDATA, {}, {}, {}, static_cast<int>(elementStack_.size()), false, {}, {}, valueStart, valueEnd, start, position_);
+    bool hasNonWhitespaceContent = false;
+    for (std::size_t probe = valueStart; probe < valueEnd; ++probe) {
+        if (!IsWhitespace(SourceCharAt(probe))) {
+            hasNonWhitespaceContent = true;
+            break;
+        }
+    }
+    if (valueEnd > valueStart) {
+        RecordTextForDtdValidation(!hasNonWhitespaceContent, false);
+    }
+
+    SetCurrentNode(XmlNodeType::CDATA, {}, {}, {}, static_cast<int>(elementStack_.size()), false, {}, {}, valueStart, valueEnd, start, position_, {}, {}, std::string::npos, std::string::npos, std::string::npos, std::string::npos, true);
 }
 
 void XmlReader::ParseText() {
     XmlReaderTokenizer tokenizer(inputSource_.get());
-    EnsureExternalSubsetDeclarationsLoaded();
+    if (dtdState_ != nullptr) {
+        EnsureExternalSubsetDeclarationsLoaded();
+    }
     if (!elementStack_.empty() && dtdState_ != nullptr
         && dtdState_->emptyElementDeclarations.find(elementStack_.back()) != dtdState_->emptyElementDeclarations.end()) {
         throw XmlException(
@@ -2916,14 +4326,35 @@ void XmlReader::ParseText() {
     std::size_t rawSegmentStart = std::string::npos;
     bool textBufferMaterialized = false;
     bool rawSegmentKnownNonWhitespace = false;
+    bool textBufferIncludesNonSWhitespace = false;
 
-    auto isWhitespaceOnlySourceRange = [&](std::size_t start, std::size_t end) {
-        for (std::size_t index = start; index < end; ++index) {
-            if (!IsWhitespace(SourceCharAt(index))) {
-                return false;
-            }
+    auto scanAsciiTextChunk = [this](std::size_t start, bool& sawNonWhitespace) {
+        std::size_t available = 0;
+        const char* chunk = SourcePtrAt(start, available);
+        if (chunk == nullptr || available == 0) {
+            return start;
         }
-        return true;
+
+        std::size_t offset = 0;
+        while (offset < available) {
+            const unsigned char ch = static_cast<unsigned char>(chunk[offset]);
+            if (ch == '<' || ch == '&' || ch == '\n' || ch == ']') {
+                break;
+            }
+            if (ch >= 0x80) {
+                break;
+            }
+            if (!(ch == 0x09 || ch == 0x0D || ch >= 0x20)) {
+                const auto [line, column] = ComputeLineColumn(start + offset);
+                throw XmlException("Invalid XML character", line, column);
+            }
+            if (!sawNonWhitespace && !IsWhitespace(static_cast<char>(ch))) {
+                sawNonWhitespace = true;
+            }
+            ++offset;
+        }
+
+        return start + offset;
     };
 
     auto flushText = [&](std::size_t segmentEnd) {
@@ -2934,10 +4365,8 @@ void XmlReader::ParseText() {
         bool isWhitespaceOnly = false;
         if (textBufferMaterialized) {
             isWhitespaceOnly = IsWhitespaceOnly(textBuffer);
-        } else if (rawSegmentKnownNonWhitespace) {
-            isWhitespaceOnly = false;
         } else {
-            isWhitespaceOnly = isWhitespaceOnlySourceRange(rawSegmentStart, segmentEnd);
+            isWhitespaceOnly = !rawSegmentKnownNonWhitespace;
         }
 
         XmlNodeType nodeType = XmlNodeType::Text;
@@ -2950,18 +4379,17 @@ void XmlReader::ParseText() {
         } else {
             QueueNode(nodeType, {}, {}, {}, textDepth, false, {}, {}, rawSegmentStart, segmentEnd, rawSegmentStart, segmentEnd);
         }
+        if (segmentEnd > rawSegmentStart) {
+            RecordTextForDtdValidation(isWhitespaceOnly, isWhitespaceOnly && !textBufferIncludesNonSWhitespace);
+        }
         textBuffer.clear();
         rawSegmentStart = std::string::npos;
         textBufferMaterialized = false;
         rawSegmentKnownNonWhitespace = false;
+        textBufferIncludesNonSWhitespace = false;
     };
 
     while (HasSourceChar(position_) && SourceCharAt(position_) != '<') {
-        if (!XmlConvert::IsXmlChar(SourceCharAt(position_))) {
-            const auto [line, column] = ComputeLineColumn(position_);
-            throw XmlException("Invalid XML character", line, column);
-        }
-
         if (tokenizer.StartsWith(position_, "]]>") ) {
             const auto [line, column] = ComputeLineColumn(position_);
             throw XmlException("']]>' is not allowed in text content", line, column);
@@ -2969,27 +4397,37 @@ void XmlReader::ParseText() {
 
         if (SourceCharAt(position_) != '&') {
             std::size_t segmentEnd = position_;
-            while (HasSourceChar(segmentEnd)
-                && SourceCharAt(segmentEnd) != '\n'
-                && SourceCharAt(segmentEnd) != '<'
-                && SourceCharAt(segmentEnd) != '&') {
-                if (SourceCharAt(segmentEnd) == ']'
+            bool segmentHasNonWhitespace = false;
+            while (HasSourceChar(segmentEnd)) {
+                const std::size_t asciiSegmentEnd = scanAsciiTextChunk(segmentEnd, segmentHasNonWhitespace);
+                if (asciiSegmentEnd != segmentEnd) {
+                    segmentEnd = asciiSegmentEnd;
+                    continue;
+                }
+
+                const char segmentChar = SourceCharAt(segmentEnd);
+                if (segmentChar == '\0'
+                    || segmentChar == '\n'
+                    || segmentChar == '<'
+                    || segmentChar == '&') {
+                    break;
+                }
+                if (segmentChar == ']'
                     && tokenizer.StartsWith(segmentEnd, "]]>") ) {
                     const auto [line, column] = ComputeLineColumn(segmentEnd);
                     throw XmlException("']]>' is not allowed in text content", line, column);
                 }
-                if (!XmlConvert::IsXmlChar(SourceCharAt(segmentEnd))) {
-                    const auto [line, column] = ComputeLineColumn(segmentEnd);
-                    throw XmlException("Invalid XML character", line, column);
+                if (!segmentHasNonWhitespace && !IsWhitespace(segmentChar)) {
+                    segmentHasNonWhitespace = true;
                 }
-                ++segmentEnd;
+                segmentEnd += ValidateXmlCharacterAt(segmentEnd);
             }
 
             if (segmentEnd > position_) {
                 if (rawSegmentStart == std::string::npos) {
                     rawSegmentStart = position_;
                 }
-                if (!rawSegmentKnownNonWhitespace && !IsWhitespace(SourceCharAt(position_))) {
+                if (!rawSegmentKnownNonWhitespace && segmentHasNonWhitespace) {
                     rawSegmentKnownNonWhitespace = true;
                 }
                 if (textBufferMaterialized) {
@@ -3056,6 +4494,9 @@ void XmlReader::ParseText() {
                 Throw("Invalid numeric entity reference: &" + entity + ';');
             }
             AppendCodePointUtf8(textBuffer, codePoint);
+            if (IsXmlWhitespaceCodePoint(codePoint)) {
+                textBufferIncludesNonSWhitespace = true;
+            }
             continue;
         }
 
@@ -3068,6 +4509,11 @@ void XmlReader::ParseText() {
         std::string resolvedValue;
         const auto declared = dtdState_->entityDeclarations.find(entity);
         if (declared != dtdState_->entityDeclarations.end()) {
+            if (documentDeclarationStandalone_ == "yes"
+                && dtdState_->externalSubsetEntityNames.find(entity) != dtdState_->externalSubsetEntityNames.end()) {
+                Throw("Standalone document declaration must not use external general entity references");
+            }
+            ValidateParsedEntityReplacementText(declared->second);
             resolvedValue = DecodeEntityText(
                 declared->second,
                 [this](const std::string& nestedEntity) -> std::optional<std::string> {
@@ -3090,14 +4536,52 @@ void XmlReader::ParseText() {
                     throw XmlException(
                         "Standalone document declaration must not use external general entity references");
                 }
+                if (std::find(activeExternalEntityNames_.begin(), activeExternalEntityNames_.end(), entity)
+                    != activeExternalEntityNames_.end()) {
+                    Throw("Entity reference cycle detected: &" + entity + ';');
+                }
                 const std::string absoluteUri = settings_.Resolver->ResolveUri(baseUri_, external->second);
-                resolvedValue = settings_.Resolver->GetEntity(absoluteUri);
+                const std::string rawResolvedValue = NormalizeBomEncodedXmlText(settings_.Resolver->GetEntity(absoluteUri));
                 if (settings_.MaxCharactersFromEntities != 0) {
-                    entityCharactersRead_ += resolvedValue.size();
+                    entityCharactersRead_ += rawResolvedValue.size();
                     if (entityCharactersRead_ > settings_.MaxCharactersFromEntities) {
                         Throw("The XML document exceeds the configured MaxCharactersFromEntities limit");
                     }
                 }
+
+                activeExternalEntityNames_.push_back(entity);
+                try {
+                    std::string_view validatedValue(rawResolvedValue);
+                    const std::size_t textDeclarationEnd = ConsumeLeadingTextDeclarationIfPresent(validatedValue);
+                    if (textDeclarationEnd != 0) {
+                        validatedValue.remove_prefix(textDeclarationEnd);
+                    }
+
+                    if (!validatedValue.empty()) {
+                        XmlReaderSettings fragmentSettings = settings_;
+                        fragmentSettings.Conformance = ConformanceLevel::Fragment;
+                        fragmentSettings.Validation = ValidationType::None;
+
+                        auto fragmentSource = std::make_shared<const std::string>(std::string(validatedValue));
+                        XmlReader fragmentReader = CreateFromValidatedString(fragmentSource, fragmentSettings);
+                        if (dtdState_ != nullptr) {
+                            fragmentReader.dtdState_ = std::make_unique<DtdState>(*dtdState_);
+                        }
+                        fragmentReader.documentDeclarationStandalone_ = documentDeclarationStandalone_;
+                        fragmentReader.baseUri_ = baseUri_;
+                        fragmentReader.baseUriNeedsResolution_ = baseUriNeedsResolution_;
+                        fragmentReader.activeExternalEntityNames_ = activeExternalEntityNames_;
+
+                        while (fragmentReader.Read()) {
+                        }
+                    }
+
+                    resolvedValue.assign(validatedValue.data(), validatedValue.size());
+                } catch (...) {
+                    activeExternalEntityNames_.pop_back();
+                    throw;
+                }
+                activeExternalEntityNames_.pop_back();
             }
         }
 
@@ -3107,6 +4591,13 @@ void XmlReader::ParseText() {
                 ? (preserveSpace ? XmlNodeType::SignificantWhitespace : XmlNodeType::Whitespace)
                 : XmlNodeType::Text;
             QueueNode(resolvedNodeType, {}, {}, resolvedValue, textDepth + 1, false, {}, resolvedValue);
+            if (resolvedValue.find('<') == std::string::npos) {
+                bool isWhitespaceOnly = false;
+                bool matchesElementContentWhitespace = false;
+                if (TryClassifyElementContentTextValue(resolvedValue, isWhitespaceOnly, matchesElementContentWhitespace)) {
+                    RecordTextForDtdValidation(isWhitespaceOnly, matchesElementContentWhitespace);
+                }
+            }
         }
         QueueNode(XmlNodeType::EndEntity, entity, {}, {}, textDepth, false, {}, {}, std::string::npos, std::string::npos, entityStart, entityToken.end);
     }
@@ -3366,6 +4857,9 @@ std::pair<std::string, std::string> XmlReader::CaptureElementXml(
 void XmlReader::ParseElement() {
     XmlReaderTokenizer tokenizer(inputSource_.get());
     const auto start = position_;
+    if (dtdState_ != nullptr) {
+        EnsureExternalSubsetDeclarationsLoaded();
+    }
     ReadChar();
     std::string name = ParseName();
     if (!elementStack_.empty() && dtdState_ != nullptr
@@ -3373,7 +4867,15 @@ void XmlReader::ParseElement() {
         throw XmlException(
             "DTD validation failed: element '" + elementStack_.back() + "' declared EMPTY must not contain child elements");
     }
+    if (dtdState_ != nullptr
+        && !dtdState_->elementContentDeclarations.empty()
+        && dtdState_->elementContentDeclarations.find(name) == dtdState_->elementContentDeclarations.end()) {
+        throw XmlException("DTD validation failed: element '" + name + "' was not declared");
+    }
     const auto [elementPrefixView, elementLocalNameView] = SplitQualifiedNameView(name);
+    if (!IsValidXmlQualifiedName(name) || elementPrefixView == "xmlns") {
+        Throw("Invalid XML name");
+    }
     const bool topLevelElement = elementStack_.empty();
     std::vector<std::pair<std::string, std::string>> attributes;
     std::vector<AttributeValueMetadata> attributeValueMetadata;
@@ -3421,7 +4923,20 @@ void XmlReader::ParseElement() {
         return true;
     };
 
-    auto applyXmlSpaceFromAttributes = [this, &attributes, &attributeValueMetadata, &preserveSpace, &sourceRangeEqualsLiteral]() {
+    auto applyXmlSpaceValue = [this, &preserveSpace](std::string_view value) {
+        if (value == "preserve") {
+            preserveSpace = true;
+            return;
+        }
+        if (value == "default") {
+            preserveSpace = false;
+            return;
+        }
+
+        Throw("xml:space must be 'default' or 'preserve'");
+    };
+
+    auto applyXmlSpaceFromAttributes = [this, &attributes, &attributeValueMetadata, &sourceRangeEqualsLiteral, &applyXmlSpaceValue]() {
         for (std::size_t index = 0; index < attributes.size(); ++index) {
             if (attributes[index].first != "xml:space") {
                 continue;
@@ -3429,29 +4944,189 @@ void XmlReader::ParseElement() {
 
             const auto& metadata = attributeValueMetadata[index];
             if (metadata.valueStart == std::string::npos || metadata.valueEnd == std::string::npos) {
-                if (IsXmlSpacePreserve(attributes[index].second)) {
-                    preserveSpace = true;
-                } else if (IsXmlSpaceDefault(attributes[index].second)) {
-                    preserveSpace = false;
-                }
+                applyXmlSpaceValue(attributes[index].second);
                 continue;
             }
 
             if ((metadata.flags & kAttributeValueNeedsDecoding) == 0) {
                 if (sourceRangeEqualsLiteral(metadata.valueStart, metadata.valueEnd, "preserve")) {
-                    preserveSpace = true;
+                    applyXmlSpaceValue("preserve");
                 } else if (sourceRangeEqualsLiteral(metadata.valueStart, metadata.valueEnd, "default")) {
-                    preserveSpace = false;
+                    applyXmlSpaceValue("default");
+                } else {
+                    Throw("xml:space must be 'default' or 'preserve'");
                 }
                 continue;
             }
 
             std::string attributeValue = SourceSubstr(metadata.valueStart, metadata.valueEnd - metadata.valueStart);
             attributeValue = DecodeEntities(attributeValue);
-            if (IsXmlSpacePreserve(attributeValue)) {
-                preserveSpace = true;
-            } else if (IsXmlSpaceDefault(attributeValue)) {
-                preserveSpace = false;
+            applyXmlSpaceValue(attributeValue);
+        }
+    };
+
+    auto validateAttributeEntityReplacementTexts = [this, &tokenizer](std::size_t valueStart, std::size_t valueEnd) {
+        if (dtdState_ == nullptr || valueStart == std::string::npos || valueEnd == std::string::npos || valueEnd <= valueStart) {
+            return;
+        }
+
+        std::size_t scan = valueStart;
+        while (scan < valueEnd) {
+            const auto ampersand = FindInSource("&", scan);
+            if (ampersand == std::string::npos || ampersand >= valueEnd) {
+                break;
+            }
+
+            const auto entityToken = tokenizer.ScanEntityReference(ampersand);
+            if (entityToken.end == std::string::npos || entityToken.end > valueEnd) {
+                Throw("Unterminated entity reference");
+            }
+
+            const std::string entity = entityToken.name;
+            if (ResolvePredefinedEntityReferenceValueView(entity).empty()
+                && (entity.empty() || entity.front() != '#')) {
+                const auto declared = dtdState_->entityDeclarations.find(entity);
+                if (declared != dtdState_->entityDeclarations.end()) {
+                    ValidateAttributeEntityReplacementText(declared->second);
+                }
+            }
+
+            scan = entityToken.end;
+        }
+    };
+
+    auto namespaceDeclarationUsesTokenizedType = [this, &name](std::string_view attributeName) {
+        if (dtdState_ == nullptr) {
+            return false;
+        }
+
+        const std::string elementName(name);
+        if (const auto idIt = dtdState_->idAttributes.find(elementName);
+            idIt != dtdState_->idAttributes.end() && idIt->second == attributeName) {
+            return true;
+        }
+        if (const auto notationIt = dtdState_->notationAttributes.find(elementName);
+            notationIt != dtdState_->notationAttributes.end() && notationIt->second == attributeName) {
+            return true;
+        }
+        if (const auto nmTokenIt = dtdState_->nmTokenAttributes.find(elementName);
+            nmTokenIt != dtdState_->nmTokenAttributes.end()
+                && nmTokenIt->second.find(std::string(attributeName)) != nmTokenIt->second.end()) {
+            return true;
+        }
+        if (const auto nameIt = dtdState_->nameAttributes.find(elementName);
+            nameIt != dtdState_->nameAttributes.end()
+                && nameIt->second.find(std::string(attributeName)) != nameIt->second.end()) {
+            return true;
+        }
+        if (const auto enumeratedIt = dtdState_->enumeratedAttributes.find(elementName);
+            enumeratedIt != dtdState_->enumeratedAttributes.end()
+                && enumeratedIt->second.find(std::string(attributeName)) != enumeratedIt->second.end()) {
+            return true;
+        }
+
+        return false;
+    };
+
+    auto normalizeNamespaceDeclarationValue = [&namespaceDeclarationUsesTokenizedType](std::string_view attributeName, std::string value) {
+        if (namespaceDeclarationUsesTokenizedType(attributeName)) {
+            return NormalizeXmlAttributeWhitespace(value);
+        }
+        return value;
+    };
+
+    auto materializeNamespaceDeclarationValue = [this, &attributes, &attributeValueMetadata, &normalizeNamespaceDeclarationValue](std::size_t index) {
+        if (index >= attributes.size()) {
+            return std::string{};
+        }
+        if (index >= attributeValueMetadata.size()) {
+            return normalizeNamespaceDeclarationValue(attributes[index].first, attributes[index].second);
+        }
+
+        const auto& metadata = attributeValueMetadata[index];
+        if (metadata.valueStart == std::string::npos || metadata.valueEnd == std::string::npos) {
+            return normalizeNamespaceDeclarationValue(attributes[index].first, attributes[index].second);
+        }
+
+        std::string value = SourceSubstr(metadata.valueStart, metadata.valueEnd - metadata.valueStart);
+        if ((metadata.flags & kAttributeValueNeedsDecoding) != 0) {
+            value = DecodeEntities(value);
+        }
+        return normalizeNamespaceDeclarationValue(attributes[index].first, std::move(value));
+    };
+
+    auto applyNamespaceDeclarationAttributes = [this, &attributes, &attributeValueMetadata, &localNamespaceDeclarations, &setLocalNamespaceDeclaration, &materializeNamespaceDeclarationValue]() {
+        for (std::size_t index = 0; index < attributes.size(); ++index) {
+            const std::string& attributeName = attributes[index].first;
+            if (!IsNamespaceDeclarationName(attributeName)) {
+                continue;
+            }
+
+            const std::string_view prefix = NamespaceDeclarationPrefixView(attributeName);
+            bool alreadyBound = false;
+            for (const auto& entry : localNamespaceDeclarations) {
+                if (std::string_view(entry.first) == prefix) {
+                    alreadyBound = true;
+                    break;
+                }
+            }
+            if (alreadyBound) {
+                continue;
+            }
+
+            std::string value = materializeNamespaceDeclarationValue(index);
+            ValidateNamespaceDeclarationBinding(prefix, value);
+            setLocalNamespaceDeclaration(std::string(prefix), std::move(value));
+        }
+    };
+
+    auto validateNamespaceAwareNames = [this, &attributes, &lookupNamespaceInScopes](std::string_view currentElementPrefix) {
+        if (!currentElementPrefix.empty() && lookupNamespaceInScopes(currentElementPrefix).empty()) {
+            Throw("Undeclared namespace prefix '" + std::string(currentElementPrefix) + "'");
+        }
+
+        std::vector<std::pair<std::string, std::string>> expandedAttributeNames;
+        expandedAttributeNames.reserve(attributes.size());
+        for (const auto& attribute : attributes) {
+            const std::string& attributeName = attribute.first;
+            const auto [attributePrefix, attributeLocalName] = SplitQualifiedNameView(attributeName);
+            if (!IsValidXmlQualifiedName(attributeName)
+                || (attributePrefix == "xmlns" && !IsNamespaceDeclarationName(attributeName))) {
+                Throw("Invalid XML name");
+            }
+
+            std::string namespaceUri;
+            if (attributeName == "xmlns" || attributePrefix == "xmlns") {
+                namespaceUri = "http://www.w3.org/2000/xmlns/";
+            } else if (!attributePrefix.empty()) {
+                namespaceUri = lookupNamespaceInScopes(attributePrefix);
+                if (namespaceUri.empty()) {
+                    Throw("Undeclared namespace prefix '" + std::string(attributePrefix) + "'");
+                }
+            }
+
+            for (const auto& expanded : expandedAttributeNames) {
+                if (expanded.first == namespaceUri && expanded.second == attributeLocalName) {
+                    Throw("Duplicate attribute '" + attributeName + "'");
+                }
+            }
+            expandedAttributeNames.emplace_back(std::move(namespaceUri), std::string(attributeLocalName));
+        }
+    };
+
+    auto validateDtdDeclaredAttributes = [this, &attributes, &name]() {
+        if (dtdState_ == nullptr || dtdState_->elementContentDeclarations.empty()) {
+            return;
+        }
+
+        const auto elementDeclarations = dtdState_->declaredAttributes.find(name);
+        for (const auto& attribute : attributes) {
+            const bool declared = elementDeclarations != dtdState_->declaredAttributes.end()
+                && elementDeclarations->second.find(attribute.first) != elementDeclarations->second.end();
+            if (!declared) {
+                throw XmlException(
+                    "DTD validation failed: attribute '" + attribute.first
+                    + "' on element '" + name + "' was not declared");
             }
         }
     };
@@ -3465,10 +5140,27 @@ void XmlReader::ParseElement() {
         if (tokenizer.ConsumeStartTagClose(position_, isEmptyElement)) {
             AdvanceLineInfoFromInputSource(inputSource_.get(), closeStart, position_, lineNumber_, linePosition_);
             if (isEmptyElement) {
-                ApplyDtdAttributeDeclarations(name, attributes, attributeValueMetadata, retainLocalNamespaceDeclarationsForAttributes);
-                applyXmlSpaceFromAttributes();
+                const bool requiresAttributePostProcessing = ApplyDtdAttributeDeclarations(
+                    name,
+                    attributes,
+                    attributeValueMetadata,
+                    retainLocalNamespaceDeclarationsForAttributes);
+                if (requiresAttributePostProcessing) {
+                    applyNamespaceDeclarationAttributes();
+                    applyXmlSpaceFromAttributes();
+                }
                 if (topLevelElement && !documentTypeName_.empty() && name != documentTypeName_) {
                     Throw("Document type name '" + documentTypeName_ + "' does not match root element name '" + name + "'");
+                }
+                validateNamespaceAwareNames(elementPrefixView);
+                validateDtdDeclaredAttributes();
+                if (dtdState_ != nullptr
+                    && !dtdState_->elementContentDeclarations.empty()
+                    && !topLevelElement) {
+                    RecordChildElementForDtdValidation(name);
+                }
+                if (dtdState_ != nullptr && !dtdState_->elementContentDeclarations.empty()) {
+                    ValidateElementDtdContent(name, ElementContentValidationFrame{});
                 }
                 std::string nsUri = lookupNamespaceInScopes(elementPrefixView);
                 SetCurrentNode(
@@ -3487,7 +5179,10 @@ void XmlReader::ParseElement() {
                     std::move(attributes),
                     {},
                     start,
-                    position_);
+                    position_,
+                    std::string::npos,
+                    std::string::npos,
+                    true);
                 currentLocalNamespaceDeclarations_ = localNamespaceDeclarations;
                 currentAttributeValueMetadata_ = std::move(attributeValueMetadata);
                 RefreshCurrentEarliestRetainedAttributeValueStart();
@@ -3502,6 +5197,9 @@ void XmlReader::ParseElement() {
 
         if (!tokenizer.HasChar(position_)) {
             Throw("Unexpected end of XML document");
+        }
+        if (position_ == whitespaceStart) {
+            Throw("Whitespace is required between attributes");
         }
 
         const auto attributeStart = position_;
@@ -3527,12 +5225,27 @@ void XmlReader::ParseElement() {
         }
         const auto rawValueStart = attributeToken.rawValueStart;
         const auto rawValueEnd = attributeToken.rawValueEnd;
-        const auto invalidLt = FindInSource("<", rawValueStart);
-        if (invalidLt != std::string::npos && invalidLt < rawValueEnd) {
+        const bool needsDecoding = (attributeToken.rawValueFlags & kAttributeValueNeedsDecoding) != 0;
+        const std::size_t invalidCharacterPosition = attributeToken.invalidCharacterPosition;
+        const std::size_t invalidLt = attributeToken.invalidLtPosition;
+        if (invalidCharacterPosition != std::string::npos
+            && (invalidLt == std::string::npos || invalidCharacterPosition < invalidLt)) {
+            const auto [line, column] = ComputeLineColumn(invalidCharacterPosition);
+            throw XmlException("Invalid XML character", line, column);
+        }
+        if (invalidLt != std::string::npos) {
             const auto [line, column] = ComputeLineColumn(invalidLt);
             throw XmlException("'<' is not allowed in attribute values", line, column);
         }
-        const bool needsDecoding = SourceRangeContains(rawValueStart, rawValueEnd, '&');
+        if (std::any_of(attributes.begin(), attributes.end(), [&](const auto& existingAttribute) {
+                return existingAttribute.first == attributeToken.name;
+            })) {
+            Throw("Duplicate attribute '" + attributeToken.name + "'");
+        }
+        if (attributes.empty()) {
+            attributes.reserve(4);
+            attributeValueMetadata.reserve(4);
+        }
         attributes.emplace_back(std::move(attributeToken.name), std::string{});
         const std::string& attributeName = attributes.back().first;
         const auto attributeColon = attributeName.find(':');
@@ -3548,6 +5261,7 @@ void XmlReader::ParseElement() {
             && attributeName != "xmlns"
             && attributeName.rfind("xmlns:", 0) != 0
             && attributeName != "xml:space") {
+            validateAttributeEntityReplacementTexts(rawValueStart, rawValueEnd);
             (void)DecodeEntities(SourceSubstr(rawValueStart, rawValueEnd - rawValueStart));
         }
         if (attributeName == "xmlns") {
@@ -3555,6 +5269,7 @@ void XmlReader::ParseElement() {
             if (needsDecoding) {
                 attributeValue = DecodeEntities(attributeValue);
             }
+            attributeValue = normalizeNamespaceDeclarationValue(attributeName, std::move(attributeValue));
             ValidateNamespaceDeclarationBinding({}, attributeValue);
             setLocalNamespaceDeclaration({}, std::move(attributeValue));
         } else if (attributeName.rfind("xmlns:", 0) == 0) {
@@ -3562,32 +5277,40 @@ void XmlReader::ParseElement() {
             if (needsDecoding) {
                 attributeValue = DecodeEntities(attributeValue);
             }
+            attributeValue = normalizeNamespaceDeclarationValue(attributeName, std::move(attributeValue));
             ValidateNamespaceDeclarationBinding(attributeName.substr(6), attributeValue);
             setLocalNamespaceDeclaration(attributeName.substr(6), std::move(attributeValue));
         } else if (attributeName == "xml:space") {
             if (!needsDecoding) {
                 if (sourceRangeEqualsLiteral(rawValueStart, rawValueEnd, "preserve")) {
-                    preserveSpace = true;
+                    applyXmlSpaceValue("preserve");
                 } else if (sourceRangeEqualsLiteral(rawValueStart, rawValueEnd, "default")) {
-                    preserveSpace = false;
+                    applyXmlSpaceValue("default");
+                } else {
+                    Throw("xml:space must be 'default' or 'preserve'");
                 }
             } else {
                 std::string attributeValue = SourceSubstr(rawValueStart, rawValueEnd - rawValueStart);
                 attributeValue = DecodeEntities(attributeValue);
-                if (IsXmlSpacePreserve(attributeValue)) {
-                    preserveSpace = true;
-                } else if (IsXmlSpaceDefault(attributeValue)) {
-                    preserveSpace = false;
-                }
+                applyXmlSpaceValue(attributeValue);
             }
         }
     }
 
-    ApplyDtdAttributeDeclarations(name, attributes, attributeValueMetadata, retainLocalNamespaceDeclarationsForAttributes);
-    applyXmlSpaceFromAttributes();
+    const bool requiresAttributePostProcessing = ApplyDtdAttributeDeclarations(
+        name,
+        attributes,
+        attributeValueMetadata,
+        retainLocalNamespaceDeclarationsForAttributes);
+    if (requiresAttributePostProcessing) {
+        applyNamespaceDeclarationAttributes();
+        applyXmlSpaceFromAttributes();
+    }
     if (topLevelElement && !documentTypeName_.empty() && name != documentTypeName_) {
         Throw("Document type name '" + documentTypeName_ + "' does not match root element name '" + name + "'");
     }
+    validateNamespaceAwareNames(elementPrefixView);
+    validateDtdDeclaredAttributes();
 
     const bool pushedNamespaceScope = !localNamespaceDeclarations.empty();
     const std::string elementNamespaceUri = lookupNamespaceInScopes(elementPrefixView);
@@ -3595,7 +5318,15 @@ void XmlReader::ParseElement() {
     if (pushedNamespaceScope) {
         namespaceScopes_.push_back(std::move(localNamespaceDeclarations));
     }
+    if (dtdState_ != nullptr
+        && !dtdState_->elementContentDeclarations.empty()
+        && !topLevelElement) {
+        RecordChildElementForDtdValidation(name);
+    }
     elementStack_.push_back(name);
+    if (dtdState_ != nullptr && !dtdState_->elementContentDeclarations.empty()) {
+        elementContentValidationStack_.push_back(ElementContentValidationFrame{});
+    }
     SetCurrentNode(
         XmlNodeType::Element,
         std::move(name),
@@ -3612,7 +5343,10 @@ void XmlReader::ParseElement() {
         std::move(attributes),
         {},
         start,
-        position_);
+        position_,
+        std::string::npos,
+        std::string::npos,
+        true);
     currentAttributeValueMetadata_ = std::move(attributeValueMetadata);
     RefreshCurrentEarliestRetainedAttributeValueStart();
     const bool pushedXmlSpacePreserve = preserveSpace != inheritedPreserveSpace;
@@ -3641,6 +5375,14 @@ void XmlReader::ParseEndElement() {
     if (elementStack_.empty()) {
         const std::string name = SourceSubstr(nameStart, nameLen);
         Throw("Unexpected closing tag: </" + name + ">");
+    }
+
+    {
+        const std::string name = SourceSubstr(nameStart, nameLen);
+        const auto [prefixView, localNameView] = SplitQualifiedNameView(name);
+        if (!IsValidXmlQualifiedName(name) || prefixView == "xmlns") {
+            Throw("Invalid XML name");
+        }
     }
 
     const std::string& expected = elementStack_.back();
@@ -3673,8 +5415,14 @@ void XmlReader::ParseEndElement() {
     AdvanceLineInfoFromInputSource(inputSource_.get(), start, position_, lineNumber_, linePosition_);
 
     const int depth = static_cast<int>(elementStack_.size()) - 1;
+    if (!elementContentValidationStack_.empty()) {
+        ValidateElementDtdContent(expected, elementContentValidationStack_.back());
+    }
     std::string name = std::move(elementStack_.back());
     elementStack_.pop_back();
+    if (!elementContentValidationStack_.empty()) {
+        elementContentValidationStack_.pop_back();
+    }
 
     const auto [prefixView, localNameView] = SplitQualifiedNameView(name);
     const std::string namespaceUri = LookupNamespaceUri(prefixView);
@@ -3715,7 +5463,14 @@ void XmlReader::ParseEndElement() {
         std::string::npos,
         std::string::npos,
         start,
-        position_);
+        position_,
+        {},
+        {},
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        std::string::npos,
+        true);
     currentLocalNamespaceDeclarations_ = std::move(endElementLocalNamespaceDeclarations);
 }
 
@@ -3728,11 +5483,94 @@ std::string XmlReader::LookupNamespaceUri(std::string_view prefix) const {
         }
     }
 
+    if (prefix == "xml") {
+        return "http://www.w3.org/XML/1998/namespace";
+    }
+    if (prefix == "xmlns") {
+        return "http://www.w3.org/2000/xmlns/";
+    }
+
     return {};
 }
 
 const std::vector<std::pair<std::string, std::string>>& XmlReader::CurrentAttributes() const {
     return currentAttributes_;
+}
+
+void XmlReader::RecordChildElementForDtdValidation(std::string_view childName) {
+    if (dtdState_ != nullptr
+        && !dtdState_->elementContentDeclarations.empty()
+        && !elementContentValidationStack_.empty()) {
+        elementContentValidationStack_.back().childElements.emplace_back(childName);
+    }
+}
+
+void XmlReader::RecordTextForDtdValidation(bool isWhitespaceOnly, bool matchesElementContentWhitespace) {
+    if (dtdState_ != nullptr
+        && !dtdState_->elementContentDeclarations.empty()
+        && !elementContentValidationStack_.empty()) {
+        auto& frame = elementContentValidationStack_.back();
+        if (isWhitespaceOnly) {
+            frame.hasWhitespaceText = true;
+            if (!matchesElementContentWhitespace) {
+                frame.hasNonSWhitespaceText = true;
+            }
+            return;
+        }
+
+        frame.hasNonWhitespaceText = true;
+    }
+}
+
+void XmlReader::ValidateElementDtdContent(
+    std::string_view elementName,
+    const ElementContentValidationFrame& frame) const {
+    if (dtdState_ == nullptr) {
+        return;
+    }
+
+    if (dtdState_->elementContentDeclarations.empty()) {
+        return;
+    }
+
+    const auto declaration = dtdState_->elementContentDeclarations.find(std::string(elementName));
+    if (declaration == dtdState_->elementContentDeclarations.end()) {
+        throw XmlException("DTD validation failed: element '" + std::string(elementName) + "' was not declared");
+    }
+
+    const std::string& contentSpecification = declaration->second;
+    if (contentSpecification == "ANY") {
+        return;
+    }
+
+    if (contentSpecification == "EMPTY") {
+        if (frame.hasWhitespaceText || frame.hasNonWhitespaceText || !frame.childElements.empty()) {
+            throw XmlException(
+                "DTD validation failed: element '" + std::string(elementName) + "' content does not match declaration");
+        }
+        return;
+    }
+
+    std::unordered_set<std::string> mixedAllowedChildren;
+    if (TryParseMixedContentSpecification(contentSpecification, mixedAllowedChildren)) {
+        for (const auto& childName : frame.childElements) {
+            if (mixedAllowedChildren.find(childName) == mixedAllowedChildren.end()) {
+                throw XmlException(
+                    "DTD validation failed: element '" + std::string(elementName) + "' content does not match declaration");
+            }
+        }
+        return;
+    }
+
+    const bool declarationIsExternal = documentDeclarationStandalone_ == "yes"
+        && dtdState_->externalElementDeclarationNames.find(std::string(elementName)) != dtdState_->externalElementDeclarationNames.end();
+    if (frame.hasNonWhitespaceText
+        || frame.hasNonSWhitespaceText
+        || (declarationIsExternal && frame.hasWhitespaceText)
+        || !DoesObservedChildrenMatchContentModel(contentSpecification, frame.childElements)) {
+        throw XmlException(
+            "DTD validation failed: element '" + std::string(elementName) + "' content does not match declaration");
+    }
 }
 
 std::string XmlReader::CurrentLocalName() const {
@@ -4022,6 +5860,7 @@ void XmlReader::AppendCurrentAttributesForLoad(XmlElement& element) {
 }
 
 void XmlReader::InitializeInputState() {
+    elementContentValidationStack_.clear();
     namespaceScopes_.clear();
     namespaceScopeFramePushedStack_.clear();
     xmlSpacePreserveStack_.clear();
@@ -4032,6 +5871,10 @@ void XmlReader::InitializeInputState() {
     namespaceScopes_.back().emplace_back("xml", "http://www.w3.org/XML/1998/namespace");
     namespaceScopes_.back().emplace_back("xmlns", "http://www.w3.org/2000/xmlns/");
     xmlSpacePreserveStack_.push_back(false);
+    sourceWasUtf8Bom_ = HasSourceChar(2)
+        && static_cast<unsigned char>(SourceCharAt(0)) == 0xEF
+        && static_cast<unsigned char>(SourceCharAt(1)) == 0xBB
+        && static_cast<unsigned char>(SourceCharAt(2)) == 0xBF;
     if (HasSourceChar(2)
         && static_cast<unsigned char>(SourceCharAt(0)) == 0xEF
         && static_cast<unsigned char>(SourceCharAt(1)) == 0xBB
@@ -4051,6 +5894,7 @@ XmlReader XmlReader::CreateFromValidatedString(
     const XmlReaderSettings& settings) {
     const std::size_t sourceSize = xml == nullptr ? 0 : xml->size();
     XmlReader reader(settings);
+    reader.sourceWasUtf16_ = false;
     reader.inputSource_ = std::make_shared<StringXmlReaderInputSource>(std::move(xml));
     reader.InitializeInputState();
     if (reader.settings_.MaxCharactersInDocument != 0
@@ -4062,9 +5906,16 @@ XmlReader XmlReader::CreateFromValidatedString(
 }
 
 XmlReader XmlReader::Create(const std::string& xml, const XmlReaderSettings& settings) {
-    auto sourceText = std::make_shared<std::string>(xml);
+    if (LooksLikeMalformedUtf16XmlPrefix(xml)) {
+        throw XmlException("Malformed UTF-16 XML input");
+    }
+
+    const bool sourceWasUtf16 = HasUtf16Bom(xml);
+    auto sourceText = std::make_shared<std::string>(NormalizeBomEncodedXmlText(xml));
     ValidateXmlReaderInputAgainstSchemas(sourceText, settings);
-    return CreateFromValidatedString(sourceText, settings);
+    XmlReader reader = CreateFromValidatedString(sourceText, settings);
+    reader.sourceWasUtf16_ = sourceWasUtf16;
+    return reader;
 }
 
 XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& settings) {
@@ -4113,12 +5964,14 @@ XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& setti
         }
 
         XmlReader reader(settings);
+        reader.sourceWasUtf16_ = false;
         reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(replayStream);
         reader.InitializeInputState();
         return reader;
     }
 
     XmlReader reader(settings);
+    reader.sourceWasUtf16_ = false;
     std::string initialBuffer;
     if (settings.MaxCharactersInDocument != 0) {
         initialBuffer = ReadStreamPrefix(stream, settings.MaxCharactersInDocument + 4);
@@ -4134,10 +5987,75 @@ XmlReader XmlReader::Create(std::istream& stream, const XmlReaderSettings& setti
 }
 
 XmlReader XmlReader::CreateFromFile(const std::string& path, const XmlReaderSettings& settings) {
+    const auto absolutePath = std::filesystem::absolute(std::filesystem::path(path)).string();
+
+    auto stream = std::make_shared<std::ifstream>(std::filesystem::path(path), std::ios::binary);
+    if (!*stream) {
+        throw XmlException("Failed to open XML file: " + path);
+    }
+
+    char bomProbeBuffer[8] = {};
+    stream->read(bomProbeBuffer, static_cast<std::streamsize>(sizeof(bomProbeBuffer)));
+    const auto bytesRead = stream->gcount();
+    const std::string bomProbe(bomProbeBuffer, static_cast<std::size_t>(bytesRead > 0 ? bytesRead : 0));
+    stream->clear();
+    stream->seekg(0, std::ios::beg);
+    if (!*stream) {
+        throw XmlException("Failed to rewind XML file after BOM detection: " + path);
+    }
+
+    if (LooksLikeMalformedUtf16XmlPrefix(bomProbe)) {
+        throw XmlException("Malformed UTF-16 XML input");
+    }
+
+    if (HasUtf16Bom(bomProbe)) {
+        const std::string rawXml((std::istreambuf_iterator<char>(*stream)), std::istreambuf_iterator<char>());
+        XmlReader reader = XmlReader::Create(NormalizeBomEncodedXmlText(rawXml), settings);
+        reader.sourceWasUtf16_ = true;
+        reader.baseUri_ = absolutePath;
+        return reader;
+    }
+
+    bool maxCharactersChecked = false;
+    if (settings.MaxCharactersInDocument != 0) {
+        std::error_code fileSizeError;
+        const auto fileSize = std::filesystem::file_size(std::filesystem::path(path), fileSizeError);
+        if (!fileSizeError) {
+            const std::size_t bomLength = GetUtf8BomLength(bomProbe);
+            if (fileSize > bomLength && fileSize - bomLength > settings.MaxCharactersInDocument) {
+                throw XmlException("The XML document exceeds the configured MaxCharactersInDocument limit");
+            }
+            maxCharactersChecked = true;
+        }
+    }
+
+    auto createReaderFromInputSource = [&absolutePath](
+                                          std::shared_ptr<const XmlReaderInputSource> inputSource,
+                                          const XmlReaderSettings& readerSettings) {
+        XmlReader reader(readerSettings);
+        reader.sourceWasUtf16_ = false;
+        reader.inputSource_ = std::move(inputSource);
+        reader.InitializeInputState();
+        reader.baseUri_ = absolutePath;
+        return reader;
+    };
+
+    std::shared_ptr<const XmlReaderInputSource> mappedInputSource;
+#if defined(_WIN32)
+    try {
+        mappedInputSource = std::make_shared<MemoryMappedXmlReaderInputSource>(std::filesystem::path(path));
+    } catch (const XmlException&) {
+        mappedInputSource.reset();
+    }
+#endif
+
     if (settings.Validation == ValidationType::Schema) {
-        auto stream = std::make_shared<std::ifstream>(std::filesystem::path(path), std::ios::binary);
-        if (!*stream) {
-            throw XmlException("Failed to open XML file: " + path);
+        if (mappedInputSource != nullptr) {
+            XmlReaderSettings validationSettings = settings;
+            validationSettings.Validation = ValidationType::None;
+            auto validatingReader = createReaderFromInputSource(mappedInputSource, validationSettings);
+            ValidateXmlReaderInputAgainstSchemas(validatingReader, settings);
+            return createReaderFromInputSource(std::move(mappedInputSource), settings);
         }
 
         XmlReaderSettings validationSettings = settings;
@@ -4152,20 +6070,20 @@ XmlReader XmlReader::CreateFromFile(const std::string& path, const XmlReaderSett
         }
 
         XmlReader reader(settings);
+        reader.sourceWasUtf16_ = false;
         reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(
             std::static_pointer_cast<std::istream>(stream));
         reader.InitializeInputState();
-        reader.baseUri_ = std::filesystem::absolute(std::filesystem::path(path)).string();
+        reader.baseUri_ = absolutePath;
         return reader;
     }
 
-    auto stream = std::make_shared<std::ifstream>(std::filesystem::path(path), std::ios::binary);
-    if (!*stream) {
-        throw XmlException("Failed to open XML file: " + path);
+    if (mappedInputSource != nullptr) {
+        return createReaderFromInputSource(std::move(mappedInputSource), settings);
     }
 
     std::string initialBuffer;
-    if (settings.MaxCharactersInDocument != 0) {
+    if (!maxCharactersChecked && settings.MaxCharactersInDocument != 0) {
         initialBuffer = ReadStreamPrefix(*stream, settings.MaxCharactersInDocument + 4);
         const std::size_t bomLength = GetUtf8BomLength(initialBuffer);
         if (initialBuffer.size() > bomLength
@@ -4175,11 +6093,12 @@ XmlReader XmlReader::CreateFromFile(const std::string& path, const XmlReaderSett
     }
 
     XmlReader reader(settings);
+    reader.sourceWasUtf16_ = false;
     reader.inputSource_ = std::make_shared<StreamXmlReaderInputSource>(
         std::static_pointer_cast<std::istream>(stream),
         std::move(initialBuffer));
     reader.InitializeInputState();
-    reader.baseUri_ = std::filesystem::absolute(std::filesystem::path(path)).string();
+    reader.baseUri_ = absolutePath;
     return reader;
 }
 
@@ -4204,6 +6123,12 @@ bool XmlReader::Read() {
         }
 
         if (!HasSourceChar(position_)) {
+            if (settings_.Conformance == ConformanceLevel::Document && !sawRootElement_) {
+                Throw("Unexpected end of XML document");
+            }
+            if (!elementStack_.empty()) {
+                Throw("Unexpected end of XML document");
+            }
             ValidatePendingDtdIdReferences();
             MaybeDiscardSourcePrefix();
             eof_ = true;
@@ -4212,8 +6137,34 @@ bool XmlReader::Read() {
 
         if (elementStack_.empty()) {
             const auto markupKind = tokenizer.ClassifyMarkup(position_);
+            if (settings_.Conformance == ConformanceLevel::Document && !sawRootElement_) {
+                if (Peek() != '<') {
+                    if (!IsWhitespace(Peek())) {
+                        Throw("Unexpected content before the root element");
+                    }
+
+                    std::size_t scan = position_;
+                    while (HasSourceChar(scan) && SourceCharAt(scan) != '<') {
+                        if (!IsWhitespace(SourceCharAt(scan))) {
+                            Throw("Unexpected content before the root element");
+                        }
+                        ++scan;
+                    }
+                } else if (markupKind == XmlMarkupKind::CData) {
+                    Throw("Unexpected content before the root element");
+                }
+            }
+
             if (settings_.Conformance == ConformanceLevel::Document && completedRootElement_) {
                 if (IsWhitespace(Peek())) {
+                    std::size_t scan = position_;
+                    while (HasSourceChar(scan) && SourceCharAt(scan) != '<') {
+                        if (!IsWhitespace(SourceCharAt(scan))) {
+                            Throw("Unexpected content after the root element");
+                        }
+                        ++scan;
+                    }
+
                     ParseText();
                     if (settings_.IgnoreWhitespace
                         && (currentNodeType_ == XmlNodeType::Whitespace || currentNodeType_ == XmlNodeType::SignificantWhitespace)) {
@@ -4257,9 +6208,7 @@ bool XmlReader::Read() {
 
         if (Peek() != '<') {
             ParseText();
-            if (elementStack_.empty()
-                && currentNodeType_ != XmlNodeType::Whitespace
-                && currentNodeType_ != XmlNodeType::SignificantWhitespace) {
+            if (elementStack_.empty()) {
                 xmlDeclarationAllowed_ = false;
             }
             if (settings_.IgnoreWhitespace
@@ -4345,6 +6294,7 @@ void XmlReader::Close() {
     ResetCurrentNode();
     bufferedNodes_.clear();
     elementStack_.clear();
+    elementContentValidationStack_.clear();
     namespaceScopes_.clear();
     namespaceScopeFramePushedStack_.clear();
     xmlSpacePreserveStack_.clear();
@@ -4498,7 +6448,7 @@ std::string XmlReader::GetAttribute(std::string_view name) const {
 std::string XmlReader::GetAttribute(int index) const {
     const auto& attributes = CurrentAttributes();
     if (index < 0 || static_cast<std::size_t>(index) >= attributes.size()) {
-        return {};
+        throw std::out_of_range("Attribute index is out of range");
     }
     return CurrentAttributeValue(static_cast<std::size_t>(index));
 }
@@ -4517,6 +6467,10 @@ std::string XmlReader::GetAttribute(std::string_view localName, std::string_view
 }
 
 bool XmlReader::MoveToAttribute(std::string_view name) {
+    if (name.empty()) {
+        throw std::invalid_argument("Attribute name cannot be empty");
+    }
+
     const auto& attributes = CurrentAttributes();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         if (attributes[i].first == name || CurrentAttributeLocalName(i) == name) {
@@ -4530,7 +6484,7 @@ bool XmlReader::MoveToAttribute(std::string_view name) {
 bool XmlReader::MoveToAttribute(int index) {
     const auto& attributes = CurrentAttributes();
     if (index < 0 || static_cast<std::size_t>(index) >= attributes.size()) {
-        return false;
+        throw std::out_of_range("Attribute index is out of range");
     }
     attributeIndex_ = index;
     return true;
@@ -4718,6 +6672,10 @@ bool XmlReader::IsStartElement(std::string_view name) {
     return MoveToContent() == XmlNodeType::Element && Name() == name;
 }
 
+bool XmlReader::IsStartElement(std::string_view localName, std::string_view namespaceUri) {
+    return MoveToContent() == XmlNodeType::Element && LocalName() == localName && NamespaceURI() == namespaceUri;
+}
+
 void XmlReader::ReadStartElement() {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadStartElement called when the reader is not positioned on an element");
@@ -4731,6 +6689,18 @@ void XmlReader::ReadStartElement(std::string_view name) {
     }
     if (Name() != name) {
         throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
+    }
+    Read();
+}
+
+void XmlReader::ReadStartElement(std::string_view localName, std::string_view namespaceUri) {
+    if (MoveToContent() != XmlNodeType::Element) {
+        throw XmlException("ReadStartElement called when the reader is not positioned on an element");
+    }
+    if (LocalName() != localName || NamespaceURI() != namespaceUri) {
+        throw XmlException(
+            "Element '{" + std::string(namespaceUri) + "}" + std::string(localName) +
+            "' was not found. Current element is '{" + NamespaceURI() + "}" + LocalName() + "'");
     }
     Read();
 }
@@ -4783,6 +6753,50 @@ std::string XmlReader::ReadElementContentAsString() {
     }
 }
 
+std::string XmlReader::ReadElementContentAsString(std::string_view localName, std::string_view namespaceUri) {
+    if (MoveToContent() != XmlNodeType::Element) {
+        throw XmlException("ReadElementContentAsString called when the reader is not positioned on an element");
+    }
+    if (LocalName() != localName || NamespaceURI() != namespaceUri) {
+        throw XmlException(
+            "Element '{" + std::string(namespaceUri) + "}" + std::string(localName) +
+            "' was not found. Current element is '{" + NamespaceURI() + "}" + LocalName() + "'");
+    }
+    return ReadElementContentAsString();
+}
+
+int XmlReader::ReadElementContentAsInt() {
+    return XmlConvert::ToInt32(ReadElementContentAsString());
+}
+
+int XmlReader::ReadElementContentAsInt(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToInt32(ReadElementContentAsString(localName, namespaceUri));
+}
+
+long long XmlReader::ReadElementContentAsLong() {
+    return XmlConvert::ToInt64(ReadElementContentAsString());
+}
+
+long long XmlReader::ReadElementContentAsLong(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToInt64(ReadElementContentAsString(localName, namespaceUri));
+}
+
+double XmlReader::ReadElementContentAsDouble() {
+    return XmlConvert::ToDouble(ReadElementContentAsString());
+}
+
+double XmlReader::ReadElementContentAsDouble(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToDouble(ReadElementContentAsString(localName, namespaceUri));
+}
+
+bool XmlReader::ReadElementContentAsBoolean() {
+    return XmlConvert::ToBoolean(ReadElementContentAsString());
+}
+
+bool XmlReader::ReadElementContentAsBoolean(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToBoolean(ReadElementContentAsString(localName, namespaceUri));
+}
+
 std::string XmlReader::ReadElementString() {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadElementString called when the reader is not positioned on an element");
@@ -4830,6 +6844,18 @@ std::string XmlReader::ReadElementString(std::string_view name) {
     }
     if (Name() != name) {
         throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
+    }
+    return ReadElementString();
+}
+
+std::string XmlReader::ReadElementString(std::string_view localName, std::string_view namespaceUri) {
+    if (MoveToContent() != XmlNodeType::Element) {
+        throw XmlException("ReadElementString called when the reader is not positioned on an element");
+    }
+    if (LocalName() != localName || NamespaceURI() != namespaceUri) {
+        throw XmlException(
+            "Element '{" + std::string(namespaceUri) + "}" + std::string(localName) +
+            "' was not found. Current element is '{" + NamespaceURI() + "}" + LocalName() + "'");
     }
     return ReadElementString();
 }

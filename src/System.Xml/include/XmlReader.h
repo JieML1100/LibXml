@@ -66,12 +66,24 @@ public:
     XmlNodeType MoveToContent();
     bool IsStartElement();
     bool IsStartElement(std::string_view name);
+    bool IsStartElement(std::string_view localName, std::string_view namespaceUri);
     void ReadStartElement();
     void ReadStartElement(std::string_view name);
+    void ReadStartElement(std::string_view localName, std::string_view namespaceUri);
     void ReadEndElement();
     std::string ReadElementContentAsString();
+    std::string ReadElementContentAsString(std::string_view localName, std::string_view namespaceUri);
+    int ReadElementContentAsInt();
+    int ReadElementContentAsInt(std::string_view localName, std::string_view namespaceUri);
+    long long ReadElementContentAsLong();
+    long long ReadElementContentAsLong(std::string_view localName, std::string_view namespaceUri);
+    double ReadElementContentAsDouble();
+    double ReadElementContentAsDouble(std::string_view localName, std::string_view namespaceUri);
+    bool ReadElementContentAsBoolean();
+    bool ReadElementContentAsBoolean(std::string_view localName, std::string_view namespaceUri);
     std::string ReadElementString();
     std::string ReadElementString(std::string_view name);
+    std::string ReadElementString(std::string_view localName, std::string_view namespaceUri);
     void Skip();
     bool ReadToFollowing(std::string_view name);
     bool ReadToDescendant(std::string_view name);
@@ -121,6 +133,13 @@ private:
         std::string elementName;
     };
 
+    struct ElementContentValidationFrame {
+        std::vector<std::string> childElements;
+        bool hasWhitespaceText = false;
+        bool hasNonWhitespaceText = false;
+        bool hasNonSWhitespaceText = false;
+    };
+
     struct DtdState {
         std::unordered_map<std::string, std::string> entityDeclarations;
         std::unordered_set<std::string> declaredEntityNames;
@@ -128,6 +147,9 @@ private:
         std::unordered_set<std::string> unparsedEntityDeclarationNames;
         std::unordered_set<std::string> seenIdAttributeValues;
         std::unordered_set<std::string> emptyElementDeclarations;
+        std::unordered_map<std::string, std::string> elementContentDeclarations;
+        std::unordered_map<std::string, std::unordered_set<std::string>> declaredAttributes;
+        std::unordered_set<std::string> externalElementDeclarationNames;
         std::vector<PendingDtdIdReference> pendingIdAttributeReferences;
         std::unordered_map<std::string, std::string> idAttributes;
         std::unordered_map<std::string, std::string> notationAttributes;
@@ -142,6 +164,7 @@ private:
         std::unordered_map<std::string, std::unordered_map<std::string, std::string>> externalFixedAttributes;
         std::unordered_map<std::string, std::unordered_map<std::string, std::string>> externalEnumeratedAttributes;
         std::unordered_map<std::string, std::string> externalEntitySystemIds;
+        std::unordered_set<std::string> externalSubsetEntityNames;
         std::vector<std::shared_ptr<XmlNode>> parsedEntities;
         std::vector<std::shared_ptr<XmlNode>> parsedNotations;
         std::string externalSubsetSystemId;
@@ -157,6 +180,8 @@ private:
     std::string ParseName();
     std::string ParseQuotedValue(bool decodeEntities = true);
     std::string DecodeEntities(std::string_view value) const;
+    void ValidateParsedEntityReplacementText(std::string_view rawReplacementText) const;
+    void ValidateAttributeEntityReplacementText(std::string_view rawReplacementText) const;
     void QueueNode(
         XmlNodeType nodeType,
         std::string name,
@@ -184,6 +209,7 @@ private:
     std::size_t FindInSource(std::string_view token, std::size_t position) const noexcept;
     std::string SourceSubstr(std::size_t start, std::size_t count = std::string::npos) const;
     bool SourceRangeContains(std::size_t start, std::size_t end, char value) const noexcept;
+    std::size_t ValidateXmlCharacterAt(std::size_t position) const;
     void AppendSourceSubstrTo(std::string& target, std::size_t start, std::size_t count) const;
     std::size_t AppendDecodedSourceRangeTo(std::string& target, std::size_t start, std::size_t end) const;
     void EnsureCurrentAttributeValueDecoded(std::size_t index) const;
@@ -195,7 +221,11 @@ private:
     void RegisterDtdDeclarations(
         const std::vector<std::shared_ptr<XmlNode>>& entities,
         const std::vector<std::shared_ptr<XmlNode>>& notations);
+    void RegisterDtdElementDeclarations(
+        const std::unordered_map<std::string, std::string>& elementContentDeclarations,
+        bool fromExternalSubset = false);
     void RegisterDtdAttributeDeclarations(
+        const std::unordered_map<std::string, std::unordered_set<std::string>>& declaredAttributes,
         const std::unordered_map<std::string, std::string>& idAttributes,
         const std::unordered_map<std::string, std::string>& notationAttributes,
         const std::unordered_map<std::string, std::unordered_map<std::string, bool>>& nmTokenAttributes,
@@ -205,9 +235,16 @@ private:
         const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& fixedAttributes,
         const std::unordered_map<std::string, std::unordered_map<std::string, std::string>>& enumeratedAttributes,
         bool fromExternalSubset = false);
-    void LoadExternalSubsetDeclarations(std::string_view systemLiteral);
+    void LoadExternalSubsetDeclarations(
+        std::string_view systemLiteral,
+        const std::unordered_map<std::string, std::string>* inheritedParameterEntityDeclarations = nullptr);
+    void LoadExternalParameterEntityDeclarations(
+        const std::unordered_map<std::string, std::string>& externalParameterEntitySystemLiterals,
+        std::string_view baseUri,
+        std::unordered_map<std::string, std::string>& declarations,
+        std::unordered_set<std::string>& externalParameterEntityNames);
     void EnsureExternalSubsetDeclarationsLoaded();
-    void ApplyDtdAttributeDeclarations(
+    bool ApplyDtdAttributeDeclarations(
         std::string_view elementName,
         std::vector<std::pair<std::string, std::string>>& attributes,
         std::vector<AttributeValueMetadata>& attributeValueMetadata,
@@ -244,7 +281,13 @@ private:
         std::size_t elementStart = std::string::npos,
         std::size_t contentStart = std::string::npos,
         std::size_t closeStart = std::string::npos,
-        std::size_t closeEnd = std::string::npos);
+        std::size_t closeEnd = std::string::npos,
+        bool namesAlreadyValidated = false);
+    void RecordChildElementForDtdValidation(std::string_view childName);
+    void RecordTextForDtdValidation(bool isWhitespaceOnly, bool matchesElementContentWhitespace = false);
+    void ValidateElementDtdContent(
+        std::string_view elementName,
+        const ElementContentValidationFrame& frame) const;
     void SetCurrentNameParts(std::string_view prefix, std::string_view localName);
     void SetCurrentAttributeNameParts(std::vector<std::string> prefixes, std::vector<std::string> localNames);
     std::pair<std::size_t, std::size_t> ComputeLineColumn(std::size_t position) const noexcept;
@@ -312,6 +355,7 @@ private:
     mutable std::size_t currentCloseEnd_ = std::string::npos;
     std::deque<BufferedNode> bufferedNodes_;
     std::vector<std::string> elementStack_;
+    std::vector<ElementContentValidationFrame> elementContentValidationStack_;
     std::vector<std::vector<std::pair<std::string, std::string>>> namespaceScopes_;
     std::vector<bool> namespaceScopeFramePushedStack_;
     std::vector<bool> xmlSpacePreserveStack_;
@@ -338,6 +382,9 @@ private:
     mutable std::size_t discardedSourceOffset_ = 0;
     mutable std::size_t discardedLineNumber_ = 1;
     mutable std::size_t discardedLinePosition_ = 1;
+    std::vector<std::string> activeExternalEntityNames_;
+    bool sourceWasUtf16_ = false;
+    bool sourceWasUtf8Bom_ = false;
     std::string baseUri_;
     bool baseUriNeedsResolution_ = false;
     XmlNameTable nameTable_;

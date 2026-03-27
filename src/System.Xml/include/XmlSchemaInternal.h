@@ -744,11 +744,23 @@ bool TryParseNumericEntityReferenceCodePoint(std::string_view entity, unsigned i
         return false;
     }
 
-    if (entity.size() > 2 && (entity[1] == 'x' || entity[1] == 'X')) {
-        return TryParseUnsignedInteger(entity.substr(2), 16, codePoint);
+    if (entity.size() > 2 && entity[1] == 'x') {
+        if (!TryParseUnsignedInteger(entity.substr(2), 16, codePoint)) {
+            return false;
+        }
+
+        return IsValidXmlCharacterCodePoint(codePoint);
     }
 
-    return TryParseUnsignedInteger(entity.substr(1), 10, codePoint);
+    if (entity.size() > 2 && entity[1] == 'X') {
+        return false;
+    }
+
+    if (!TryParseUnsignedInteger(entity.substr(1), 10, codePoint)) {
+        return false;
+    }
+
+    return IsValidXmlCharacterCodePoint(codePoint);
 }
 
 void AppendCodePointUtf8(std::string& output, unsigned int codePoint) {
@@ -830,7 +842,7 @@ void PopulateInternalEntityDeclarations(
             continue;
         }
 
-        declarations[entity->Name()] = entity->Value();
+        declarations.try_emplace(entity->Name(), entity->Value());
     }
 }
 

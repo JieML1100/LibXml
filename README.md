@@ -17,10 +17,16 @@ msbuild LibXML.sln /p:Configuration=Debug /p:Platform=x64
 测试入口：
 
 - `build\System.Xml.Tests\Debug\System.Xml.Tests.exe`
+- `build\System.Xml.Tests\Debug\System.Xml.Tests.exe --xmlconf xmlconf\xmlconf.xml`
 
 示例入口：
 
 - `build\System.Xml.QuickStart\Debug\System.Xml.QuickStart.exe`
+
+规范状态：
+
+- XML 1.0 第五版主线能力已完成，当前默认按第五版语义收口名称字符、XML declaration、注释 / PI、命名空间声明与 DTD 主要校验路径
+- xmlconf 入口默认以 XML 1.0 第五版为目标，可通过 `--xml10-edition 5` 显式指定，或用 `--xml10-edition all` 跑全部 XML 1.0 edition 过滤
 
 当前实现包含：
 
@@ -44,6 +50,10 @@ msbuild LibXML.sln /p:Configuration=Debug /p:Platform=x64
 - QName 前缀 / 本地名拆分辅助
 - GetElementsByTagName 递归查询
 - XPath 子集查询，支持绝对路径、相对路径、`//` 后代轴、`*` 通配、`[@attr]`、`[@attr='value']`、`[child='value']`、`[child/grand='value']`、`[text()]`、`[text()='value']`、`[n]`、`[last()]`、`[position()=n]`、`[position()>n]`、`[last()-1=position()]`、`text()`、`true()`、`false()`、`lang()`、`boolean()`、`number()`、`string()`、`concat()`、`sum()`、`translate()`、`floor()`、`ceiling()`、`round()`，以及谓词中的 `+`、`-`、`*`、`div`、`mod` 数值表达式与基于 `XmlNamespaceManager` 的前缀解析
+- XPath 公开求值入口：`XmlNode::Evaluate(...)`、`XPathNavigator::Evaluate(...)`、`XPathExpression::Compile(...)`
+- XML 1.0 第五版名称字符、PI target、字符引用、注释 / CDATA、XML declaration 与命名空间声明约束
+- DTD 声明与校验：`ELEMENT`、`ATTLIST`、`ENTITY`、`NOTATION`、外部子集、external parameter entity、默认属性物化、元素内容模型、`ID/IDREF`、`ENTITY/ENTITIES`、`NMTOKEN/NMTOKENS`、枚举与 `xml:space`
+- 外部实体解析与 `XmlResolver` 语义，覆盖 Reader / DOM settings 路径
 - XML 文档解析与生成
 - 实体解码与转义
 - 文件加载与保存
@@ -51,10 +61,10 @@ msbuild LibXML.sln /p:Configuration=Debug /p:Platform=x64
 
 当前未覆盖：
 
-- XML Schema、完整 XPath、XSLT、验证器
+- XML 1.1、XSLT、完整 XPath 2.x / 3.x 能力与更高阶验证器
 - 更完整的命名空间一致性和高级 API
 - 更低内存、支持更完整规范细节的 XmlReader/XmlWriter 管线
-- 完整的 XML 规范边角行为，例如所有 Unicode 名称规则、外部实体解析、DTD 验证
+- 全量 xmlconf 一致性收口与少量 `.NET System.Xml` 兼容细节
 
 快速上手
 
@@ -102,7 +112,7 @@ writer.WriteEndDocument();
 
 路径装载语义
 
-- `XmlDocument::Load(path)` 走 one-shot 文档装载路径：先整文件读入内存，再基于内存文本构建 DOM。
+- `XmlDocument::Load(path)` 复用 file-backed `XmlReader` 路径：打开文件并通过 reader 构建 DOM，不再固定走整文件 one-shot materialization。
 - `XmlReader::CreateFromFile(path)` 保持文件流语义：打开文件并通过 stream-backed reader 读取，不隐藏整文件 materialization。
 - `XmlReader::Create(stream)` 与 `XmlReader::CreateFromFile(path)` 都属于流式 reader 路径；`XmlReader::Create(xml)` 属于内存文本路径。
 - 因为入口语义不同，`XmlDocument::Load(path)` 与 `XmlReader::CreateFromFile(path)` 的 benchmark 数字不能直接当成同一种成本模型比较。
@@ -112,7 +122,9 @@ writer.WriteEndDocument();
 - 绝对路径：`/root/group/item`
 - 相对路径：`group/item`
 - 后代轴：`//item`
+- 显式轴：`child::`、`attribute::`、`self::`、`parent::`、`descendant::`、`descendant-or-self::`、`ancestor::`、`ancestor-or-self::`、`following-sibling::`、`preceding-sibling::`、`following::`、`preceding::`、`namespace::`
 - 通配符：`*` 与 `@*`
+- 节点类型测试：`node()`、`text()`、`comment()`、`processing-instruction()`、`processing-instruction('target')`
 - 属性存在过滤：`item[@id]`
 - 属性过滤：`item[@id='2']`
 - 文本存在过滤：`item[text()]`
@@ -147,32 +159,26 @@ XPath 函数矩阵
 
 暂未支持：
 
-- 完整轴系统，例如 `ancestor::`、`following-sibling::`、`preceding::`
+- 完整 XPath 1.0 全覆盖、少量低频边角语义，以及更高版本 XPath 能力
 
 DTD 支持边界
 
 当前支持：
 
 - `DOCTYPE` 的 `PUBLIC` / `SYSTEM` 头
-- 内部子集中的 `ENTITY` 声明
-- 内部子集中的 `NOTATION` 声明
-- 以上声明在 DOM / Writer / Reader 中的可见与 round-trip 保留
-
-当前明确不支持：
-
-- parameter entity
-- `ELEMENT`
-- `ATTLIST`
-- conditional section
+- 内部 / 外部子集中的 `ENTITY`、`NOTATION`、`ELEMENT`、`ATTLIST` 声明
+- external parameter entity，以及外部 DTD 路径上的 `INCLUDE` / `IGNORE` conditional section
+- 默认属性物化、`EMPTY` / 元素内容模型校验、`ID` / `IDREF(S)` / `ENTITY(IES)` / `NMTOKEN(S)` / `NOTATION` 约束
+- 以上声明与校验在 DOM / Writer / Reader 中的可见性、保留与主要 round-trip 路径
 
 限制说明
 
-- 当前 XPath 仍是子集实现，不支持完整函数集、完整布尔代数和完整轴系统
+- 当前 XPath 仍是以 XPath 1.0 常用能力为主的子集实现，已覆盖常见轴 / 谓词 / 函数与公开 `Evaluate` / `Compile` 入口，但尚未完全复刻 .NET 行为
 - 命名空间感知 XPath 需要显式传入 `XmlNamespaceManager`；未传入时，带前缀名称按字面 QName / 字面前缀匹配，不再退化为按 `LocalName` 或任意前缀通配的宽松匹配
-- XmlReader / XmlWriter 已覆盖常见 DOM 与顺序读写场景，但还没有完全复刻 .NET `System.Xml`
+- XmlReader / XmlWriter / DTD 验证已覆盖 XML 1.0 第五版常见 DOM 与顺序读写场景，但还没有完全复刻 .NET `System.Xml`
 
 建议后续扩展方向：
 
-- 扩展 XPath 谓词、轴与函数支持
+- 补齐剩余 XPath 低频函数、边角语义与公开 API 兼容细节
 - 继续补齐 `System.Xml` 兼容面与异常细节
 - 增加基准测试和更系统的单元测试

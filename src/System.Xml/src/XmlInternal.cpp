@@ -55,8 +55,14 @@ const std::string& EmptyString() {
 }
 
 void ValidateXmlDeclarationVersion(std::string_view version) {
-    if (version != "1.0") {
+    if (version.size() < 3 || version[0] != '1' || version[1] != '.') {
         throw XmlException("Malformed XML declaration");
+    }
+
+    for (std::size_t index = 2; index < version.size(); ++index) {
+        if (version[index] < '0' || version[index] > '9') {
+            throw XmlException("Malformed XML declaration");
+        }
     }
 }
 

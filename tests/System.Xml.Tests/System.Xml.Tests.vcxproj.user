@@ -1,4 +1,11 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LocalDebuggerCommandArgumentsHistory> --xmlconf xmlconf\xmlconf.xml --limit 185| --xmlconf xmlconf\xmlconf.xml|--xmlconf G:\Work\LibXML\xmlconf\xmlconf.xml|</LocalDebuggerCommandArgumentsHistory>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LocalDebuggerCommandArguments>--xmlconf G:\Work\LibXML\xmlconf\xmlconf.xml</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArgumentsHistory> --xmlconf xmlconf\xmlconf.xml|--xmlconf G:\Work\LibXML\xmlconf\xmlconf.xml|</LocalDebuggerCommandArgumentsHistory>
+  </PropertyGroup>
 </Project>

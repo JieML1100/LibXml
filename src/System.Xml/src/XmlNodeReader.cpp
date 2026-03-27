@@ -155,7 +155,7 @@ std::string XmlNodeReader::GetAttribute(std::string_view name) const {
 std::string XmlNodeReader::GetAttribute(int index) const {
     const auto& attributes = CurrentAttributes();
     if (index < 0 || static_cast<std::size_t>(index) >= attributes.size()) {
-        return {};
+        throw std::out_of_range("Attribute index is out of range");
     }
     return attributes[static_cast<std::size_t>(index)].second;
 }
@@ -173,6 +173,10 @@ std::string XmlNodeReader::GetAttribute(std::string_view localName, std::string_
 }
 
 bool XmlNodeReader::MoveToAttribute(std::string_view name) {
+    if (name.empty()) {
+        throw std::invalid_argument("Attribute name cannot be empty");
+    }
+
     const auto* event = CurrentEvent();
     if (event == nullptr) {
         return false;
@@ -194,7 +198,7 @@ bool XmlNodeReader::MoveToAttribute(std::string_view name) {
 bool XmlNodeReader::MoveToAttribute(int index) {
     const auto& attributes = CurrentAttributes();
     if (index < 0 || static_cast<std::size_t>(index) >= attributes.size()) {
-        return false;
+        throw std::out_of_range("Attribute index is out of range");
     }
     attributeIndex_ = index;
     return true;
@@ -373,6 +377,10 @@ bool XmlNodeReader::IsStartElement(std::string_view name) {
     return MoveToContent() == XmlNodeType::Element && Name() == name;
 }
 
+bool XmlNodeReader::IsStartElement(std::string_view localName, std::string_view namespaceUri) {
+    return MoveToContent() == XmlNodeType::Element && LocalName() == localName && NamespaceURI() == namespaceUri;
+}
+
 void XmlNodeReader::ReadStartElement() {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadStartElement called when the reader is not positioned on an element");
@@ -386,6 +394,18 @@ void XmlNodeReader::ReadStartElement(std::string_view name) {
     }
     if (Name() != name) {
         throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
+    }
+    Read();
+}
+
+void XmlNodeReader::ReadStartElement(std::string_view localName, std::string_view namespaceUri) {
+    if (MoveToContent() != XmlNodeType::Element) {
+        throw XmlException("ReadStartElement called when the reader is not positioned on an element");
+    }
+    if (LocalName() != localName || NamespaceURI() != namespaceUri) {
+        throw XmlException(
+            "Element '{" + std::string(namespaceUri) + "}" + std::string(localName) +
+            "' was not found. Current element is '{" + NamespaceURI() + "}" + LocalName() + "'");
     }
     Read();
 }
@@ -425,6 +445,50 @@ std::string XmlNodeReader::ReadElementContentAsString() {
     }
 }
 
+std::string XmlNodeReader::ReadElementContentAsString(std::string_view localName, std::string_view namespaceUri) {
+    if (MoveToContent() != XmlNodeType::Element) {
+        throw XmlException("ReadElementContentAsString called when the reader is not positioned on an element");
+    }
+    if (LocalName() != localName || NamespaceURI() != namespaceUri) {
+        throw XmlException(
+            "Element '{" + std::string(namespaceUri) + "}" + std::string(localName) +
+            "' was not found. Current element is '{" + NamespaceURI() + "}" + LocalName() + "'");
+    }
+    return ReadElementContentAsString();
+}
+
+int XmlNodeReader::ReadElementContentAsInt() {
+    return XmlConvert::ToInt32(ReadElementContentAsString());
+}
+
+int XmlNodeReader::ReadElementContentAsInt(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToInt32(ReadElementContentAsString(localName, namespaceUri));
+}
+
+long long XmlNodeReader::ReadElementContentAsLong() {
+    return XmlConvert::ToInt64(ReadElementContentAsString());
+}
+
+long long XmlNodeReader::ReadElementContentAsLong(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToInt64(ReadElementContentAsString(localName, namespaceUri));
+}
+
+double XmlNodeReader::ReadElementContentAsDouble() {
+    return XmlConvert::ToDouble(ReadElementContentAsString());
+}
+
+double XmlNodeReader::ReadElementContentAsDouble(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToDouble(ReadElementContentAsString(localName, namespaceUri));
+}
+
+bool XmlNodeReader::ReadElementContentAsBoolean() {
+    return XmlConvert::ToBoolean(ReadElementContentAsString());
+}
+
+bool XmlNodeReader::ReadElementContentAsBoolean(std::string_view localName, std::string_view namespaceUri) {
+    return XmlConvert::ToBoolean(ReadElementContentAsString(localName, namespaceUri));
+}
+
 std::string XmlNodeReader::ReadElementString() {
     if (MoveToContent() != XmlNodeType::Element) {
         throw XmlException("ReadElementString called when the reader is not positioned on an element");
@@ -459,6 +523,18 @@ std::string XmlNodeReader::ReadElementString(std::string_view name) {
     }
     if (Name() != name) {
         throw XmlException("Element '" + std::string(name) + "' was not found. Current element is '" + Name() + "'");
+    }
+    return ReadElementString();
+}
+
+std::string XmlNodeReader::ReadElementString(std::string_view localName, std::string_view namespaceUri) {
+    if (MoveToContent() != XmlNodeType::Element) {
+        throw XmlException("ReadElementString called when the reader is not positioned on an element");
+    }
+    if (LocalName() != localName || NamespaceURI() != namespaceUri) {
+        throw XmlException(
+            "Element '{" + std::string(namespaceUri) + "}" + std::string(localName) +
+            "' was not found. Current element is '{" + NamespaceURI() + "}" + LocalName() + "'");
     }
     return ReadElementString();
 }

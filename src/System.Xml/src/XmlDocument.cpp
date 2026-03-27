@@ -4,6 +4,51 @@ namespace System::Xml {
 
 namespace {
 
+char ToLowerAscii(char value) noexcept {
+    	static const char kToLowerAsciiTable[] =
+		"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F"
+		"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F"
+		"\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2A\x2B\x2C\x2D\x2E\x2F"
+		"\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3A\x3B\x3C\x3D\x3E\x3F"
+		"\x40\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6A\x6B\x6C\x6D\x6E\x6F"
+		"\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7A\x5B\x5C\x5D\x5E\x5F"
+		"\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6A\x6B\x6C\x6D\x6E\x6F"
+		"\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7A\x7B\x7C\x7D\x7E\x7F"
+		"\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F"
+		"\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F"
+		"\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF"
+		"\xB0\xB1\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF"
+		"\xC0\xC1\xC2\xC3\xC4\xC5\xC6\xC7\xC8\xC9\xCA\xCB\xCC\xCD\xCE\xCF"
+		"\xD0\xD1\xD2\xD3\xD4\xD5\xD6\xD7\xD8\xD9\xDA\xDB\xDC\xDD\xDE\xDF"
+		"\xE0\xE1\xE2\xE3\xE4\xE5\xE6\xE7\xE8\xE9\xEA\xEB\xEC\xED\xEE\xEF"
+		"\xF0\xF1\xF2\xF3\xF4\xF5\xF6\xF7\xF8\xF9\xFA\xFB\xFC\xFD\xFE\xFF";
+	return kToLowerAsciiTable[static_cast<unsigned char>(value)];
+}
+
+bool EqualsAsciiIgnoreCase(std::string_view left, std::string_view right) noexcept {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        if (ToLowerAscii(left[index]) != ToLowerAscii(right[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool IsUtf16EncodingDeclaration(std::string_view encoding) noexcept {
+    return EqualsAsciiIgnoreCase(encoding, "utf-16")
+        || EqualsAsciiIgnoreCase(encoding, "utf-16le")
+        || EqualsAsciiIgnoreCase(encoding, "utf-16be");
+}
+
+bool IsUtf8EncodingDeclaration(std::string_view encoding) noexcept {
+    return EqualsAsciiIgnoreCase(encoding, "utf-8");
+}
+
 std::string ReadFileFullyForXmlDocumentLoad(const std::string& path) {
     std::ifstream stream(std::filesystem::path(path), std::ios::binary | std::ios::ate);
     if (!stream) {
@@ -64,6 +109,12 @@ std::string ReadStreamFullyForXmlDocumentLoad(std::istream& stream) {
     return xml;
 }
 
+bool CanUseReaderBackedLoadXmlFastPath(std::string_view xml) noexcept {
+    constexpr std::size_t kReaderBackedLoadXmlThreshold = 8u * 1024u * 1024u;
+    return xml.size() >= kReaderBackedLoadXmlThreshold
+        && xml.find("<!DOCTYPE") == std::string_view::npos;
+}
+
 }  // namespace
 
 class XmlParser final {
@@ -80,7 +131,12 @@ public:
         Element,
     };
 
-    explicit XmlParser(std::string_view input) : input_(input), position_(0) {
+    explicit XmlParser(std::string_view input, bool sourceWasUtf16 = false)
+        : input_(input), position_(0), sourceWasUtf16_(sourceWasUtf16) {
+        sourceWasUtf8Bom_ = input_.size() >= 3
+            && input_[0] == '\xEF'
+            && input_[1] == '\xBB'
+            && input_[2] == '\xBF';
         if (input_.size() >= 3 && input_[0] == '\xEF' && input_[1] == '\xBB' && input_[2] == '\xBF') {
             position_ = 3;
         }
@@ -201,15 +257,6 @@ private:
         if (pendingDtdIdReferences_.empty()) {
             return;
         }
-
-        for (const auto& reference : pendingDtdIdReferences_) {
-            if (seenDtdIdAttributeValues_.find(reference.value) == seenDtdIdAttributeValues_.end()) {
-                throw XmlException(
-                    "DTD validation failed: attribute '" + reference.attributeName
-                    + "' on element '" + reference.elementName
-                    + "' references unknown ID value '" + reference.value + "'");
-            }
-        }
     }
 
     XmlMarkupKind ClassifyMarkup() const noexcept {
@@ -281,10 +328,36 @@ private:
 
     std::string ParseName() {
         const auto start = position_;
-        const std::string name = ParseNameAt(input_, position_);
-        if (name.empty()) {
-            position_ = start;
-            Throw("Invalid XML name");
+        bool usedAsciiFastPath = false;
+        if (start < input_.size()) {
+            const unsigned char first = static_cast<unsigned char>(input_[start]);
+            if (first < 0x80 && IsNameStartChar(static_cast<char>(first))) {
+                const std::size_t available = input_.size() - start;
+                const std::size_t nameLength = 1 + ConsumeNameCharsInBuffer(input_.data() + start + 1, available - 1);
+                if (nameLength < available && static_cast<unsigned char>(input_[start + nameLength]) < 0x80) {
+                    position_ = start + nameLength;
+                    usedAsciiFastPath = true;
+                }
+            }
+        }
+
+        if (!usedAsciiFastPath) {
+            position_ = ConsumeXmlNameAt(position_, [this](std::size_t index) noexcept {
+                return index < input_.size() ? input_[index] : '\0';
+            });
+            if (position_ == start) {
+                Throw("Invalid XML name");
+            }
+        }
+
+        std::string name(input_.substr(start, position_ - start));
+        if (!usedAsciiFastPath) {
+            try {
+                (void)XmlConvert::VerifyName(name);
+            } catch (const XmlException&) {
+                position_ = start;
+                Throw("Invalid XML name");
+            }
         }
 
         return name;
@@ -454,6 +527,8 @@ private:
                 preserveSpace = true;
             } else if (IsXmlSpaceDefault(attribute->Value())) {
                 preserveSpace = false;
+            } else {
+                throw XmlException("xml:space must be 'default' or 'preserve'");
             }
         }
 
@@ -504,6 +579,15 @@ private:
                 }
                 sawEncoding = true;
                 ValidateXmlDeclarationEncoding(value);
+                if (IsUtf16EncodingDeclaration(value) && !sourceWasUtf16_) {
+                    Throw("Malformed XML declaration");
+                }
+                if (sourceWasUtf16_ && !IsUtf16EncodingDeclaration(value)) {
+                    Throw("Malformed XML declaration");
+                }
+                if (sourceWasUtf8Bom_ && !IsUtf8EncodingDeclaration(value)) {
+                    Throw("Malformed XML declaration");
+                }
                 encoding = value;
             } else if (name == "standalone") {
                 if (!sawVersion) {
@@ -550,6 +634,10 @@ private:
             const auto [line, column] = ComputeLineColumn(invalidDoubleHyphen);
             throw XmlException("Comment may not contain '--'", line, column);
         }
+        if (end > position_ && input_[end - 1] == '-') {
+            const auto [line, column] = ComputeLineColumn(end - 1);
+            throw XmlException("Comment may not contain '--'", line, column);
+        }
 
         const auto text = std::string(input_.substr(position_, end - position_));
         position_ = end + 3;
@@ -573,8 +661,17 @@ private:
     std::shared_ptr<XmlProcessingInstruction> ParseProcessingInstruction(XmlDocument& document) {
         Consume("<?");
         const std::string target = ParseName();
-        if (target == "xml") {
+        if (!IsNamespaceAwareProcessingInstructionTarget(target)) {
+            Throw("Invalid XML name");
+        }
+        if (target.size() == 3
+            && (target[0] == 'x' || target[0] == 'X')
+            && (target[1] == 'm' || target[1] == 'M')
+            && (target[2] == 'l' || target[2] == 'L')) {
             Throw("XML declaration is only allowed at the beginning of the document");
+        }
+        if (!IsEnd() && !StartsWith("?>") && !IsWhitespace(input_[position_])) {
+            Throw("Malformed processing instruction");
         }
 
         std::string data;
@@ -616,6 +713,9 @@ private:
             Consume("PUBLIC");
             SkipWhitespace();
             publicId = ParseQuotedValue(false);
+            if (!IsValidPublicIdentifierLiteral(publicId)) {
+                Throw("Malformed DOCTYPE declaration");
+            }
             SkipWhitespace();
             systemId = ParseQuotedValue(false);
             SkipWhitespace();
@@ -676,12 +776,19 @@ private:
         pendingDtdIdReferences_.clear();
         if (!internalSubset.empty()) {
             ParseDocumentTypeEmptyElementDeclarations(internalSubset, dtdEmptyElementDeclarations_);
+            std::vector<std::shared_ptr<XmlNode>> entities;
+            std::vector<std::shared_ptr<XmlNode>> notations;
+            ParseDocumentTypeInternalSubset(internalSubset, entities, notations);
+            std::unordered_map<std::string, std::string> internalEntityDeclarations;
+            PopulateInternalEntityDeclarations(entities, internalEntityDeclarations);
+            DtdDeclaredAttributeNames declaredAttributes;
             DtdIdAttributeDeclarations idAttributes;
             DtdNotationAttributeDeclarations notationAttributes;
             DtdNmTokenAttributeDeclarations nmTokenAttributes;
             DtdNameAttributeDeclarations nameAttributes;
             ParseDocumentTypeAttributeDeclarations(
                 internalSubset,
+                declaredAttributes,
                 dtdRequiredAttributes_,
                 dtdDefaultAttributes_,
                 dtdFixedAttributes_,
@@ -690,6 +797,11 @@ private:
                 notationAttributes,
                 nmTokenAttributes,
                 nameAttributes);
+            ValidateDtdDeclaredAttributeValueReferenceOrder(internalSubset);
+            ValidateDtdDeclaredAttributeValues(
+                dtdDefaultAttributes_,
+                dtdFixedAttributes_,
+                internalEntityDeclarations);
             dtdIdAttributes_ = std::move(idAttributes);
             dtdNmTokenAttributes_ = std::move(nmTokenAttributes);
             dtdNameAttributes_ = std::move(nameAttributes);
@@ -800,12 +912,127 @@ private:
         flushText(position_, sawEntityReference);
     }
 
-    std::shared_ptr<XmlElement> ParseElement(XmlDocument& document, bool inheritedPreserveSpace = false) {
+    std::shared_ptr<XmlElement> ParseElement(
+        XmlDocument& document,
+        bool inheritedPreserveSpace = false,
+        const std::vector<std::pair<std::string, std::string>>* inheritedNamespaceBindings = nullptr) {
         Expect('<');
         const std::string name = ParseName();
+        const auto [elementPrefix, elementLocalName] = SplitQualifiedNameView(name);
+        if (!IsValidXmlQualifiedName(name) || elementPrefix == "xmlns") {
+            Throw("Invalid XML name");
+        }
+        static_cast<void>(elementLocalName);
         auto element = document.CreateElement(name);
         const std::string_view text = input_;
         bool childPreserveSpace = inheritedPreserveSpace;
+        std::vector<std::pair<std::string, std::string>> localNamespaceDeclarations;
+        bool hasNamespaceSensitiveNames = !elementPrefix.empty();
+
+        auto lookupNamespace = [&localNamespaceDeclarations, inheritedNamespaceBindings](std::string_view prefix) {
+            for (auto it = localNamespaceDeclarations.rbegin(); it != localNamespaceDeclarations.rend(); ++it) {
+                if (std::string_view(it->first) == prefix) {
+                    return it->second;
+                }
+            }
+            if (inheritedNamespaceBindings != nullptr) {
+                for (auto it = inheritedNamespaceBindings->rbegin(); it != inheritedNamespaceBindings->rend(); ++it) {
+                    if (std::string_view(it->first) == prefix) {
+                        return it->second;
+                    }
+                }
+            }
+            if (prefix == "xml") {
+                return std::string("http://www.w3.org/XML/1998/namespace");
+            }
+            if (prefix == "xmlns") {
+                return std::string("http://www.w3.org/2000/xmlns/");
+            }
+            return std::string{};
+        };
+
+        auto setLocalNamespaceDeclaration = [&localNamespaceDeclarations](std::string prefix, std::string namespaceUri) {
+            for (auto it = localNamespaceDeclarations.rbegin(); it != localNamespaceDeclarations.rend(); ++it) {
+                if (it->first == prefix) {
+                    it->second = std::move(namespaceUri);
+                    return;
+                }
+            }
+            localNamespaceDeclarations.emplace_back(std::move(prefix), std::move(namespaceUri));
+        };
+
+        auto namespaceDeclarationUsesTokenizedType = [this, &name](std::string_view attributeName) {
+            const auto idIt = dtdIdAttributes_.find(name);
+            if (idIt != dtdIdAttributes_.end() && idIt->second == attributeName) {
+                return true;
+            }
+
+            const auto nmTokenIt = dtdNmTokenAttributes_.find(name);
+            if (nmTokenIt != dtdNmTokenAttributes_.end()
+                && nmTokenIt->second.find(std::string(attributeName)) != nmTokenIt->second.end()) {
+                return true;
+            }
+
+            const auto nameIt = dtdNameAttributes_.find(name);
+            if (nameIt != dtdNameAttributes_.end()
+                && nameIt->second.find(std::string(attributeName)) != nameIt->second.end()) {
+                return true;
+            }
+
+            const auto enumeratedIt = dtdEnumeratedAttributes_.find(name);
+            if (enumeratedIt != dtdEnumeratedAttributes_.end()
+                && enumeratedIt->second.find(std::string(attributeName)) != enumeratedIt->second.end()) {
+                return true;
+            }
+
+            return false;
+        };
+
+        auto normalizeNamespaceDeclarationValue = [&namespaceDeclarationUsesTokenizedType](std::string_view attributeName, std::string value) {
+            if (namespaceDeclarationUsesTokenizedType(attributeName)) {
+                return NormalizeXmlAttributeWhitespace(value);
+            }
+            return value;
+        };
+
+        auto validateNamespaceAwareNames = [&element, &lookupNamespace](std::string_view currentElementPrefix) {
+            if (!currentElementPrefix.empty() && lookupNamespace(currentElementPrefix).empty()) {
+                throw XmlException("Undeclared namespace prefix '" + std::string(currentElementPrefix) + "'");
+            }
+
+            std::vector<std::pair<std::string, std::string>> expandedAttributeNames;
+            const auto& attributes = element->Attributes();
+            expandedAttributeNames.reserve(attributes.size());
+            for (const auto& attribute : attributes) {
+                if (attribute == nullptr) {
+                    continue;
+                }
+
+                const std::string_view attributeName = attribute->Name();
+                const auto [attributePrefix, attributeLocalName] = SplitQualifiedNameView(attributeName);
+                if (!IsValidXmlQualifiedName(attributeName)
+                    || (attributePrefix == "xmlns" && !IsNamespaceDeclarationName(attributeName))) {
+                    throw XmlException("Invalid XML name");
+                }
+
+                std::string namespaceUri;
+                if (attributeName == "xmlns" || attributePrefix == "xmlns") {
+                    namespaceUri = "http://www.w3.org/2000/xmlns/";
+                } else if (!attributePrefix.empty()) {
+                    namespaceUri = lookupNamespace(attributePrefix);
+                    if (namespaceUri.empty()) {
+                        throw XmlException("Undeclared namespace prefix '" + std::string(attributePrefix) + "'");
+                    }
+                }
+
+                for (const auto& expanded : expandedAttributeNames) {
+                    if (expanded.first == namespaceUri && expanded.second == attributeLocalName) {
+                        throw XmlException("Duplicate attribute '" + std::string(attributeName) + "'");
+                    }
+                }
+                expandedAttributeNames.emplace_back(std::move(namespaceUri), std::string(attributeLocalName));
+            }
+        };
 
         while (true) {
             SkipWhitespace();
@@ -820,6 +1047,30 @@ private:
                         return SubsetStartsWithAt(text, position, token);
                     })) {
                 ApplyDtdAttributeDeclarations(*element);
+                const bool inheritedNamespacesPresent = inheritedNamespaceBindings != nullptr && !inheritedNamespaceBindings->empty();
+                const bool mayNeedDtdNamespaceScan = dtdDefaultAttributes_.find(name) != dtdDefaultAttributes_.end();
+                if (hasNamespaceSensitiveNames || inheritedNamespacesPresent || mayNeedDtdNamespaceScan) {
+                    for (const auto& attribute : element->Attributes()) {
+                        if (attribute == nullptr) {
+                            continue;
+                        }
+
+                        const std::string_view attributeName = attribute->Name();
+                        const auto [attributePrefix, attributeLocalName] = SplitQualifiedNameView(attributeName);
+                        if (!attributePrefix.empty() || attributeName == "xmlns") {
+                            hasNamespaceSensitiveNames = true;
+                        }
+                        if (!IsNamespaceDeclarationName(attributeName)) {
+                            continue;
+                        }
+
+                        std::string normalizedValue = normalizeNamespaceDeclarationValue(attributeName, attribute->Value());
+                        setLocalNamespaceDeclaration(NamespaceDeclarationPrefix(std::string(attributeName)), std::move(normalizedValue));
+                    }
+                }
+                if (hasNamespaceSensitiveNames || inheritedNamespacesPresent || !localNamespaceDeclarations.empty()) {
+                    validateNamespaceAwareNames(elementPrefix);
+                }
                 childPreserveSpace = ResolveElementPreserveSpace(*element, inheritedPreserveSpace);
                 if (isEmptyElement) {
                     return element;
@@ -848,6 +1099,14 @@ private:
             if (attributeToken.name.empty()) {
                 Throw("Invalid XML name");
             }
+            const auto [attributePrefix, attributeLocalName] = SplitQualifiedNameView(attributeToken.name);
+            if (!IsValidXmlQualifiedName(attributeToken.name)
+                || (attributePrefix == "xmlns" && !IsNamespaceDeclarationName(attributeToken.name))) {
+                Throw("Invalid XML name");
+            }
+            if (!attributePrefix.empty() || attributeToken.name == "xmlns") {
+                hasNamespaceSensitiveNames = true;
+            }
             if (!attributeToken.valid) {
                 position_ = cursor;
                 if (!attributeToken.sawEquals) {
@@ -868,13 +1127,28 @@ private:
                 const auto [line, column] = ComputeLineColumn(invalidLt);
                 throw XmlException("'<' is not allowed in attribute values", line, column);
             }
-            std::string attributeValue = DecodeEntities(input_.substr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart));
+            if (element->HasAttribute(attributeToken.name)) {
+                Throw("Duplicate attribute '" + attributeToken.name + "'");
+            }
+            const auto ampersand = input_.find('&', attributeToken.rawValueStart);
+            const bool needsEntityDecoding = ampersand != std::string_view::npos
+                && ampersand < attributeToken.rawValueEnd;
+            std::string attributeValue = needsEntityDecoding
+                ? DecodeEntities(input_.substr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart))
+                : std::string(input_.substr(attributeToken.rawValueStart, attributeToken.rawValueEnd - attributeToken.rawValueStart));
             if (attributeToken.name == "xmlns") {
+                attributeValue = normalizeNamespaceDeclarationValue(attributeToken.name, std::move(attributeValue));
                 ValidateNamespaceDeclarationBinding({}, attributeValue);
+                setLocalNamespaceDeclaration({}, attributeValue);
             } else {
-                const auto [attributePrefix, attributeLocalName] = SplitQualifiedNameView(attributeToken.name);
                 if (attributePrefix == "xmlns") {
+                    attributeValue = normalizeNamespaceDeclarationValue(attributeToken.name, std::move(attributeValue));
                     ValidateNamespaceDeclarationBinding(attributeLocalName, attributeValue);
+                    setLocalNamespaceDeclaration(std::string(attributeLocalName), attributeValue);
+                } else if (attributeToken.name == "xml:space"
+                    && !IsXmlSpacePreserve(attributeValue)
+                    && !IsXmlSpaceDefault(attributeValue)) {
+                    Throw("xml:space must be 'default' or 'preserve'");
                 }
             }
             element->AppendAttributeForLoad(
@@ -887,6 +1161,11 @@ private:
             case XmlMarkupKind::EndTag: {
                 Consume("</");
                 const std::string closeName = ParseName();
+                const auto [closePrefix, closeLocalName] = SplitQualifiedNameView(closeName);
+                if (!IsValidXmlQualifiedName(closeName) || closePrefix == "xmlns") {
+                    Throw("Invalid XML name");
+                }
+                static_cast<void>(closeLocalName);
                 if (closeName != name) {
                     Throw("Mismatched closing tag. Expected </" + name + "> but found </" + closeName + ">");
                 }
@@ -933,7 +1212,23 @@ private:
                     throw XmlException(
                         "DTD validation failed: element '" + name + "' declared EMPTY must not contain child elements");
                 }
-                element->AppendChildForOwnedLoad(ParseElement(document, childPreserveSpace));
+                {
+                    const std::vector<std::pair<std::string, std::string>>* childNamespaceBindings = inheritedNamespaceBindings;
+                    std::vector<std::pair<std::string, std::string>> mergedNamespaceBindings;
+                    if (!localNamespaceDeclarations.empty()) {
+                        if (inheritedNamespaceBindings == nullptr || inheritedNamespaceBindings->empty()) {
+                            childNamespaceBindings = &localNamespaceDeclarations;
+                        } else {
+                            mergedNamespaceBindings = *inheritedNamespaceBindings;
+                            mergedNamespaceBindings.insert(
+                                mergedNamespaceBindings.end(),
+                                localNamespaceDeclarations.begin(),
+                                localNamespaceDeclarations.end());
+                            childNamespaceBindings = &mergedNamespaceBindings;
+                        }
+                    }
+                    element->AppendChildForOwnedLoad(ParseElement(document, childPreserveSpace, childNamespaceBindings));
+                }
                 break;
             case XmlMarkupKind::None:
                 if (IsEnd()) {
@@ -963,6 +1258,8 @@ private:
     std::unordered_set<std::string> seenDtdIdAttributeValues_;
     std::vector<PendingDtdIdReference> pendingDtdIdReferences_;
     std::string documentTypeName_;
+    bool sourceWasUtf16_ = false;
+    bool sourceWasUtf8Bom_ = false;
 };
 
 std::shared_ptr<XmlDocument> BuildXmlDocumentFromReader(XmlReader& reader) {
@@ -994,7 +1291,13 @@ std::shared_ptr<XmlDocument> XmlDocument::Parse(std::string_view xml, const XmlR
 }
 
 void XmlDocument::LoadXml(std::string_view xml) {
-    XmlParser(xml).ParseInto(*this);
+    if (CanUseReaderBackedLoadXmlFastPath(xml)) {
+        auto reader = XmlReader::Create(std::string(xml));
+        LoadXmlDocumentFromReader(reader, *this);
+        return;
+    }
+
+    XmlParser(xml, false).ParseInto(*this);
 }
 
 void XmlDocument::LoadXml(std::string_view xml, const XmlReaderSettings& settings) {
@@ -1003,7 +1306,8 @@ void XmlDocument::LoadXml(std::string_view xml, const XmlReaderSettings& setting
 }
 
 void XmlDocument::Load(const std::string& path) {
-    LoadXml(ReadFileFullyForXmlDocumentLoad(path));
+    auto reader = XmlReader::CreateFromFile(path);
+    LoadXmlDocumentFromReader(reader, *this);
 }
 
 void XmlDocument::Load(const std::string& path, const XmlReaderSettings& settings) {
@@ -1012,7 +1316,8 @@ void XmlDocument::Load(const std::string& path, const XmlReaderSettings& setting
 }
 
 void XmlDocument::Load(std::istream& stream) {
-    LoadXml(ReadStreamFullyForXmlDocumentLoad(stream));
+    auto reader = XmlReader::Create(stream);
+    LoadXmlDocumentFromReader(reader, *this);
 }
 
 void XmlDocument::Load(std::istream& stream, const XmlReaderSettings& settings) {
@@ -1072,6 +1377,12 @@ std::string LookupNamespaceUriInBindings(
         if (it->first == prefix) {
             return it->second;
         }
+    }
+    if (prefix == "xml") {
+        return "http://www.w3.org/XML/1998/namespace";
+    }
+    if (prefix == "xmlns") {
+        return "http://www.w3.org/2000/xmlns/";
     }
     return {};
 }

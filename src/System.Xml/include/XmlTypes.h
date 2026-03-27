@@ -54,6 +54,7 @@ enum class ConformanceLevel {
 
 enum class ValidationType {
     None,
+    Dtd,
     Schema,
 };
 

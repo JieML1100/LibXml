@@ -1196,11 +1196,30 @@ void XmlWriter::WriteRaw(std::string_view xml) {
         return;
     }
 
+    const auto selectTopLevelRawConformance = [this](std::string_view rawXml, bool hasOpenElement) {
+        if (hasOpenElement) {
+            return ConformanceLevel::Fragment;
+        }
+        if (settings_.Conformance == ConformanceLevel::Fragment) {
+            return ConformanceLevel::Fragment;
+        }
+
+        const auto firstNonWhitespace = rawXml.find_first_not_of(" \t\r\n");
+        if (firstNonWhitespace == std::string_view::npos) {
+            return ConformanceLevel::Fragment;
+        }
+
+        const auto prolog = rawXml.substr(firstNonWhitespace);
+        if (prolog.starts_with("<?xml") || prolog.starts_with("<!DOCTYPE")) {
+            return ConformanceLevel::Document;
+        }
+
+        return ConformanceLevel::Fragment;
+    };
+
     if (UsesDirectOutput()) {
         XmlReaderSettings readerSettings;
-        readerSettings.Conformance = directElementStack_.empty()
-            ? settings_.Conformance
-            : ConformanceLevel::Fragment;
+        readerSettings.Conformance = selectTopLevelRawConformance(xml, !directElementStack_.empty());
         auto reader = XmlReader::Create(std::string(xml), readerSettings);
         WriteNodesFromReader(*this, reader);
         return;
@@ -1210,9 +1229,7 @@ void XmlWriter::WriteRaw(std::string_view xml) {
 
     try {
         XmlReaderSettings readerSettings;
-        readerSettings.Conformance = checkpoint.elementStack.empty()
-            ? settings_.Conformance
-            : ConformanceLevel::Fragment;
+        readerSettings.Conformance = selectTopLevelRawConformance(xml, !checkpoint.elementStack.empty());
         auto reader = XmlReader::Create(std::string(xml), readerSettings);
         WriteNodesFromReader(*this, reader);
         return;

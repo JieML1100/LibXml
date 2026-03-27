@@ -28,6 +28,8 @@ class XmlReader;
 class XmlWriter;
 class XPathNavigator;
 class XPathDocument;
+class XPathValue;
+class XPathExpression;
 
 void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document);
 std::string LookupNamespaceUriOnElement(const XmlElement* element, std::string_view prefix);
@@ -141,6 +143,10 @@ public:
     std::shared_ptr<XmlNode> SelectSingleNode(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
     XmlNodeList SelectNodes(std::string_view xpath) const;
     XmlNodeList SelectNodes(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
+    XPathValue Evaluate(std::string_view xpath) const;
+    XPathValue Evaluate(std::string_view xpath, const XmlNamespaceManager& namespaces) const;
+    XPathValue Evaluate(const XPathExpression& expression) const;
+    XPathValue Evaluate(const XPathExpression& expression, const XmlNamespaceManager& namespaces) const;
 
 protected:
     XmlNode(XmlNodeType nodeType, std::string name = {}, std::string value = {});

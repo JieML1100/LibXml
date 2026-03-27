@@ -111,6 +111,11 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
         return document.AllocateOwnedNode<XmlWhitespace>(std::move(reader.currentValue_));
     };
 
+    const auto createOwnedSignificantWhitespaceNode = [&document, &reader]() {
+        reader.MaterializeValue();
+        return document.AllocateOwnedNode<XmlSignificantWhitespace>(std::move(reader.currentValue_));
+    };
+
     const auto createOwnedCDataNode = [&document, &reader]() {
         reader.MaterializeValue();
         return document.AllocateOwnedNode<XmlCDataSection>(std::move(reader.currentValue_));
@@ -150,7 +155,7 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
                 declaration.systemId);
             const std::string externalSubset = Trim(reader.settings_.Resolver->GetEntity(absoluteUri));
             if (!externalSubset.empty()) {
-                ParseDocumentTypeInternalSubset(externalSubset, entities, notations);
+                ParseDocumentTypeInternalSubset(externalSubset, entities, notations, true);
             }
         }
 
@@ -222,7 +227,7 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
             }
             break;
         case XmlNodeType::SignificantWhitespace:
-            appendNode(createOwnedTextNode(), true);
+            appendNode(createOwnedSignificantWhitespaceNode(), true);
             break;
         case XmlNodeType::Comment:
             appendNode(createOwnedCommentNode(), true);
@@ -249,7 +254,11 @@ void LoadXmlDocumentFromReader(XmlReader& reader, XmlDocument& document) {
             break;
         }
         case XmlNodeType::EntityReference:
-            appendNode(document.AllocateOwnedNode<XmlEntityReference>(reader.Name(), reader.Value()), true);
+            if (const std::string& resolvedValue = reader.Value(); !resolvedValue.empty()) {
+                appendNode(document.AllocateOwnedNode<XmlEntityReference>(reader.Name(), resolvedValue), true);
+            } else {
+                appendNode(document.CreateEntityReference(reader.Name()), true);
+            }
             entityExpansionDepth = 1;
             break;
         case XmlNodeType::EndEntity:
@@ -855,6 +864,22 @@ XmlNodeList XmlNode::SelectNodes(std::string_view xpath, const XmlNamespaceManag
     return EvaluateXPathFromNode(*this, xpath, &namespaces);
 }
 
+XPathValue XmlNode::Evaluate(std::string_view xpath) const {
+    return CreateNavigator().Evaluate(xpath);
+}
+
+XPathValue XmlNode::Evaluate(std::string_view xpath, const XmlNamespaceManager& namespaces) const {
+    return CreateNavigator().Evaluate(xpath, namespaces);
+}
+
+XPathValue XmlNode::Evaluate(const XPathExpression& expression) const {
+    return CreateNavigator().Evaluate(expression);
+}
+
+XPathValue XmlNode::Evaluate(const XPathExpression& expression, const XmlNamespaceManager& namespaces) const {
+    return CreateNavigator().Evaluate(expression, namespaces);
+}
+
 std::string XmlNode::InnerText() const {
     if (NodeType() == XmlNodeType::Text
         || NodeType() == XmlNodeType::EntityReference
@@ -1453,16 +1478,20 @@ XmlDocumentType::XmlDocumentType(
       internalSubset_(std::move(internalSubset)) {
     if (entities.empty() && notations.empty()) {
         ParseDocumentTypeInternalSubset(internalSubset_, entities_, notations_);
+        std::unordered_map<std::string, std::string> internalEntityDeclarations;
+        PopulateInternalEntityDeclarations(entities_, internalEntityDeclarations);
         DtdRequiredAttributeDeclarations requiredAttributes;
         DtdDefaultAttributeDeclarations defaultAttributes;
         DtdFixedAttributeDeclarations fixedAttributes;
         DtdEnumeratedAttributeDeclarations enumeratedAttributes;
+        DtdDeclaredAttributeNames declaredAttributes;
         DtdIdAttributeDeclarations idAttributes;
         DtdNotationAttributeDeclarations notationAttributes;
         DtdNmTokenAttributeDeclarations nmTokenAttributes;
         DtdNameAttributeDeclarations nameAttributes;
         ParseDocumentTypeAttributeDeclarations(
             internalSubset_,
+            declaredAttributes,
             requiredAttributes,
             defaultAttributes,
             fixedAttributes,
@@ -1471,6 +1500,11 @@ XmlDocumentType::XmlDocumentType(
             notationAttributes,
             nmTokenAttributes,
             nameAttributes);
+        ValidateDtdDeclaredAttributeValueReferenceOrder(internalSubset_);
+        ValidateDtdDeclaredAttributeValues(
+            defaultAttributes,
+            fixedAttributes,
+            internalEntityDeclarations);
     } else {
         entities_ = CloneDocumentTypeDeclarations(entities);
         notations_ = CloneDocumentTypeDeclarations(notations);
